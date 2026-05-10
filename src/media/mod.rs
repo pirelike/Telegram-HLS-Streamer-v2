@@ -1,0 +1,314 @@
+mod analysis;
+mod encoder;
+mod models;
+mod process;
+mod tiers;
+
+pub use analysis::*;
+pub use encoder::*;
+pub use models::*;
+pub use process::*;
+pub use tiers::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn parses_ffprobe_streams() {
+        let value = serde_json::json!({
+            "format": { "duration": "12.5", "size": "1000" },
+            "streams": [
+                { "index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080, "bit_rate": "5000000", "tags": { "language": "eng", "title": "Main" } },
+                { "index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 6, "sample_rate": "48000", "channel_layout": "5.1" },
+                { "index": 2, "codec_type": "subtitle", "codec_name": "subrip", "tags": { "language": "hun" } }
+            ]
+        });
+        let analysis = analysis::analysis_from_ffprobe(std::path::Path::new("/missing"), &value)
+            .await
+            .unwrap();
+        assert_eq!(analysis.duration, 12.5);
+        assert_eq!(analysis.video_streams[0].height, 1080);
+        assert_eq!(analysis.audio_streams[0].channels, 6);
+        assert_eq!(analysis.subtitle_streams[0].language, "hun");
+    }
+
+    #[test]
+    fn copy_mode_abr_matrix_selects_expected_tiers() {
+        let mut cfg = crate::config::Config::default();
+        cfg.abr_tiers = "1080:10M,720:5M,480:2M".into();
+        cfg.enable_copy_mode = true;
+        cfg.abr_enabled = true;
+        let tiers = select_video_tiers(&cfg, "h264", 1080);
+        assert_eq!(
+            tiers.iter().map(|t| t.height).collect::<Vec<_>>(),
+            [1080, 720, 480]
+        );
+        assert!(tiers[0].copy);
+
+        let tiers = select_video_tiers(&cfg, "vp9", 1080);
+        assert_eq!(
+            tiers.iter().map(|t| t.height).collect::<Vec<_>>(),
+            [1080, 1080, 720, 480]
+        );
+        assert!(!tiers[0].copy);
+
+        cfg.abr_enabled = false;
+        let tiers = select_video_tiers(&cfg, "h264", 1080);
+        assert_eq!(tiers.len(), 1);
+        assert!(tiers[0].copy);
+
+        cfg.enable_copy_mode = false;
+        let tiers = select_video_tiers(&cfg, "h264", 1080);
+        assert_eq!(tiers.len(), 1);
+        assert!(!tiers[0].copy);
+    }
+
+    #[test]
+    fn virtual_abr_generates_only_tier_zero() {
+        let mut cfg = crate::config::Config::default();
+        cfg.abr_enabled = true;
+        cfg.virtual_abr_tiers = true;
+        let tiers = select_video_tiers(&cfg, "h264", 1080);
+        assert_eq!(tiers.len(), 1);
+    }
+
+    #[test]
+    fn subtitle_codec_filter_skips_bitmap() {
+        assert!(process::is_text_subtitle("subrip"));
+        assert!(process::is_text_subtitle("mov_text"));
+        assert!(!process::is_text_subtitle("hdmv_pgs_subtitle"));
+        assert!(!process::is_text_subtitle("dvd_subtitle"));
+    }
+
+    #[test]
+    fn hls_playlist_parser_maps_extinf_to_segment_keys() {
+        let playlist = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.006000,
+video_0000.m4s
+#EXTINF:3.500000,
+nested/video_0001.m4s?token=ignored
+#EXT-X-ENDLIST
+"#;
+        let durations = process::parse_hls_segment_durations("video_0", playlist);
+        assert_eq!(durations.get("video_0/video_0000.m4s"), Some(&4.006));
+        assert_eq!(durations.get("video_0/video_0001.m4s"), Some(&3.5));
+        assert!(!durations.contains_key("video_0/init.mp4"));
+    }
+
+    #[tokio::test]
+    async fn generated_media_processes_to_fmp4_video_and_audio() {
+        let base = std::env::temp_dir().join(format!(
+            "thls_media_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let source = base.join("sample.mp4");
+        let status = tokio::process::Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-v")
+            .arg("error")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc2=size=128x72:rate=10:duration=3")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("sine=frequency=1000:duration=3")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-c:a")
+            .arg("aac")
+            .arg(&source)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let analysis = analyze_media(&source).await.unwrap();
+        assert_eq!(analysis.video_streams[0].codec_name, "h264");
+        assert_eq!(analysis.audio_streams.len(), 1);
+
+        let mut cfg = crate::config::Config::default();
+        cfg.enable_hw_accel = false;
+        cfg.abr_enabled = false;
+        cfg.hls_segment_duration = 1;
+        let output = base.join("out");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = process_media(&analysis, "job1", &output, &cfg, &cancel, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.video_playlists.len(), 1);
+        assert!(output.join("video_0/init.mp4").exists());
+        assert!(output.join("video_0/playlist.m3u8").exists());
+        assert!(has_extension(&output.join("video_0"), "m4s").await);
+        assert!(output.join("audio_0/init.mp4").exists());
+        assert!(output.join("audio_0/playlist.m3u8").exists());
+        assert!(has_extension(&output.join("audio_0"), "m4s").await);
+        assert!(!has_extension(&output.join("audio_0"), "ts").await);
+        assert!(result
+            .segment_durations
+            .keys()
+            .any(|k| k.starts_with("video_0/")));
+        let video_duration = duration_sum(&result.segment_durations, "video_0/");
+        let audio_duration = duration_sum(&result.segment_durations, "audio_0/");
+        assert!(video_duration > 0.0, "video duration sum was zero");
+        assert!(
+            (video_duration - analysis.duration).abs() < 0.5,
+            "video duration sum {video_duration} differed from source {}",
+            analysis.duration
+        );
+        assert!(
+            (audio_duration - analysis.duration).abs() < 0.5,
+            "audio duration sum {audio_duration} differed from source {}",
+            analysis.duration
+        );
+        let _ = tokio::fs::remove_dir_all(base).await;
+    }
+
+    fn duration_sum(durations: &std::collections::HashMap<String, f64>, prefix: &str) -> f64 {
+        durations
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(_, duration)| *duration)
+            .sum()
+    }
+
+    async fn has_extension(dir: &std::path::Path, ext: &str) -> bool {
+        let mut entries = tokio::fs::read_dir(dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some(ext) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn repair_bitrate_uses_telegram_limit_and_duration() {
+        assert_eq!(process::repair_bitrate(1_000_000, 2.0), "3400k");
+        assert_eq!(process::repair_bitrate(1_000, 0.0), "68k");
+    }
+
+    #[tokio::test]
+    async fn copy_alignment_check_flags_empty_or_long_segments() {
+        let base = std::env::temp_dir().join(format!(
+            "thls_copy_alignment_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.hls_segment_duration = 4;
+
+        tokio::fs::write(
+            base.join("playlist.m3u8"),
+            "#EXTM3U\n#EXTINF:4.0,\nvideo_0000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .await
+        .unwrap();
+        assert!(!process::copied_segments_need_reencode(&base, &cfg)
+            .await
+            .unwrap());
+
+        tokio::fs::write(
+            base.join("playlist.m3u8"),
+            "#EXTM3U\n#EXTINF:9.0,\nvideo_0000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .await
+        .unwrap();
+        assert!(process::copied_segments_need_reencode(&base, &cfg)
+            .await
+            .unwrap());
+
+        tokio::fs::write(base.join("playlist.m3u8"), "#EXTM3U\n")
+            .await
+            .unwrap();
+        assert!(process::copied_segments_need_reencode(&base, &cfg)
+            .await
+            .unwrap());
+        let _ = tokio::fs::remove_dir_all(base).await;
+    }
+
+    #[test]
+    fn audio_output_channels_preserves_51_downmixes_71() {
+        // 5.1 source → preserved as 5.1 (6 channels)
+        let audio_51 = AudioStream {
+            index: 0,
+            codec_name: "aac".into(),
+            channels: 6,
+            sample_rate: "48000".into(),
+            bit_rate: "384k".into(),
+            channel_layout: "5.1".into(),
+            language: "eng".into(),
+            title: String::new(),
+        };
+        assert_eq!(output_audio_channels(&audio_51), 6);
+
+        // 7.1 source → downmixed to stereo (2 channels)
+        let audio_71 = AudioStream {
+            index: 1,
+            codec_name: "aac".into(),
+            channels: 8,
+            sample_rate: "48000".into(),
+            bit_rate: "512k".into(),
+            channel_layout: "7.1".into(),
+            language: "eng".into(),
+            title: String::new(),
+        };
+        assert_eq!(output_audio_channels(&audio_71), 2);
+
+        // Mono → preserved as mono
+        let audio_mono = AudioStream {
+            index: 2,
+            codec_name: "aac".into(),
+            channels: 1,
+            sample_rate: "48000".into(),
+            bit_rate: "64k".into(),
+            channel_layout: "mono".into(),
+            language: "eng".into(),
+            title: String::new(),
+        };
+        assert_eq!(output_audio_channels(&audio_mono), 1);
+
+        // Stereo → preserved as stereo
+        let audio_stereo = AudioStream {
+            index: 3,
+            codec_name: "aac".into(),
+            channels: 2,
+            sample_rate: "48000".into(),
+            bit_rate: "128k".into(),
+            channel_layout: "stereo".into(),
+            language: "eng".into(),
+            title: String::new(),
+        };
+        assert_eq!(output_audio_channels(&audio_stereo), 2);
+
+        // 3.1 → preserved
+        let audio_31 = AudioStream {
+            index: 4,
+            codec_name: "aac".into(),
+            channels: 4,
+            sample_rate: "48000".into(),
+            bit_rate: "256k".into(),
+            channel_layout: "3.1".into(),
+            language: "eng".into(),
+            title: String::new(),
+        };
+        assert_eq!(output_audio_channels(&audio_31), 4);
+    }
+}

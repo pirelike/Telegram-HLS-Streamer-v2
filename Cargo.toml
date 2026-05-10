@@ -1,0 +1,33 @@
+[package]
+name = "thls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "signal", "sync", "time", "io-util", "net"] }
+
+axum = { version = "0.7", features = ["macros", "multipart"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs", "limit", "trace", "cors"] }
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+dotenvy = "0.15"
+libc = "0.2"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

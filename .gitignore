@@ -1,0 +1,9 @@
+/target
+/uploads
+/processing
+/streamer.db
+/streamer.db-wal
+/streamer.db-shm
+/streamer.db.backup_*
+/streamer.db.corrupted*
+.env
