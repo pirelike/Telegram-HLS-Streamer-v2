@@ -7,3 +7,17 @@
 /streamer.db.backup_*
 /streamer.db.corrupted*
 .env
+
+# Media files
+*.mkv
+*.mp4
+*.avi
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# System files
+.DS_Store
+Thumbs.db
