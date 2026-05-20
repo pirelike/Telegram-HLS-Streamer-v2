@@ -1,11 +1,10 @@
 mod download;
 mod handlers;
 mod json;
-mod processing;
+pub(crate) mod processing;
 mod types;
 
-pub(crate) use processing::{enqueue_job, start_background_tasks};
-#[cfg(test)]
+pub(crate) use processing::{enqueue_existing_job, enqueue_job, start_background_tasks};
 pub(crate) use types::JobStatus;
 pub(crate) use types::{JobMetadata, JobRequest, JobState};
 

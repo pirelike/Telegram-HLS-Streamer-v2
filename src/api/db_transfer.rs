@@ -1,18 +1,17 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::to_bytes;
 use axum::extract::{FromRequest, Multipart, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{api_error, AppState};
+use super::{api_error, db_unavailable, AppState};
 use crate::{config::Config, db, telegram};
 
 #[derive(Debug, Deserialize)]
@@ -34,7 +33,8 @@ pub(super) async fn handle_db_export(
     request: Request,
 ) -> Response {
     let upload_to_telegram = if is_json(&headers) {
-        match to_bytes(request.into_body(), usize::MAX).await {
+        // Enforce 1 MB limit on the export JSON request body
+        match to_bytes(request.into_body(), 1024 * 1024).await {
             Ok(bytes) if bytes.is_empty() => true,
             Ok(bytes) => match serde_json::from_slice::<ExportRequest>(&bytes) {
                 Ok(req) => req.upload_to_telegram.unwrap_or(true),
@@ -49,7 +49,10 @@ pub(super) async fn handle_db_export(
     };
 
     let export = {
-        let conn = state.db.lock().await;
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
         match db::export_to_dict(&conn) {
             Ok(export) => export,
             Err(e) => {
@@ -132,7 +135,10 @@ pub(super) async fn handle_db_export(
 
 pub(super) async fn handle_db_backup(State(state): State<Arc<AppState>>) -> Response {
     let result = {
-        let conn = state.db.lock().await;
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
         db::backup_database_file(&conn, &state.db_path)
     };
     match result {
@@ -163,7 +169,8 @@ pub(super) async fn handle_db_import(
         let map = auto_fill_or_keep(opt_map, &bytes, 0);
         (bytes, map)
     } else {
-        let bytes = match to_bytes(request.into_body(), usize::MAX).await {
+        // Enforce 1 MB limit on the import JSON request body
+        let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
             Ok(bytes) => bytes,
             Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_payload", e.to_string()),
         };
@@ -208,11 +215,10 @@ pub(super) async fn handle_database_load(
     let mut database = None;
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() == Some("database") {
-            match field.bytes().await {
-                Ok(bytes) => database = Some(bytes.to_vec()),
-                Err(e) => {
-                    return api_error(StatusCode::BAD_REQUEST, "invalid_multipart", e.to_string())
-                }
+            // Limit database file upload to 100 MB
+            match read_field_bytes_limit(field, 100 * 1024 * 1024).await {
+                Ok(bytes) => database = Some(bytes),
+                Err(resp) => return resp,
             }
         }
     }
@@ -288,15 +294,13 @@ async fn import_from_multipart(
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name() {
             Some("file") => {
-                let bytes = field.bytes().await.map_err(|e| {
-                    api_error(StatusCode::BAD_REQUEST, "invalid_multipart", e.to_string())
-                })?;
-                file = Some(bytes.to_vec());
+                // Limit import export JSON to 50 MB
+                let bytes = read_field_bytes_limit(field, 50 * 1024 * 1024).await?;
+                file = Some(bytes);
             }
             Some("bot_index_map") => {
-                let text = field.text().await.map_err(|e| {
-                    api_error(StatusCode::BAD_REQUEST, "invalid_multipart", e.to_string())
-                })?;
+                // Limit bot_index_map text to 64 KB
+                let text = read_field_text_limit(field, 64 * 1024).await?;
                 map = Some(
                     serde_json::from_str::<HashMap<i64, i64>>(&text).map_err(|e| {
                         api_error(
@@ -360,7 +364,10 @@ async fn import_export_bytes(
         );
     }
     let result = {
-        let mut conn = state.db.lock().await;
+        let mut conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
         db::merge_from_export(&mut conn, &export, &bot_index_map)
     };
     match result {
@@ -386,17 +393,48 @@ async fn replace_live_database(
         let conn = db::init_db(&source)?;
         conn.close().map_err(|(_, e)| anyhow::anyhow!(e))?;
     }
-    let mut guard = state.db.lock().await;
-    let old = std::mem::replace(&mut *guard, Connection::open_in_memory()?);
-    let _ = old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-    old.close().map_err(|(_, e)| anyhow::anyhow!(e))?;
+    let old_pool = {
+        let guard = state.db.read().await;
+        guard.clone()
+    };
+    wait_for_pool_drain(&old_pool).await?;
+    let mut guard = state.db.write().await;
+    wait_for_pool_drain(&guard).await?;
+    if let Ok(conn) = guard.get() {
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            tracing::warn!(error = %e, "WAL checkpoint failed during live database replacement");
+        }
+    }
+    wait_for_pool_drain(&guard).await?;
+    let old_pool = std::mem::replace(&mut *guard, db::init_db_pool_lazy(&state.db_path));
+    drop(old_pool);
     let result = db::replace_database_file(&state.db_path, &source)?;
-    let new_conn = db::init_db(&state.db_path)?;
+    let new_pool = db::init_db_pool(&state.db_path)?;
+    let new_conn = new_pool.get()?;
     let cfg = Config::load(&new_conn)?;
-    *guard = new_conn;
+    drop(new_conn);
+    *guard = new_pool;
     drop(guard);
     *state.config.write().await = Arc::new(cfg);
     Ok(result)
+}
+
+async fn wait_for_pool_drain(pool: &db::DbPool) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = pool.state();
+        if state.connections == state.idle_connections {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for sqlite pool to drain ({} total, {} idle)",
+                state.connections,
+                state.idle_connections
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn is_json(headers: &HeaderMap) -> bool {
@@ -420,4 +458,47 @@ fn unix_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+async fn read_field_bytes_limit(
+    mut field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+) -> Result<Vec<u8>, Response> {
+    let mut buf = Vec::new();
+    while match field.chunk().await {
+        Ok(Some(chunk)) => {
+            if buf.len() + chunk.len() > limit {
+                return Err(api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload_too_large",
+                    format!("field exceeds limit of {limit} bytes"),
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_multipart",
+                e.to_string(),
+            ))
+        }
+    } {}
+    Ok(buf)
+}
+
+async fn read_field_text_limit(
+    field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+) -> Result<String, Response> {
+    let bytes = read_field_bytes_limit(field, limit).await?;
+    String::from_utf8(bytes).map_err(|e| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_utf8",
+            format!("field is not valid UTF-8: {e}"),
+        )
+    })
 }

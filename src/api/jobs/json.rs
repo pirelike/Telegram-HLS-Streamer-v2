@@ -6,7 +6,11 @@ use serde_json::{json, Value};
 use super::types::{JobState, JobStatus};
 use crate::db;
 
-pub(super) fn job_status_json(job: &JobState, queue_position: Option<usize>) -> Value {
+pub(super) fn job_status_json(
+    job: &JobState,
+    queue_position: Option<usize>,
+    queue_depth: Option<usize>,
+) -> Value {
     json!({
         "job_id": job.job_id,
         "status": job.status.as_str(),
@@ -15,6 +19,7 @@ pub(super) fn job_status_json(job: &JobState, queue_position: Option<usize>) -> 
         "total_steps": job.total_steps,
         "description": job.description,
         "queue_position": queue_position,
+        "queue_depth": queue_depth,
         "analysis": job.analysis,
         "error": job.error,
         "filename": job.filename,
@@ -36,6 +41,18 @@ pub(super) fn queue_position(jobs: &HashMap<String, JobState>, job_id: &str) -> 
         .iter()
         .position(|j| j.job_id == job_id)
         .map(|pos| pos + 1)
+}
+
+pub(super) fn queue_depth(jobs: &HashMap<String, JobState>, job_id: &str) -> Option<usize> {
+    let job = jobs.get(job_id)?;
+    if job.status != JobStatus::Queued {
+        return None;
+    }
+    Some(
+        jobs.values()
+            .filter(|j| j.status == JobStatus::Queued)
+            .count(),
+    )
 }
 
 pub(super) fn normalize_category(value: Option<&str>) -> Result<Option<String>, String> {

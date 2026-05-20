@@ -1,6 +1,5 @@
 # THLS Next Roadmap
 
-Baseline: all original 9 phases complete (see `ROADMAP.md`).
 This file tracks the next iteration — bug fixes, guards, performance, and
 feature work discovered during codebase review.
 
@@ -8,230 +7,258 @@ Priorities: bug > guard > perf > feature.
 
 ---
 
-## Phase 10: Reliability Fixes
+## P0 — Critical Bugs
 
-### 10.1 Oversized segment adaptive re-encode
-The single remaining open item from the original ROADMAP (Phase 4).
-Segments exceeding `TELEGRAM_MAX_FILE_SIZE` (50 MB) are detected but cause
-job failure — no adaptive re-encode happens.
+- [ ] **Chunk uploads can buffer unbounded request bodies**
+  `src/api/mod.rs:166` disables Axum's default body limit globally while `src/api/uploads.rs:202-206` extracts the chunk as `Bytes` before handler validation. A malformed or oversized `POST /api/upload/chunk` can be fully buffered in memory before `UPLOAD_CHUNK_SIZE` checks run, risking process OOM. Add a route/body-size limit that rejects oversized chunks before buffering.
 
-- [ ] Detect oversized `.m4s` segments after FFmpeg processing.
-- [ ] Re-encode the individual segment with a lower CRF or shorter GOP.
-- [ ] Re-split if needed so the result stays under the limit.
-- [ ] Retry upload of the re-encoded segment.
-- [ ] Surface segment re-encode as a processing step in job progress.
+- [ ] **Concurrent duplicate chunks can corrupt uploaded files**
+  `src/api/uploads.rs:227-274` checks `received_chunks` under `pending_uploads`, then drops the lock before writing to the target offset. Two same-index chunk requests can both pass the check and race-write different bytes; finalization can still see a complete upload. Serialize writes per upload/chunk or reserve the chunk while holding state.
 
-### 10.2 Disk space pre-check
-Processing starts without verifying free disk space. If the disk fills
-mid-encode, the job fails with a cryptic FFmpeg error. Upload allocation
-already handles this (returns 507); processing should too.
+- [ ] **Concurrent finalize can enqueue duplicate jobs for one upload**
+  `src/api/uploads.rs:343-402` validates completion, releases the pending-upload lock, enqueues, then removes the upload. Two finalize requests can both enqueue jobs pointing at the same source file. Atomically remove/mark the pending upload as finalizing before enqueue, and make duplicate finalize return a clear 404/409.
 
-- [ ] Estimate required disk: source size × ABR multiplier + overhead.
-- [ ] Check `statvfs` free space before starting processing.
-- [ ] Reject the job with a clear error if estimated space > free space.
-- [ ] Surface disk pressure in `/health`.
+- [ ] **Database load can run while active jobs are still writing**
+  `src/api/db_transfer.rs:396-418` waits for SQLite pool drain but does not reject queued/downloading/processing/uploading jobs in `state.jobs`. A job can finish after DB replacement and save old work into the newly loaded database. Block live DB replacement while non-terminal jobs exist.
 
-### 10.3 FFmpeg / ffprobe availability check
-`/health` checks DB, bots, queue, and cloudflared — but not whether
-`ffprobe` and `ffmpeg` are executable. A missing binary only surfaces
-when the first job is enqueued.
+- [ ] **Live DB replacement can leave no active database after cross-device rename failure**
+  `src/api/db_transfer.rs:232-234` writes uploaded replacement DBs under `std::env::temp_dir()`, while `src/db/transfer.rs:163-168` renames the active DB to backup before renaming the temp source into place. If the temp path and active DB are on different filesystems, `rename(source, active)` can fail after the active DB was moved aside. Copy or stage the replacement on the active DB filesystem before swapping, and roll back on failure.
 
-- [ ] Run `ffprobe -version` and `ffmpeg -version` at startup.
-- [ ] Expose `ffprobe_available` and `ffmpeg_available` in `/health`.
-- [ ] Reject uploads with a clear error if either binary is missing.
-- [ ] Include detected encoder capabilities (VAAPI/NVENC/QSV) in health output.
+- [ ] **DB backups can miss committed WAL data**
+  `src/db/transfer.rs:190-198` runs `PRAGMA wal_checkpoint(TRUNCATE)` best-effort, ignores checkpoint result rows/errors, then copies only the main `.db` file. If WAL frames remain busy, the backup can be stale or incomplete. Treat failed/busy checkpoint as backup failure or use SQLite's backup API.
 
-### 10.4 Better processing failure surfacing
-When FFmpeg fails during processing, the error shown to users is often
-an opaque "processing failed". The actual FFmpeg stderr is logged but
-not propagated.
+- [ ] **`TELEGRAM_MAX_FILE_SIZE` can be raised above the real Bot API ceiling**
+  `src/settings_registry.rs:52` has no max bound and `src/config.rs:326` applies the value directly. Values above `20971520` let local splitting/upload preflight accept files Telegram will reject, violating the project invariant. Hard-cap validation and config loading at `20971520`.
 
-- [ ] Extract the last N lines of FFmpeg stderr on failure.
-- [ ] Surface them in `GET /api/status/<job_id>` error detail.
-- [ ] Surface them in the frontend job status display.
+- [ ] **Virtual ABR distorts non-16:9 sources**
+  `src/api/playback/virtual_.rs:346` hardcodes `scale='trunc({target_height}*16/9/2)*2':{target_height}` and the playlist advertises the same assumed ratio. 4:3, vertical, and ultrawide sources are transcoded and advertised incorrectly. Use the source track's actual aspect ratio for playlist resolution and FFmpeg scale.
+
+- [ ] **Oversized `.m4s` segments detected but never repaired; repair count incorrectly reports success**
+  `src/media/process.rs:300-342` — After fMP4 remux, oversized `.m4s` segments are collected into `oversized_m4s`, but the repair loop (lines 324-342) only emits a warning. No re-encode or keyframe-split is performed. `m4s_repair_count` is then set to `oversized_m4s.len()` and returned as the "repaired" count, falsely reporting success. Jobs with large `.m4s` segments will fail at Telegram upload with no actionable error; callers have no signal that repair was skipped. The `.ts` repair path works correctly; the `.m4s` path is an unimplemented stub. Either implement re-encode to a lower bitrate (same resolution, per the Telegram invariant) or set `m4s_repair_count = 0` and document that the upload-time byte-splitting path handles these.
+
+- [ ] **`replace_live_database` installs an empty pool before the file rename completes**
+  `src/api/db_transfer.rs:409-411` — `std::mem::replace` at line 409 swaps the live pool with a freshly-initialised lazy pool pointing at the original DB path. `replace_database_file` (line 411) then renames the original to a backup and moves the uploaded file into place. Any request that acquires a connection between line 409 and the completion of the rename can either connect to the already-moved backup file or receive a file-not-found error, both surfacing as unexpected 500s. Move the file rename entirely before installing the new pool, or hold the `state.db` write-lock across both operations.
 
 ---
 
-## Phase 11: Performance Optimizations
+## P1 — Performance (High Impact)
 
-### 11.1 Streaming segment responses (not buffer-in-memory)
-Segments are currently read fully into memory before the response body
-starts. A 50 MB segment × N concurrent viewers = memory pressure.
+- [ ] **Browser upload is strictly serial even though chunk retries are resumable**
+  `static/upload.js:418-456` sends chunks one at a time. After the upload race fixes in P0, add small bounded parallelism (for example 2-4 chunks) so large local uploads use available bandwidth without overwhelming disk writes or request limits. Keep retries per chunk and stop all in-flight work on cancel.
 
-- [ ] Stream `.m4s`, `.ts`, `.vtt`, `.jpg` responses from the cache file.
-- [ ] Use `tokio::fs::File` + `Stream` body for cached segments.
-- [ ] Keep the single-flight gate; only the winner opens the file.
-- [ ] Fall back to buffered response for Telegram-fetched segments (no local file).
+- [ ] **Upload resume assumes contiguous chunks**
+  `static/upload.js:396-404` resumes from `received_chunks`, but `src/api/uploads.rs:456-468` can return explicit `received_indices`. If chunks are uploaded out of order or a future parallel upload leaves gaps, the browser can skip missing chunks. Resume from `received_indices` and send only missing indices.
 
-### 11.2 Hardware encoder for virtual ABR
-Virtual ABR on-demand transcode hardcodes `libx264`. The encoder
-selection from `media::select_encoder` (VAAPI/NVENC/QSV) exists but
-is not wired into the virtual transcode path.
+- [ ] **No lightweight playback/cache benchmark exists**
+  The repo has `/api/metrics`, cache counters, Telegram metrics, and an ignored manual cache smoke test, but no repeatable command that reports first-segment latency, cache-hit latency, Telegram fetch latency, and virtual ABR transcode latency. Add a small script or ignored test that exercises one completed job and prints these timings.
 
-- [ ] Pass the selected hardware encoder through to the virtual ABR FFmpeg command.
-- [ ] Validate that hardware encoder produces valid fMP4 output.
-- [ ] Fall back to CPU if hardware encoder fails for a given resolution.
-- [ ] Expose virtual-ABR encoder type in `/api/metrics`.
-
-### 11.3 Segment cache warm-up after job completion
-After a job completes, all segments exist in Telegram but not in the
-local LRU cache. The first playback is cold (fetches from Telegram).
-
-- [ ] Optionally prefetch the first N segments of each track into cache.
-- [ ] Throttle prefetch to avoid saturating Telegram rate limits.
-- [ ] Gate behind a config setting: `CACHE_WARMUP_ENABLED` (default off).
+- [ ] **Cache warm-up is too coarse for home-server bandwidth**
+  `CACHE_WARMUP_ENABLED` exists and `spawn_cache_warmup` is called after job completion, but warm-up should stay conservative: first playable video segment, first audio segment, and thumbnail only, gated by cache budget and `SEGMENT_PREFETCH_MIN_FREE_BYTES`. Avoid warming whole jobs or all tiers.
 
 ---
 
-## Phase 12: Operational Hardening
+## P2 — Reliability
 
-### 12.1 Segment re-upload recovery
-If a Telegram `file_id` becomes invalid (bot removed from channel,
-message deleted, token revoked), segment playback returns an error.
-No recovery path exists.
+- [ ] **No graceful shutdown for in-flight jobs and uploads**
+  `src/main.rs:107-114` only awaits Ctrl-C; Axum's `with_graceful_shutdown` drains HTTP connections but the spawned `job_dispatcher`, `process_job` tasks, FFmpeg children, Telegram uploads, and chunked uploads are abruptly killed. Jobs left in `processing`/`uploading` accumulate as stuck rows in the DB. Add a shared `CancellationToken`/broadcast, signal all worker tasks, and wait for them (with a deadline) before the process exits.
 
-- [ ] Detect Telegram 400/403 errors during segment fetch.
-- [ ] If the segment file is still in local cache, re-upload it to the same bot.
-- [ ] Update the `file_id` in the DB on successful re-upload.
-- [ ] If re-upload fails, try the next bot in the pool.
-- [ ] Log a warning and return a temporary error to the client if all bots fail.
+- [ ] **Background workers die silently with no supervisor**
+  `src/api/jobs/processing.rs:132-145` breaks the dispatcher loop on `acquire_owned` error with no log or restart; `upload_sweeper`, `watch_folder_poller`, and `job_timeout_watcher` are all `tokio::spawn`ed and never monitored. A panic in `process_job` also loses one semaphore permit permanently. Wrap each worker in a supervisor that logs the exit cause, catches panics (`JoinHandle::is_panicked`), and respawns with backoff; track semaphore permits explicitly so they cannot leak.
 
-### 12.2 Prometheus / OpenMetrics endpoint
-Only JSON metrics exist at `/api/metrics`. Standard monitoring stacks
-expect Prometheus format at `/metrics`.
+- [ ] **Crash recovery only catches `processing` state, not `queued`/`uploading`/`analyzing`**
+  `recover_stuck_processing_jobs` at `src/api/jobs/processing.rs:935-956` and `src/db/queries.rs:686-697` queries `status='processing'`. Jobs that crashed before the processing marker was written (see `src/api/jobs/processing.rs:172-177`) stay as `queued`/`uploading`/`analyzing` in the DB with no in-memory state and no heartbeat. Add a `jobs.lease_expires_at` column, treat any non-terminal row whose lease lapsed as stuck, and either re-enqueue from `source_path` or mark as failed.
 
-- [ ] Add `GET /metrics` endpoint returning Prometheus text format.
-- [ ] Expose counters: uploads_total, jobs_total, segments_served, cache_hits, cache_misses.
-- [ ] Expose gauges: cache_size_bytes, queue_depth, active_jobs, disk_free_bytes.
-- [ ] Expose histograms: upload_duration_seconds, processing_duration_seconds.
-- [ ] Keep the existing JSON endpoint. Add Prometheus as an additional format.
+- [ ] **Telegram retries have no jitter, no max-sleep cap, and no per-bot circuit breaker**
+  `src/telegram.rs:205-282,297-330` hardcodes `MAX_ATTEMPTS=3`, backs off as `2^attempt` seconds with no jitter (concurrent uploads thunder-herd), and honors `RetryAfter` but won't sleep past the attempt budget — a single 60s flood-wait permanently fails the job. No per-bot failure counter means `assign_upload_bots` keeps round-robining to banned or blocked bots. Parametrize retries from config, add full jitter, cap individual sleep duration, and track per-bot rolling error rates to skip unhealthy bots.
 
-### 12.3 Orphaned processing directory cleanup
-If the process crashes during a job, `processing/<job_id>/` directories
-may be left behind. They are only cleaned on successful job completion
-or explicit cancellation.
+- [ ] **FFmpeg has no per-process timeout and SIGKILL is sent with no SIGTERM grace**
+  `run_ffmpeg_cancellable` at `src/media/process.rs:794-858` reacts to `cancel_flag` but has no wall-clock timeout; a hung encoder only stops when the global `job_timeout_watcher` flips the flag (`src/api/jobs/processing.rs:783-840`). `child.kill()` sends SIGKILL directly, leaking hwaccel state. The stderr ring buffer keeps only the last 8 KB (`src/media/process.rs:810-813`), truncating real error lines on long encodes. Add a configurable per-tier timeout, SIGTERM-then-SIGKILL with a grace period, and keep head + tail of stderr (or stream lines through `tracing` on Debug).
 
-- [ ] On startup, scan `processing/` for orphaned directories.
-- [ ] Remove any directory that has no corresponding active job in the DB.
-- [ ] Log removed directories for audit.
+- [ ] **`save_job` races with concurrent reads because SQLite pragmas are missing**
+  `src/db/queries.rs:13-110` runs `DELETE` + bulk `INSERT` inside one transaction; without `busy_timeout` or `synchronous=NORMAL` (`src/db/mod.rs:28-30,75-78` only set WAL + foreign_keys), concurrent playback readers hit `SQLITE_BUSY` and surface as 500s. The `INSERT OR REPLACE` on the `jobs` row also fires `ON DELETE CASCADE`, which is exactly what the explicit deletes are working around — fragile. Set `PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL` and replace `INSERT OR REPLACE` with `INSERT … ON CONFLICT … DO UPDATE`.
 
-### 12.4 Cloudflared tunnel process manager
-`CLOUDFLARED_ENABLED` logs a warning that it's unimplemented. The tunnel
-is referenced in `/health` but there is no process lifecycle.
+- [ ] **Watch-folder re-enqueues files after restart because dedup is in-memory only**
+  `src/api/watch_folder.rs:127-177` keeps `watch_seen` in a runtime `HashMap`; on restart it's empty (`src/main.rs:86`), so any file still in `watch_root` (not yet moved to `done/`) is re-stat'd, marked stable, and re-enqueued — duplicating a job that may already be in the DB. `seen.clear()` also runs on every settings save (`src/api/watch_folder.rs:102`). Persist watch claims (e.g., a `watch_claims` table keyed by canonical inode/path + size + mtime) and consult it before enqueue.
 
-- [ ] Spawn `cloudflared tunnel run` as a managed child process.
-- [ ] Monitor process health and restart on unexpected exit.
-- [ ] Expose tunnel status and uptime in `/health`.
-- [ ] Wire `CLOUDFLARED_TUNNEL_TOKEN` and `CLOUDFLARED_CONFIG` from config.
-- [ ] Log tunnel URL on successful connection.
+- [ ] **Orphaned pending-upload files survive restarts and accumulate**
+  `src/api/uploads.rs:233-239,394-426` relies on an in-memory `Mutex<HashMap>` for TTL tracking. On restart the map is empty, so partial files in `uploads/` preallocated to `total_size` via `set_len` (`src/api/uploads.rs:163-166`) are never reconciled; `uploads/` accumulates orphaned ~100 GB sparse files. At startup, scan `uploads/` and delete files whose `upload_id` has no matching pending state and no completed job; persist pending uploads to a `pending_uploads` table.
 
----
+- [ ] **Round-robin upload-bot counter is unfair under partial failure**
+  `src/api/jobs/processing.rs:556-574` calls `set_last_bot_index` before uploads run; if `upload_outputs` fails, the counter has already advanced. The `round_robin` mutex is also held only across `get_last_bot_index` + `set_last_bot_index`, so concurrent jobs interleave bot assignments after the lock drops, defeating fairness. Persist the new counter only after the last upload succeeds, or atomically reserve a range in the DB via `UPDATE … RETURNING`.
 
-## Phase 13: Feature Completeness
+- [ ] **Terminal jobs evicted from memory after 5 min, losing status responses and log correlation**
+  `cleanup_old_terminal_jobs` at `src/api/jobs/processing.rs:842-852` drops terminal jobs from `state.jobs` after 300s; subsequent status/poll requests cannot return the error message even though the DB has it. There is also no per-job `tracing` span, so concurrent jobs interleave logs unreadably. Wrap every per-job task in `tracing::info_span!("job", job_id)` and have the status handler fall back to a DB read for terminal jobs after in-memory eviction.
 
-### 13.1 Per-job ABR tier overrides
-All jobs get the same ABR ladder from global config. No way to vary
-tiers per job (e.g., a 4K film gets 4 tiers, a 480p clip gets 1).
+- [ ] **URL ingest can spawn unbounded background downloads**
+  `src/api/ingest.rs:24-70` accepts each URL and immediately `tokio::spawn`s a downloader. A client can start many remote downloads that consume disk, outbound sockets, and queue slots before normal upload limits apply. Add a small in-memory semaphore for URL ingest, clear status/cancel behavior while waiting, and reuse the existing upload/job limits where practical.
 
-- [ ] Accept optional `tiers` field on `POST /api/upload/init` and watch-folder metadata.
-- [ ] Store per-job tier configuration in the `jobs` table.
-- [ ] Fall back to global ABR config when no per-job tiers are specified.
-- [ ] Validate that specified tiers are within global bounds.
+- [ ] **Remote download has no explicit wall-clock or idle timeout**
+  `src/api/ingest.rs:72-282` builds a fresh reqwest client and streams chunks until completion, but there is no per-download deadline or per-read idle timeout. A slow or stalled origin can keep a job in `downloading` indefinitely until broader job timeout logic notices. Add bounded timeout behavior and surface `download_timed_out` as a clear job error.
 
-### 13.2 Multi-track audio and subtitle selection in watch UI
-The watch player currently auto-selects the first audio and subtitle
-track. Users cannot switch languages or commentary tracks.
+- [ ] **Ingest download task ignores `job_timeout_watcher` cancellation**
+  `src/api/ingest.rs:354-356` — `stream_to_file` exits early when `cancel_requested || status == Cancelled`. The `job_timeout_watcher` sets `job.status = Error` (not `Cancelled`), so the per-chunk cancel check never fires on timeout. The spawned download task runs to completion after the job has already been marked `error` in memory, then calls `enqueue_existing_job` on a job whose in-memory state is `Error`, which passes the `!cancel_requested && status != Cancelled` guard and re-queues a job that was intentionally timed out. Add `status == Error` (or check the `cancel_flag` atomic) to the `stream_to_file` early-exit condition.
 
-- [ ] Populate Shaka Player track list from HLS master playlist.
-- [ ] Add audio track selector to the watch UI.
-- [ ] Add subtitle track selector (including "off" option).
-- [ ] Persist user track preference in browser local storage.
+- [ ] **`single_flight` inflight entry permanently unresolvable if streaming leader panics**
+  `src/api/playback/real.rs:190-249` — The `tokio::spawn`'d leader accumulates bytes and calls `finish_inflight` on success and known-error paths. If the task panics (e.g. OOM in `extend_from_slice`), `finish_inflight` is never called: `outcome` stays `None` and `notify_waiters()` is never called. All subsequent requests for the same `cache_key` call `wait_for_outcome`, loop forever on a notify that never fires, and are permanently hung. Add a `Drop`-guard or `catch_unwind` wrapper that calls `finish_inflight` with an error on any early exit.
 
-### 13.3 URL / remote ingest
-Currently the only way to get content into THLS is local file upload
-(browser chunked upload or watch folder). No way to submit a URL.
+- [ ] **`finish_inflight` removes key from inflight map before calling `notify_waiters`**
+  `src/api/playback/cache.rs:193-194` — The key is removed from `state.cache.inflight` before `inflight.notify.notify_waiters()` fires. A new request arriving in that window calls `claim_inflight`, finds no entry, becomes a spurious leader, and starts a duplicate Telegram fetch for a segment that is already in the cache or being written. Swap the order: notify while the entry still exists in the map, then remove.
 
-- [ ] Add `POST /api/ingest/url` accepting a URL.
-- [ ] Download the remote file to `uploads/` using `reqwest` streaming download.
-- [ ] Report download progress via `GET /api/status/<job_id>`.
-- [ ] Validate URL scheme (http/https only), size, and content type.
-- [ ] Respect `MAX_UPLOAD_SIZE` and disk space checks.
+- [ ] **`handle_cancel_job` deletes processing directory while FFmpeg may still be writing to it**
+  `src/api/jobs/handlers.rs:461` — The cancel handler sets `cancel_flag`, then immediately calls `cleanup_job_paths` (which deletes source + processing dir). `process_job` polls `cancel_flag` asynchronously at specific checkpoints; between flag set and FFmpeg noticing the cancellation, the processing directory is deleted from under the encoder. Intermediate files are corrupted and FFmpeg emits confusing errors. Restrict `cleanup_job_paths` to the `process_job` task; the cancel handler should only set the flag and update in-memory status.
 
-### 13.4 Job reprocessing with original parameters
-`POST /api/reprocess/<job_id>` exists but reconstructs from HLS segments
-(lossy for re-encoded tiers). No option to re-process from original source.
+- [ ] **Missing `spawn_blocking` for blocking rusqlite calls in DB transfer and frontend handlers**
+  `src/api/db_transfer.rs:56,142,371`, `src/api/frontend.rs:192` — `db::export_to_dict`, `db::backup_database_file`, `db::merge_from_export`, and `db::distinct_series_names` are invoked directly on Tokio async task threads. A DB export or import on a large database blocks the runtime thread for seconds to minutes, starving other requests. Wrap each call in `tokio::task::spawn_blocking` as is done throughout the rest of the API layer.
 
-- [ ] If the original source file is still in `uploads/`, use it directly.
-- [ ] If the original is gone, fall back to HLS reconstruction (current behavior).
-- [ ] Preserve the original job metadata (title, category, series) on reprocess.
+- [ ] **`selected_encoder` not refreshed when encoder-related settings change**
+  `src/api/playback/virtual_.rs:37` — `serve_virtual_segment` reads `state.selected_encoder.read().await.clone()` at request time. The encoder was cached correctly per P1, but cache invalidation on settings change may not be wired: if the user changes `preferred_encoder` or GPU path via the settings API, virtual ABR transcodes silently continue using the stale selection (e.g. old VAAPI device path, or CPU encoder after enabling NVENC). Verify that `media::encoder::select_encoder` is called and written to `state.selected_encoder` on any encoder-relevant settings save, and confirm it ends up in the same code path as the initial probe in `main.rs`.
 
----
+- [ ] **Virtual playlists omit `#EXT-X-MAP` for fMP4 content when source segments are `.ts`**
+  `src/api/playlists.rs:450-456` — `emit_virtual_playlist` derives `init_present` from whether `video_0/init.mp4` exists in the DB. For TS-source jobs there is no `init.mp4` so `init_present = false`, and the virtual playlist is emitted without `#EXT-X-MAP`. Virtual segments are always fMP4 (produced with `-movflags frag_keyframe+empty_moov`), so an fMP4 stream without an initialization segment reference is invalid HLS and will fail to decode on all clients. Always emit `#EXT-X-MAP` for virtual playlists regardless of source format.
 
-## Phase 14: Quality of Life
+- [ ] **Stale Telegram `file_id` recovery triggers full source re-encode for a single segment**
+  `src/api/playback/real.rs:464-518` — `extract_recovery_segment_from_source` calls `media::process_media` on the full source file when recovering from a stale `file_id`. This produces all segments and tiers in `work_dir`; only the one needed segment is read back, and the rest are discarded with `remove_dir_all`. For a 2-hour film this triggers a multi-hour full re-encode consuming tens of GB of disk, just to recover one segment. Add a targeted extraction path (e.g., seek-based single-segment encode, or byte-range extraction from the original `.ts`/`.m4s`) or cap this recovery path to init segments only.
 
-### 14.1 Job queue visibility
-Users uploading a file see no indication of queue position or estimated wait.
+- [ ] **`transcode_segment` leaks FFmpeg output file when `tokio::fs::read` fails after encode**
+  `src/api/playback/virtual_.rs:401` — The output file `out_path` is only removed via `let _ = remove_file(&out_path).await` on the success path. If `tokio::fs::read(&out_path).await?` returns an error (disk full, I/O error), the `?` propagates and the `out_path` removal is never reached. The encoded `.mp4` sits in `temp_dir()` permanently. Clean up `out_path` unconditionally (e.g. via defer pattern or an explicit `remove_file` in the error arm).
 
-- [ ] Expose queue position and depth in `GET /api/status/<job_id>` while queued.
-- [ ] Show "position N of M" in the upload complete / processing UI.
+- [ ] **`env_writer` `Mutex` not poison-safe; subsequent writes panic after any rewrite failure**
+  `src/env_writer.rs:11` — `WRITE_MUTEX.lock().unwrap()` — if a thread panics while holding the mutex (e.g., from an `unwrap` inside `write_env_values`), the `Mutex` is poisoned. Every subsequent `.env` write panics at this `unwrap`, bubbling out of `spawn_blocking` as a `JoinError`. All future settings persisted to `.env` silently fail. Use `.unwrap_or_else(|e| e.into_inner())` to recover from poisoning or return a typed error.
 
-### 14.2 Dark mode for web UI
-- [ ] Add `prefers-color-scheme` detection to `app.css`.
-- [ ] Provide light and dark CSS variables.
-- [ ] Add a manual toggle that overrides system preference.
-- [ ] Persist preference in local storage.
+- [ ] **`env_writer` missing `fsync` before rename; power loss can corrupt `.env`**
+  `src/env_writer.rs:58-62` — `std::fs::write(&tmp, &content)` followed by `std::fs::rename(&tmp, env_path)`. On Linux, `rename(2)` is atomic at the directory-entry level but does not flush the file's data to disk. A power loss after rename but before the OS flushes dirty pages produces a zero-byte or partial `.env`. Add `File::open`+ `write`+ `sync_all` + `rename` so the data is durable before the directory entry changes.
 
-### 14.3 Keyboard shortcuts for watch UI
-- [ ] Space: play/pause.
-- [ ] Left/Right arrow: seek ±10s.
-- [ ] F: fullscreen.
-- [ ] M: mute/unmute.
+- [ ] **`handle_post_settings` has a TOCTOU race under concurrent modification**
+  `src/api/bots_settings.rs:83-86` — The handler reads `state.config` under a read-lock, clones it, applies changes, drops the lock, does DB work, then re-acquires a write-lock to store the result. Two concurrent POST requests reading the same base snapshot will each overwrite the other's changes. The last writer wins, silently dropping the other request's settings. Read, apply, and store inside a single `write()` lock acquisition, or use a DB-level compare-and-swap keyed on a settings version counter.
 
-### 14.4 Upload drag-and-drop
-The upload page currently requires clicking the file input. Drag-and-drop
-is a standard expectation.
+- [ ] **`count_series_groups` and `count_season_groups` produce wrong counts when `series_name IS NULL` filter is active**
+  `src/db/queries.rs:452,522` — Both functions append `AND series_name != ''` to the caller-supplied `where_sql`. When `where_sql` already contains `WHERE season_number IS NULL`, the compound clause is `WHERE season_number IS NULL AND series_name != ''`, which is contradictory (IS NULL rows cannot satisfy `!= ''`). The query returns 0 instead of the real group count, silently breaking series-grouped pagination. Fold the `series_name != ''` condition into the filter-building logic so it is compatible with other WHERE clauses.
 
-- [ ] Accept file drops on the upload page.
-- [ ] Show a drop zone visual affordance.
-- [ ] Reuse the existing chunked upload pipeline.
+- [ ] **`upload_rate_limits` `HashMap` grows unboundedly with rotating source IPs**
+  `src/api/uploads.rs:532-550` — Each unique client IP creates an entry in `state.upload_rate_limits`. Per-IP deque timestamps are pruned on access, but the `HashMap` entry itself is never removed when its deque empties. With `behind_proxy = true` and large NAT pools or CDN forwarding IPs, this is a slow permanent memory leak. After pruning a deque to empty, call `limits.remove(&ip)`, or run a periodic `limits.retain(|_, q| !q.is_empty())` sweep.
+
+- [ ] **Ingest disk-space pre-check is silently skipped when remote server omits `Content-Length`**
+  `src/api/ingest.rs:197-213` — The `check_disk_space` call is inside `if let Some(len) = resp.content_length()`. When the origin omits the header, no space check occurs; `stream_to_file` streams up to `max_upload_size` (default 100 GB) before the per-chunk byte counter catches it. Multiple concurrent header-less downloads can exhaust disk. Move the space check to before the response body read using available free space vs. `max_upload_size` as a conservative bound, regardless of whether `Content-Length` is present.
+
+- [ ] **`analysis_from_ffprobe` silently accepts zero-duration media, causing downstream FFmpeg failures**
+  `src/media/analysis.rs:41-44` — `duration` defaults to `0.0` when the JSON field is absent or unparseable. Zero-duration analysis is accepted without error. `max_bitrate_for_segment` clamps to a 0.1 s minimum to avoid division by zero, but `encode_video_tier_ts` produces no segments for a zero-duration source, causing `remux_video_ts_to_fmp4` to fail with "no video TS segments produced" — a confusing error that hides the root cause. Add `if duration <= 0.0 { bail!("file reports zero or unknown duration") }` in `analysis_from_ffprobe` to surface the problem immediately.
+
+- [ ] **`probe_duration` uses FFprobe with `concat:` URL which FFprobe does not support as a bare filename**
+  `src/media/process.rs:989` — `fmp4_input_arg(path)` formats `concat:/path/init.mp4|/path/video_N.m4s` and passes it as a filename argument to FFprobe. FFmpeg's `concat:` demuxer works via a bare filename; FFprobe does not honour it the same way and will fail to probe `.m4s` segments, silently falling back to `cfg.hls_segment_duration as f64`. This produces inaccurate per-segment duration data used for Telegram split-size calculations. Probe `.m4s` segments directly without the `concat:` wrapper, or derive durations from the HLS playlist instead.
+
+- [ ] **Settings persistence returns success when `.env` write fails, causing config to diverge on restart**
+  `src/api/bots_settings.rs:68-86` — `write_settings_to_env` failure is logged as a warning but the handler continues to update `state.config` in memory and returns HTTP 200. On the next restart, the `.env` file dominates (per loading order), so the in-memory update is silently reverted. The user receives no indication that their settings will not survive a restart. Return an HTTP error (or at minimum a partial-persistence response) when the `.env` write fails, so callers know the update is non-durable.
 
 ---
 
-## Acceptance Test Checklist (for new phases)
+## P3 — Data Model
 
-### Phase 10
-- [ ] Oversized segment is detected, re-encoded, and uploaded successfully.
-- [ ] Re-encoded segment passes Telegram `file_size` integrity check.
-- [ ] Disk space pre-check rejects job when free space < estimated need.
-- [ ] Disk space pre-check passes job when free space > estimated need.
-- [ ] Missing FFmpeg binary returns clear error on upload attempt.
-- [ ] FFmpeg stderr is surfaced in job status on processing failure.
+- [ ] **DB export/import loses split segment parts**
+  `src/db/models.rs:247-253` defines `DbExport` with only jobs/tracks/segments; `src/db/transfer.rs:16-42` never exports `segment_parts`, and `src/db/transfer.rs:125-135` never imports them. Imported split segments keep `is_split=true` but lose all part `file_id`s, breaking playback/download. Include `segment_parts` in export/import and add a round-trip test.
 
-### Phase 11
-- [ ] Cached segment response streams from file without buffering in memory.
-- [ ] Virtual ABR uses hardware encoder when available.
-- [ ] Virtual ABR falls back to CPU when hardware encoder fails.
+- [ ] **Segment prefix lookup uses unescaped SQL `LIKE`**
+  `src/db/queries.rs:337-348` builds `LIKE "{prefix}/%"`, so `_` and `%` in prefixes match unrelated rows. Migration 18 added exact `prefix` columns; use `WHERE prefix = ?` or escape LIKE wildcards. Add a test with `video_0` and `videoA0`.
 
-### Phase 12
-- [ ] Invalid Telegram file_id triggers re-upload from cache.
-- [ ] Re-upload on the same bot succeeds and updates DB file_id.
-- [ ] `/metrics` returns valid Prometheus format.
-- [ ] Orphaned processing directories are cleaned on startup.
-- [ ] Cloudflared tunnel starts, stays alive, and is reflected in `/health`.
+- [ ] **Legacy rev-18 detection can miss `segment_parts` columns**
+  `src/db/migrations.rs:471-478` marks a legacy DB as revision 18 when `tracks`, `jobs`, and `segments` rev-18 columns exist, but does not require `segment_parts.prefix/name`. Bootstrapping can stamp a partially migrated DB as current, then later `save_job()` fails on split-part inserts. Require all rev-18 columns in detection.
 
-### Phase 13
-- [ ] Per-job ABR tiers override global config.
-- [ ] Invalid per-job tiers return 400.
-- [ ] Audio track selector appears in watch UI and switches tracks.
-- [ ] Subtitle track selector appears in watch UI and switches tracks.
-- [ ] URL ingest downloads file and enqueues for processing.
-- [ ] URL ingest rejects non-http(s) URLs.
+- [ ] **`count_series_groups`/`count_season_groups` WHERE contradiction produces wrong pagination counts**
+  `src/db/queries.rs:452,522` — Tracked above under P2 (reliability impact); also a data-model invariant violation since the filter logic is part of the query contract.
 
-### Phase 14
-- [ ] Queue position is visible during job wait.
-- [ ] Dark mode toggle works and persists across page loads.
-- [ ] Keyboard shortcuts function in watch UI.
-- [ ] Drag-and-drop upload initiates chunked upload.
+- [ ] **`output_audio_channels` exact-string match misses `"5.1(side)"` surround layout**
+  `src/media/process.rs:1001-1010` — FFprobe often reports 5.1 surround as `"5.1(side)"`. The guard `layout == "5.1"` is an exact match; `"5.1(side)"` falls through to the 2-channel stereo downmix, silently discarding surround audio. Match on `layout.starts_with("5.1")` and `layout.starts_with("3.1")`, or check `audio.channels == 6` / `== 4` directly.
+
+- [ ] **`select_video_tiers_with` ignores `cfg.abr_enabled`**
+  `src/media/tiers.rs:60` — `select_video_tiers` gates multi-tier ABR on `cfg.abr_enabled && !cfg.virtual_abr_tiers`. `select_video_tiers_with` (the per-job override variant) checks only `!cfg.virtual_abr_tiers`, ignoring `abr_enabled`. A job submitted with an explicit `abr_tiers_override` on a system with `abr_enabled = false` will silently encode multiple tiers against the operator's intent. Gate on `cfg.abr_enabled` in `select_video_tiers_with` as well, or document the override as intentionally bypassing the global toggle.
+
+- [ ] **`X-TIMESTAMP-MAP` injection silently skipped for WebVTT files with non-standard header**
+  `src/api/playback/mod.rs:187-197` — Injection only triggers on bytes starting exactly with `b"WEBVTT\r\n"` or `b"WEBVTT\n"`. A WebVTT file with a BOM, or a header like `WEBVTT NOTE something\n` (valid per spec), silently skips injection. HLS players receive no `X-TIMESTAMP-MAP` and subtitle sync drifts. Match on `starts_with(b"WEBVTT")` and find the first newline rather than requiring an exact header terminator.
+
+- [ ] **`double_bitrate` silently misparses multi-character unit suffixes**
+  `src/media/process.rs:1048-1079` — The function checks only `last_char.is_ascii_alphabetic()` and takes one character as the unit suffix. Input like `"128kbps"` has last char `'s'`; `"128kbp"` fails to parse as `f64`, so the function returns the original string unchanged. The returned value is passed to FFmpeg which rejects it. In the current call-graph `double_bitrate` receives only `"Nk"` and `"Nk"` format strings, so this is not triggered today, but the function is incorrect and silently wrong for any multi-char suffix. Apply the same suffix-stripping logic used in `bitrate_bits`.
+
+---
+
+## P4 — Security Hardening
+
+- [ ] **Settings-to-`.env` write path allows newline injection**
+  `src/env_writer.rs:30-36` writes normalized setting values directly as `KEY=value`, and generic string settings are not rejected for `\n`/`\r`. A settings update can inject additional `.env` keys. Reject control characters or write properly quoted dotenv values.
+
+- [ ] **JSON/API settings silently strip `#` fragments**
+  `src/settings_registry.rs:175-194` strips text after the first `#` for every source, including JSON settings updates. Valid values such as webhook URLs with fragments or paths containing `#` are silently truncated. Restrict inline-comment stripping to env/default parsing or make it whitespace-comment aware.
+
+- [ ] **Segment URI sanitizer allows `.` and `..` components**
+  `src/api/playlists.rs:487-497` rejects empty, spaces, `#`, and CR/LF, but still treats `.` as a safe byte and does not reject `.`/`..` path components. Imported DB keys can produce playlist URIs that clients normalize before requesting. Reject dot path components.
+
+- [ ] **Upload status endpoint does not validate ownership**
+  `src/api/uploads.rs:411-419` returns pending upload metadata by ID without UUID validation or the IP binding used by chunk/finalize handlers. Anyone with a pending upload ID can read filename, size, and progress. Validate ID format and enforce the same client ownership check.
+
+- [ ] **Telegram errors may leak bot tokens**
+  Telegram request URLs include `/bot<TOKEN>/`, and request/decode errors are surfaced through normalized error strings in paths such as `src/telegram.rs:348`. Ensure all Telegram errors and logs redact bot tokens before returning or logging.
+
+- [ ] **Public proxy settings are not enforced consistently**
+  `FORCE_HTTPS`, `CORS_ALLOWED_ORIGINS`, and `TRUSTED_PROXY_CIDRS` are exposed in `src/settings_registry.rs:46-49`, but router middleware does not enforce HTTPS redirects or CORS, and `src/api/uploads.rs:513-524` trusts `X-Forwarded-For` whenever `BEHIND_PROXY=true` without checking trusted proxy ranges. Either implement the settings end-to-end or remove/hide them from public settings until they work.
+
+---
+
+## P5 — Operational
+
+- [ ] **Watch-folder claim can overwrite existing done files**
+  `src/api/watch_folder.rs:343-358` maps a source path to `done.join(rel)` and uses `std::fs::rename`; on Unix, this can replace an existing file at the done target. A later file with the same relative path can overwrite bytes still being processed. Fail or choose a unique target when the done path already exists.
+
+- [ ] **Startup probes for `ffmpeg`/`ffprobe` can hang indefinitely**
+  `src/main.rs:192-204` awaits `ffmpeg -version` and `ffprobe -version` without a timeout, and `src/media/encoder.rs:65-87` does the same for encoder probes. A hung binary or blocked lookup can stall startup. Wrap probes in bounded timeouts.
+
+- [ ] **Cloudflared child can survive THLS shutdown**
+  `src/cloudflared.rs:68` spawns the tunnel child without `kill_on_drop`, and the manager has no shutdown path tied to Axum shutdown. A managed tunnel can remain orphaned after THLS exits. Add shutdown signaling and child cleanup.
+
+- [ ] **Runtime cache directory is not ignored or documented as runtime data**
+  `src/config.rs:103` defaults `cache_dir` to `./cache/`, and the current worktree has an untracked `cache/` with HLS artifacts. `.gitignore` ignores `/uploads` and `/processing` but not `/cache`, and `AGENTS.md` omits `cache/` from runtime-data warnings. Ignore and document `cache/` as runtime data.
+
+- [ ] **DB auto-merge settings are exposed but no worker is wired**
+  `DB_AUTO_MERGE_INTERVAL_MINUTES`, `DB_AUTO_MERGE_FILE_ID`, and `DB_AUTO_MERGE_BOT_INDEX` are loaded in `src/config.rs` and shown in settings, but only `log_startup_warnings` mentions auto-merge being disabled. Implement a simple scheduled import/export flow or remove these settings from the public registry until there is real behavior.
+
+- [ ] **Global body-limit disabling makes every route responsible for its own cap**
+  `src/api/mod.rs:166` disables Axum's default body limit for the whole router. Some DB transfer handlers use manual limits, but JSON, multipart, URL ingest, and upload endpoints now depend on each handler remembering to cap body size. Replace the global disable with route-specific limits, or document and test a per-route manual limit for every mutating endpoint.
+
+---
+
+## P6 — New Features
+
+- [ ] **Remote URL ingest UI**
+  `POST /api/ingest/url` exists, but `/upload` has no form for it. Add a small URL input on the upload page that submits a remote URL, shows the existing `downloading` job progress through `/api/status/:job_id`, and then reuses the normal processing/result UI.
+
+- [ ] **Operations panel on settings**
+  Add a compact read-only panel on `/settings` that fetches `/health` and `/api/metrics`: DB health, disk free, queue depth, cache usage/hit rate, Telegram bot session stats, FFmpeg encoder, and cloudflared status. Keep it simple and refresh manually or on a slow interval.
+
+- [ ] **Continue watching**
+  Store last playback position in browser localStorage keyed by job id from `static/watch.js`. Resume near the saved time on next open, ignore positions near the end, and show recent in-progress jobs on the home page.
+
+- [ ] **Auto-play next episode**
+  `static/watch.js` already fetches sibling episodes and renders previous/next navigation. When a series episode ends, optionally navigate to the next episode if one exists, with a small cancelable countdown.
+
+- [ ] **Library cleanup tools**
+  Add a settings page section for failed/cancelled jobs, old backups, orphaned upload files, and orphaned processing/cache entries. Default to dry-run counts and require an explicit button per cleanup action.
+
+---
+
+## P7 — Code Quality
+
+### Code Quality and Error Handling
+- [ ] Audit and remove fragile `.unwrap()` and `.expect()` calls in non-test paths. Handle errors gracefully.
+- [ ] **`cargo fmt --check` currently fails**
+  Formatting drift is present in `src/api/jobs/download.rs`, `src/api/uploads.rs`, `src/api/watch_folder.rs`, and `src/env_writer.rs`. Run `cargo fmt` after preserving unrelated user changes.
+
+- [ ] **`cargo clippy --all-targets --all-features` emits warnings**
+  Clippy exits successfully, but reports warnings for needless conversions/borrows, simple style issues, and a few too-many-arguments functions. Fix the mechanical warnings first; only refactor argument-heavy functions when it clearly reduces current complexity.
+
+- [ ] **Agent docs still contain placeholders and are out of sync**
+  `AGENTS.md:16-22` still has `[command]` placeholders despite canonical commands being documented later and in `README.md`. New Telegram limit / FFmpeg quality / oversized segment rules exist in `AGENTS.md` but not in `CODEX.md` and `CLAUDE.md`, despite the sync rule. Fill the command section and synchronize agent docs.
+
+### Current Verification Baseline
+- `cargo test` passes: 127 passed, 1 ignored.
+- `cargo fmt --check` fails with formatting drift.
+- `cargo clippy --all-targets --all-features` completes with warnings.
 
 ---
 

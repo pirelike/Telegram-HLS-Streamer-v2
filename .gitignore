@@ -21,3 +21,13 @@ __pycache__/
 # System files
 .DS_Store
 Thumbs.db
+
+# Runtime cache
+/cache/
+
+# AI agent tooling
+.sisyphus/
+.antigravitycli/
+
+# Internal docs
+/docs/

@@ -1,5 +1,6 @@
+use std::io::SeekFrom;
 use std::path::{Path as FsPath, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
@@ -7,29 +8,40 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::super::{api_error, AppState};
+use super::super::{api_error, db_unavailable, AppState};
 use super::types::JobMetadata;
+use crate::config::BotConfig;
 use crate::{db, telegram};
 
 pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Response {
-    let conn = state.db.lock().await;
-    let job = match db::get_job(&conn, job_id) {
-        Ok(Some(job)) => job,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
     };
-    let tracks = match db::get_job_tracks(&conn, job_id, None) {
-        Ok(tracks) => tracks,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
+    let job_id_clone = job_id.to_string();
+    let db_result = tokio::task::spawn_blocking(move || {
+        let job = db::get_job(&conn, &job_id_clone)?;
+        let tracks = db::get_job_tracks(&conn, &job_id_clone, None)?;
+        let segment_count = db::count_job_segments(&conn, &job_id_clone)?;
+        Ok::<(Option<db::JobRow>, Vec<db::TrackRow>, i64), anyhow::Error>((job, tracks, segment_count))
+    })
+    .await;
+
+    let (job_opt, tracks, segment_count) = match db_result {
+        Ok(Ok(val)) => val,
+        Ok(Err(e)) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "blocking_error", e.to_string()),
     };
-    let segment_count = match db::count_job_segments(&conn, job_id) {
-        Ok(count) => count,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
+
+    let Some(job) = job_opt else {
+        return api_error(StatusCode::NOT_FOUND, "not_found", "job not found");
     };
+
     let audio_count = tracks.iter().filter(|t| t.track_type == "audio").count();
     let subtitle_count = tracks.iter().filter(|t| t.track_type == "subtitle").count();
     Json(json!({
@@ -58,38 +70,59 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
 }
 
 pub(super) async fn complete_job(state: &AppState, job_id: &str) -> Result<db::JobRow, Response> {
-    let conn = state.db.lock().await;
-    match db::get_job(&conn, job_id) {
-        Ok(Some(job)) if job.status == "complete" => Ok(job),
-        Ok(Some(_)) => Err(api_error(
+    let conn = state.db_conn().await.map_err(db_unavailable)?;
+    let job_id_clone = job_id.to_string();
+    let db_result = tokio::task::spawn_blocking(move || {
+        db::get_job(&conn, &job_id_clone)
+    })
+    .await;
+
+    match db_result {
+        Ok(Ok(Some(job))) if job.status == "complete" => Ok(job),
+        Ok(Ok(Some(_))) => Err(api_error(
             StatusCode::CONFLICT,
             "not_complete",
             "job is not complete",
         )),
-        Ok(None) => Err(api_error(
+        Ok(Ok(None)) => Err(api_error(
             StatusCode::NOT_FOUND,
             "not_found",
             "job not found",
         )),
-        Err(e) => Err(api_error(
+        Ok(Err(e)) => Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "db_error",
+            e.to_string(),
+        )),
+        Err(e) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "blocking_error",
             e.to_string(),
         )),
     }
 }
 
-pub(super) async fn reconstruct_job_source(state: &AppState, job: &db::JobRow) -> Result<PathBuf> {
+pub(super) async fn reconstruct_job_source(
+    state: &Arc<AppState>,
+    job: &db::JobRow,
+) -> Result<PathBuf> {
     let segments = {
-        let conn = state.db.lock().await;
-        db::get_segments_for_job(&conn, &job.job_id)?
+        let conn = state
+            .db_conn()
+            .await
+            .context("getting sqlite connection for reconstruction")?;
+        let job_id_clone = job.job_id.clone();
+        tokio::task::spawn_blocking(move || {
+            db::get_segments_for_job(&conn, &job_id_clone)
+        })
+        .await??
     };
     let video_segments = prefix_segments(&segments, "video_0");
     if video_segments.is_empty() {
         bail!("job has no tier-0 video segments");
     }
 
-    let stamp = unique_stamp();
+    let stamp = uuid::Uuid::new_v4().simple().to_string();
     let base = std::env::temp_dir();
     let video_path = base.join(format!("thls_reconstruct_{stamp}_video.mp4"));
     let audio_path = base.join(format!("thls_reconstruct_{stamp}_audio.ts"));
@@ -152,31 +185,159 @@ fn segment_sort_key(key: &str) -> (u8, &str) {
 }
 
 async fn write_reconstructed_track(
-    state: &AppState,
+    state: &Arc<AppState>,
     segments: &[db::SegmentRow],
     path: &FsPath,
 ) -> Result<()> {
-    let mut file = tokio::fs::File::create(path).await?;
-    for segment in segments {
-        let bytes = fetch_segment_bytes(state, segment).await?;
-        file.write_all(&bytes).await?;
+    let downloads = reconstruct_downloads(state, segments).await?;
+    let total_size = downloads
+        .iter()
+        .try_fold(0_u64, |total, item| total.checked_add(item.expected_size))
+        .context("reconstructed track is too large")?;
+
+    let file = tokio::fs::File::create(path).await?;
+    file.set_len(total_size).await?;
+    drop(file);
+
+    let cfg = state.config.read().await.clone();
+    let bots = Arc::new(cfg.bots.clone());
+    let parallelism = cfg.upload_parallelism.max(1) as usize;
+    let mut pending = downloads.into_iter();
+    let mut tasks = JoinSet::new();
+
+    loop {
+        while tasks.len() < parallelism {
+            let Some(item) = pending.next() else {
+                break;
+            };
+            let state = state.clone();
+            let bots = bots.clone();
+            let path = path.to_path_buf();
+            tasks.spawn(async move { stream_download_to_path_at(state, bots, path, item).await });
+        }
+
+        let Some(result) = tasks.join_next().await else {
+            break;
+        };
+        result.context("reconstruction download task panicked")??;
     }
-    file.flush().await?;
+
     Ok(())
 }
 
-async fn fetch_segment_bytes(state: &AppState, segment: &db::SegmentRow) -> Result<Vec<u8>> {
-    let cfg = state.config.read().await.clone();
-    telegram::get_file_bytes(
+#[derive(Debug)]
+struct ReconstructDownload {
+    label: String,
+    file_id: String,
+    bot_index: i64,
+    offset: u64,
+    expected_size: u64,
+}
+
+async fn reconstruct_downloads(
+    state: &AppState,
+    segments: &[db::SegmentRow],
+) -> Result<Vec<ReconstructDownload>> {
+    let conn = state.db_conn().await.context("getting connection for reconstruct downloads")?;
+    let segments_vec = segments.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut downloads = Vec::new();
+        let mut offset = 0_u64;
+        for segment in segments_vec {
+            if segment.is_split {
+                let parts = db::get_segment_parts(&conn, &segment.job_id, &segment.segment_key)
+                    .with_context(|| {
+                        format!("getting parts for split segment {}", segment.segment_key)
+                    })?;
+                for (part_index, part) in parts.into_iter().enumerate() {
+                    let expected_size = u64::try_from(part.file_size)
+                        .with_context(|| format!("invalid part size for {}", segment.segment_key))?;
+                    downloads.push(ReconstructDownload {
+                        label: format!("{} part {part_index}", segment.segment_key),
+                        file_id: part.file_id,
+                        bot_index: part.bot_index,
+                        offset,
+                        expected_size,
+                    });
+                    offset = offset
+                        .checked_add(expected_size)
+                        .context("reconstructed track is too large")?;
+                }
+            } else {
+                let expected_size = u64::try_from(segment.file_size)
+                    .with_context(|| format!("invalid segment size for {}", segment.segment_key))?;
+                downloads.push(ReconstructDownload {
+                    label: segment.segment_key.clone(),
+                    file_id: segment.file_id.clone(),
+                    bot_index: segment.bot_index,
+                    offset,
+                    expected_size,
+                });
+                offset = offset
+                    .checked_add(expected_size)
+                    .context("reconstructed track is too large")?;
+            }
+        }
+        Ok::<Vec<ReconstructDownload>, anyhow::Error>(downloads)
+    })
+    .await?
+}
+
+
+async fn stream_download_to_path_at(
+    state: Arc<AppState>,
+    bots: Arc<Vec<BotConfig>>,
+    path: PathBuf,
+    item: ReconstructDownload,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let resp = telegram::get_file_response(
         &state.http,
         &state.telegram,
         &state.telegram_base_url,
-        &cfg.bots,
-        &segment.file_id,
-        segment.bot_index,
+        &bots,
+        &item.file_id,
+        item.bot_index,
     )
     .await
-    .with_context(|| format!("fetching {}", segment.segment_key))
+    .with_context(|| format!("fetching {}", item.label))?;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    file.seek(SeekFrom::Start(item.offset))
+        .await
+        .with_context(|| format!("seek {}", path.display()))?;
+
+    let mut written = 0_u64;
+    use tokio_stream::StreamExt as _;
+    let stream = resp.bytes_stream();
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("streaming {}", item.label))?;
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        written += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .with_context(|| format!("flush {}", path.display()))?;
+    if written != item.expected_size {
+        bail!(
+            "download_size_mismatch: {} expected={} wrote={}",
+            item.label,
+            item.expected_size,
+            written
+        );
+    }
+    state
+        .telegram
+        .record_download_success(item.bot_index, written, started.elapsed().as_secs_f64())
+        .await;
+    Ok(())
 }
 
 pub(super) async fn stream_temp_file(path: PathBuf, filename: &str) -> Response {
@@ -257,11 +418,4 @@ pub(super) fn safe_download_name(name: &str) -> String {
     } else {
         out
     }
-}
-
-fn unique_stamp() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
 }

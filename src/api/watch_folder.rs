@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::jobs::{enqueue_job, JobMetadata};
 use super::{api_error, AppState};
+use crate::db;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WatchSettings {
@@ -27,10 +28,73 @@ pub(crate) struct WatchFileState {
     stable_since: Instant,
 }
 
-pub(crate) fn load_watch_settings(path: &Path) -> anyhow::Result<WatchSettings> {
+const WATCH_SETTINGS_KEY: &str = "watch_settings";
+const WATCH_SETTINGS_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredWatchSettings {
+    version: i64,
+    watch_enabled: bool,
+    watch_root: String,
+    watch_done_dir: String,
+}
+
+impl From<WatchSettings> for StoredWatchSettings {
+    fn from(value: WatchSettings) -> Self {
+        Self {
+            version: WATCH_SETTINGS_VERSION,
+            watch_enabled: value.watch_enabled,
+            watch_root: value.watch_root,
+            watch_done_dir: value.watch_done_dir,
+        }
+    }
+}
+
+impl From<StoredWatchSettings> for WatchSettings {
+    fn from(value: StoredWatchSettings) -> Self {
+        Self {
+            watch_enabled: value.watch_enabled,
+            watch_root: value.watch_root,
+            watch_done_dir: value.watch_done_dir,
+        }
+    }
+}
+
+pub(crate) fn load_watch_settings(
+    conn: &rusqlite::Connection,
+    legacy_path: &Path,
+) -> anyhow::Result<WatchSettings> {
+    if let Some(raw) = db::get_internal_value(conn, WATCH_SETTINGS_KEY)? {
+        match serde_json::from_str::<StoredWatchSettings>(&raw) {
+            Ok(stored) if stored.version == WATCH_SETTINGS_VERSION => return Ok(stored.into()),
+            Ok(stored) => tracing::warn!(
+                version = stored.version,
+                "unsupported watch settings version; using defaults"
+            ),
+            Err(e) => tracing::warn!(error = %e, "watch settings row is invalid; using defaults"),
+        }
+    }
+
+    let settings = load_legacy_or_env_watch_settings(legacy_path);
+    let stored = StoredWatchSettings::from(settings.clone());
+    if let Ok(raw) = serde_json::to_string(&stored) {
+        db::set_internal_value(conn, WATCH_SETTINGS_KEY, &raw)?;
+    }
+    Ok(settings)
+}
+
+fn load_legacy_or_env_watch_settings(path: &Path) -> WatchSettings {
     if path.exists() {
-        let bytes = std::fs::read(path)?;
-        return Ok(serde_json::from_slice(&bytes)?);
+        match std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<WatchSettings>(&bytes).ok())
+        {
+            Some(settings) => return settings,
+            None => tracing::warn!(
+                path = %path.display(),
+                "watch settings json is invalid; using env/default values"
+            ),
+        }
     }
     let watch_root = std::env::var("WATCH_ROOT").unwrap_or_default();
     let watch_done_dir = std::env::var("WATCH_DONE_DIR")
@@ -49,11 +113,11 @@ pub(crate) fn load_watch_settings(path: &Path) -> anyhow::Result<WatchSettings> 
     let watch_enabled = std::env::var("WATCH_ENABLED")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    Ok(WatchSettings {
+    WatchSettings {
         watch_enabled,
         watch_root,
         watch_done_dir,
-    })
+    }
 }
 
 pub(super) async fn handle_get_watch_settings(State(state): State<Arc<AppState>>) -> Response {
@@ -74,14 +138,14 @@ pub(super) async fn handle_post_watch_settings(
     if let Err(e) = validate_watch_paths(&body) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_watch_settings", e);
     }
-    if let Err(e) = std::fs::create_dir_all(&body.watch_done_dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&body.watch_done_dir).await {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "watch_settings_save_failed",
             e.to_string(),
         );
     }
-    let bytes = match serde_json::to_vec_pretty(&body) {
+    let bytes = match serde_json::to_string(&StoredWatchSettings::from(body.clone())) {
         Ok(bytes) => bytes,
         Err(e) => {
             return api_error(
@@ -91,7 +155,17 @@ pub(super) async fn handle_post_watch_settings(
             )
         }
     };
-    if let Err(e) = std::fs::write(&state.watch_settings_path, bytes) {
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "watch_settings_save_failed",
+                e.to_string(),
+            )
+        }
+    };
+    if let Err(e) = db::set_internal_value(&conn, WATCH_SETTINGS_KEY, &bytes) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "watch_settings_save_failed",
@@ -130,23 +204,14 @@ async fn scan_watch_folder(
     cfg: &crate::config::Config,
 ) -> anyhow::Result<()> {
     let (root, done) = validate_watch_paths(settings).map_err(anyhow::Error::msg)?;
-    let mut candidates = Vec::new();
-    collect_candidates(&root, &done, cfg, &mut candidates);
+    let candidates = collect_candidate_metadata(root.clone(), done.clone(), cfg.clone()).await?;
 
     let now = Instant::now();
     let mut current = HashSet::new();
     let mut ready = Vec::new();
     {
         let mut seen = state.watch_seen.lock().await;
-        for path in candidates {
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let size = meta.len();
-            let modified = meta.modified().ok();
+        for (path, size, modified) in candidates {
             current.insert(path.clone());
             match seen.get_mut(&path) {
                 Some(prev) if prev.size == size && prev.modified == modified => {
@@ -183,6 +248,31 @@ async fn scan_watch_folder(
         state.watch_seen.lock().await.remove(&path);
     }
     Ok(())
+}
+
+async fn collect_candidate_metadata(
+    root: PathBuf,
+    done: PathBuf,
+    cfg: crate::config::Config,
+) -> anyhow::Result<Vec<(PathBuf, u64, Option<SystemTime>)>> {
+    tokio::task::spawn_blocking(move || {
+        let mut candidates = Vec::new();
+        collect_candidates(&root, &done, &cfg, &mut candidates);
+
+        let mut with_metadata = Vec::new();
+        for path in candidates {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            with_metadata.push((path, meta.len(), meta.modified().ok()));
+        }
+        with_metadata
+    })
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 fn collect_candidates(
@@ -242,33 +332,50 @@ async fn claim_and_enqueue(
     done: &Path,
     source: &Path,
 ) -> anyhow::Result<()> {
-    let source = source.canonicalize()?;
-    if !source.starts_with(root) || source.starts_with(done) {
-        anyhow::bail!("watch source escapes root or is inside done dir");
-    }
-    let rel = source.strip_prefix(root)?;
-    let target = done.join(rel);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::rename(&source, &target)?;
+    let root = root.to_path_buf();
+    let done = done.to_path_buf();
+    let source = source.to_path_buf();
+    let (source, target) = tokio::task::spawn_blocking(move || {
+        let source = source.canonicalize()?;
+        if !source.starts_with(&root) || source.starts_with(&done) {
+            anyhow::bail!("watch source escapes root or is inside done dir");
+        }
+        let rel = source.strip_prefix(&root)?;
+        let target = done.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok::<(PathBuf, PathBuf), anyhow::Error>((source, target))
+    })
+    .await??;
     let filename = target
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("watch-file")
         .to_string();
-    enqueue_job(
+    let rename_target = target.clone();
+    let source_clone = source.clone();
+    tokio::task::spawn_blocking(move || std::fs::rename(&source_clone, &rename_target)).await??;
+    let enqueue_result = enqueue_job(
         state,
         filename.clone(),
-        target,
+        target.clone(),
         JobMetadata {
             media_type: Some("Film".into()),
             title: Some(filename),
             ..Default::default()
         },
         false,
+        None,
     )
-    .await?;
+    .await;
+
+    if let Err(e) = enqueue_result {
+        let source_clone = source.clone();
+        let target_clone = target.clone();
+        let _ = tokio::task::spawn_blocking(move || std::fs::rename(&target_clone, &source_clone)).await;
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -328,24 +435,26 @@ mod tests {
         let db_path = dir.join("streamer.db");
         let uploads_dir = dir.join("uploads");
         let processing_dir = dir.join("processing");
-        let watch_settings_path = dir.join("watch_settings.json");
         std::fs::create_dir_all(&uploads_dir).unwrap();
         std::fs::create_dir_all(&processing_dir).unwrap();
-        let conn = crate::db::init_db(&db_path).unwrap();
+        let pool = crate::db::init_db_pool(&db_path).unwrap();
+        let conn = pool.get().unwrap();
         let cfg = Config::load(&conn).unwrap();
+        drop(conn);
         let (job_queue, _job_receiver) = tokio::sync::mpsc::channel(100);
         Arc::new(AppState {
-            db: Arc::new(Mutex::new(conn)),
-            db_path,
+            db: RwLock::new(pool),
+            db_path: db_path.clone(),
+            env_path: db_path.parent().unwrap().join(".env"),
             config: RwLock::new(Arc::new(cfg)),
             started_at: std::time::Instant::now(),
             bot_health: RwLock::new(Vec::new()),
+            cloudflared: crate::cloudflared::SharedCloudflaredStatus::default(),
             http: reqwest::Client::new(),
             telegram: TelegramRuntime::new(),
             telegram_base_url: crate::telegram::DEFAULT_API_BASE.to_string(),
             uploads_dir,
             processing_dir,
-            watch_settings_path,
             watch_settings: RwLock::new(WatchSettings {
                 watch_enabled: true,
                 watch_root: String::new(),
@@ -355,8 +464,13 @@ mod tests {
             pending_uploads: Mutex::new(HashMap::new()),
             upload_rate_limits: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
+            played_segments: Mutex::new(HashMap::new()),
             job_queue,
             cache: Arc::new(crate::api::playback::SegmentCache::new(64 * 1024 * 1024)),
+            ffmpeg_available: true,
+            ffprobe_available: true,
+            selected_encoder: RwLock::new(crate::media::cpu_encoder()),
+            last_bot_index: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -394,6 +508,41 @@ mod tests {
 
         let result = scan_watch_folder(&state, &settings, &cfg).await;
         assert!(result.is_ok(), "scan should tolerate disappearing files");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn claim_keeps_file_in_place_when_enqueue_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "thls_watch_claim_fail_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = dir.join("watch");
+        let done = root.join("done");
+        std::fs::create_dir_all(&done).unwrap();
+
+        let video = root.join("test.mp4");
+        std::fs::write(&video, b"fake video").unwrap();
+
+        let state = make_state(&dir);
+        let result = claim_and_enqueue(
+            &state,
+            &root.canonicalize().unwrap(),
+            &done.canonicalize().unwrap(),
+            &video,
+        )
+        .await;
+
+        assert!(result.is_err(), "enqueue should fail with closed receiver");
+        assert!(video.exists(), "failed enqueue must leave source in place");
+        assert!(
+            !done.join("test.mp4").exists(),
+            "failed enqueue must not claim the file"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

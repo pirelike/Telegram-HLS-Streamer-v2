@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
@@ -20,30 +21,79 @@ pub(crate) async fn enqueue_job(
     source_path: PathBuf,
     metadata: JobMetadata,
     delete_source_on_finish: bool,
+    original_source_path: Option<String>,
 ) -> Result<String> {
     let job_id = uuid::Uuid::new_v4().simple().to_string();
-    let processing_path = state.processing_dir.join(&job_id);
-    let job = JobState {
-        job_id: job_id.clone(),
-        filename: filename.clone(),
-        source_path: source_path.clone(),
-        processing_path,
-        status: JobStatus::Queued,
-        progress: 0.0,
-        step: 0,
-        total_steps: 5,
-        description: "queued".into(),
-        queued_at: Instant::now(),
-        started_at: None,
-        finished_at: None,
-        cancel_requested: false,
-        cancel_flag: Arc::new(AtomicBool::new(false)),
-        error: None,
-        metadata: metadata.clone(),
-        analysis: None,
+    enqueue_existing_job(
+        state,
+        job_id.clone(),
+        filename,
+        source_path,
+        metadata,
         delete_source_on_finish,
-    };
-    state.jobs.lock().await.insert(job_id.clone(), job);
+        original_source_path,
+        true,
+    )
+    .await?;
+    Ok(job_id)
+}
+
+pub(crate) async fn enqueue_existing_job(
+    state: &Arc<AppState>,
+    job_id: String,
+    filename: String,
+    source_path: PathBuf,
+    metadata: JobMetadata,
+    delete_source_on_finish: bool,
+    original_source_path: Option<String>,
+    insert_state: bool,
+) -> Result<()> {
+    let original_source_path = sanitize_original_source_path(original_source_path)?;
+    let processing_path = state.processing_dir.join(&job_id);
+    {
+        let mut jobs = state.jobs.lock().await;
+        if insert_state {
+            let job = JobState {
+                job_id: job_id.clone(),
+                filename: filename.clone(),
+                source_path: source_path.clone(),
+                processing_path,
+                status: JobStatus::Queued,
+                progress: 0.0,
+                step: 0,
+                total_steps: 5,
+                description: "queued".into(),
+                queued_at: Instant::now(),
+                started_at: None,
+                finished_at: None,
+                cancel_requested: false,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                error: None,
+                metadata: metadata.clone(),
+                analysis: None,
+                delete_source_on_finish,
+                original_source_path: original_source_path.clone(),
+            };
+            jobs.insert(job_id.clone(), job);
+        } else if let Some(job) = jobs.get_mut(&job_id) {
+            if job.cancel_requested || job.status == JobStatus::Cancelled {
+                bail!("cancelled");
+            }
+            job.filename = filename.clone();
+            job.source_path = source_path.clone();
+            job.processing_path = processing_path;
+            job.status = JobStatus::Queued;
+            job.progress = 0.0;
+            job.description = "queued".into();
+            job.queued_at = Instant::now();
+            job.started_at = None;
+            job.metadata = metadata.clone();
+            job.delete_source_on_finish = delete_source_on_finish;
+            job.original_source_path = original_source_path.clone();
+        } else {
+            bail!("job state is unavailable");
+        }
+    }
 
     let request = JobRequest {
         job_id: job_id.clone(),
@@ -51,6 +101,7 @@ pub(crate) async fn enqueue_job(
         source_path,
         metadata,
         delete_source_on_finish,
+        original_source_path,
     };
     tracing::info!(
         job_id = %job_id,
@@ -59,11 +110,41 @@ pub(crate) async fn enqueue_job(
         delete_source_on_finish,
         "job enqueued"
     );
+    if let Ok(conn) = state.db_conn().await {
+        let job_id_for_db = job_id.clone();
+        let filename_for_db = request.filename.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            db::insert_job_marker(&conn, &job_id_for_db, &filename_for_db, "queued")
+        })
+        .await;
+        if let Err(e) = result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
+            tracing::warn!(job_id = %job_id, error = %e, "failed to write queued DB marker");
+        }
+    }
     if state.job_queue.send(request).await.is_err() {
         state.jobs.lock().await.remove(&job_id);
         bail!("job queue is unavailable");
     }
-    Ok(job_id)
+    Ok(())
+}
+
+pub(super) fn sanitize_original_source_path(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if FsPath::new(value).is_absolute()
+        || value.contains("..")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('\0')
+    {
+        bail!("original_source_path must be a filename label");
+    }
+    Ok(Some(value.to_string()))
 }
 
 pub(crate) fn start_background_tasks(state: Arc<AppState>, receiver: mpsc::Receiver<JobRequest>) {
@@ -114,6 +195,25 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
         job.started_at = Some(Instant::now());
     }
     tracing::info!(job_id = %request.job_id, "job analyzing started");
+
+    {
+        match state.db_conn().await {
+            Ok(conn) => {
+                let job_id_for_db = request.job_id.clone();
+                let filename_for_db = request.filename.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    db::insert_processing_marker(&conn, &job_id_for_db, &filename_for_db)
+                })
+                .await;
+                if let Err(e) = result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
+                    tracing::warn!(job_id = %request.job_id, error = %e, "failed to write processing DB marker");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %request.job_id, error = %e, "failed to acquire DB connection for processing marker");
+            }
+        }
+    }
 
     if let Err(e) = tokio::fs::create_dir_all(&processing_path).await {
         finish_job_error(
@@ -170,6 +270,35 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
         (state.config.read().await.clone(), flag)
     };
     let abr_override = request.metadata.abr_tiers_override.clone();
+
+    let estimated_output_bytes = analysis.file_size
+        * if !cfg.abr_tiers.is_empty() && cfg.abr_enabled {
+            3
+        } else {
+            1
+        }
+        + 256 * 1024 * 1024;
+    match super::super::uploads::free_space_bytes(&state.processing_dir) {
+        Ok(free) if free < estimated_output_bytes => {
+            finish_job_error(
+                &state,
+                &request.job_id,
+                format!(
+                    "insufficient_disk_space: need ~{} MB, have {} MB free",
+                    estimated_output_bytes / (1024 * 1024),
+                    free / (1024 * 1024)
+                ),
+            )
+            .await;
+            cleanup_request_paths(&request, &processing_path).await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "disk space check failed, continuing");
+        }
+        _ => {}
+    }
+
     let result = match media::process_media(
         &analysis,
         &request.job_id,
@@ -200,8 +329,19 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
         subtitle_files = result.subtitle_files.len(),
         segment_durations = result.segment_durations.len(),
         thumbnail = result.thumbnail_path.is_some(),
+        oversized_repaired = result.oversized_segments_repaired,
         "media processing complete"
     );
+
+    if result.oversized_segments_repaired > 0 {
+        let mut jobs = state.jobs.lock().await;
+        if let Some(job) = jobs.get_mut(&request.job_id) {
+            job.description = format!(
+                "repaired {} oversized segment(s)",
+                result.oversized_segments_repaired
+            );
+        }
+    }
 
     {
         let mut jobs = state.jobs.lock().await;
@@ -220,14 +360,46 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
     }
     tracing::info!(job_id = %request.job_id, "job telegram upload started");
 
-    let uploads = match upload_outputs(state.clone(), &cfg, &result, &cancel_flag).await {
-        Ok(uploads) => uploads,
-        Err(e) => {
-            finish_job_error(&state, &request.job_id, format!("upload_failed: {e}")).await;
+    let (uploads, last_upload_bot_index) =
+        match upload_outputs(state.clone(), &cfg, &result, &cancel_flag).await {
+            Ok(uploads) => uploads,
+            Err(e) => {
+                finish_job_error(&state, &request.job_id, format!("upload_failed: {e}")).await;
+                cleanup_request_paths(&request, &processing_path).await;
+                return;
+            }
+        };
+    if let Some(last_bot_index) = last_upload_bot_index {
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                finish_job_error(
+                    &state,
+                    &request.job_id,
+                    format!("bot_index_persist_failed: {e}"),
+                )
+                .await;
+                cleanup_request_paths(&request, &processing_path).await;
+                return;
+            }
+        };
+        let result =
+            tokio::task::spawn_blocking(move || db::set_last_bot_index(&conn, last_bot_index))
+                .await;
+        if let Err(e) = result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
+            finish_job_error(
+                &state,
+                &request.job_id,
+                format!("bot_index_persist_failed: {e}"),
+            )
+            .await;
             cleanup_request_paths(&request, &processing_path).await;
             return;
         }
-    };
+        state
+            .last_bot_index
+            .store(last_bot_index, std::sync::atomic::Ordering::Relaxed);
+    }
     if job_cancelled(&state, &request.job_id).await {
         cleanup_request_paths(&request, &processing_path).await;
         return;
@@ -236,7 +408,14 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
     let (job, tracks, segments, segment_parts) =
         build_db_rows(&request, &analysis, &result, uploads);
     {
-        let mut conn = state.db.lock().await;
+        let mut conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                finish_job_error(&state, &request.job_id, format!("db_conn_failed: {e}")).await;
+                cleanup_request_paths(&request, &processing_path).await;
+                return;
+            }
+        };
         tracing::info!(
             job_id = %request.job_id,
             tracks = tracks.len(),
@@ -244,7 +423,11 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
             segment_parts = segment_parts.len(),
             "job db save started"
         );
-        if let Err(e) = db::save_job(&mut conn, &job, &tracks, &segments, &segment_parts) {
+        let result = tokio::task::spawn_blocking(move || {
+            db::save_job(&mut conn, &job, &tracks, &segments, &segment_parts)
+        })
+        .await;
+        if let Err(e) = result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
             finish_job_error(&state, &request.job_id, format!("db_save_failed: {e}")).await;
             cleanup_request_paths(&request, &processing_path).await;
             return;
@@ -256,6 +439,7 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
         "job cycle complete"
     );
     finish_job_complete(&state, &request.job_id).await;
+    super::super::playback::spawn_cache_warmup(state.clone(), request.job_id.clone());
     cleanup_request_paths(&request, &processing_path).await;
 }
 
@@ -264,7 +448,7 @@ async fn upload_outputs(
     cfg: &Config,
     result: &media::ProcessingResult,
     cancel_flag: &Arc<AtomicBool>,
-) -> Result<Vec<telegram::UploadedFile>> {
+) -> Result<(Vec<telegram::UploadedFile>, Option<i64>)> {
     let files = prepare_upload_files(&result.output_dir, cfg.telegram_max_file_size).await?;
     if files.is_empty() {
         bail!("no uploadable HLS output files found");
@@ -277,6 +461,7 @@ async fn upload_outputs(
         "telegram output upload batch prepared"
     );
     let assignments = assign_upload_bots(&state, files.len()).await?;
+    let last_upload_bot_index = assignments.last().map(|(index, _)| *index);
     let parallelism = cfg
         .upload_parallelism
         .max(1)
@@ -286,13 +471,21 @@ async fn upload_outputs(
     let mut tasks = JoinSet::new();
 
     for ((segment_key, path), (bot_index, bot)) in files.into_iter().zip(assignments) {
+        if cancel_flag.load(Ordering::Relaxed) {
+            tasks.abort_all();
+            bail!("cancelled");
+        }
         let permit = semaphore.clone().acquire_owned().await?;
         let state = state.clone();
         let base_url = state.telegram_base_url.clone();
         let client = state.http.clone();
         let max_file_size = cfg.telegram_max_file_size;
+        let cancel_flag_clone = cancel_flag.clone();
         tasks.spawn(async move {
             let _permit = permit;
+            if cancel_flag_clone.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("cancelled"));
+            }
             telegram::upload_document(
                 &client,
                 &state.telegram,
@@ -328,7 +521,7 @@ async fn upload_outputs(
         update_upload_progress(&state, &result.job_id, uploaded.len(), total).await;
     }
     uploaded.sort_by(|a, b| a.segment_key.cmp(&b.segment_key));
-    Ok(uploaded)
+    Ok((uploaded, last_upload_bot_index))
 }
 
 async fn update_upload_progress(state: &AppState, job_id: &str, current: usize, total: usize) {
@@ -359,12 +552,11 @@ async fn split_file_for_upload(
         return Ok(vec![(segment_key.to_string(), path.clone())]);
     }
 
-    let chunk_size = (max_size as f64 * 0.95) as usize;
-    let bytes = tokio::fs::read(path)
+    let chunk_size = (max_size.saturating_mul(95) / 100).max(1);
+    let total_parts = ((file_size - 1) / chunk_size + 1) as i64;
+    let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("read {}", path.display()))?;
-
-    let total_parts = (file_size as f64 / chunk_size as f64).ceil() as i64;
+        .with_context(|| format!("open {}", path.display()))?;
     let mut parts = Vec::new();
 
     tracing::info!(
@@ -375,13 +567,34 @@ async fn split_file_for_upload(
         "splitting oversized segment"
     );
 
-    for (i, chunk) in bytes.chunks(chunk_size).enumerate() {
-        let part_index = i as i64;
+    for part_index in 0..total_parts {
         let part_key = format!("{}/part_{}", segment_key, part_index);
         let part_path = temp_dir.join(part_index.to_string());
-        tokio::fs::write(&part_path, chunk)
+        let offset = part_index as u64 * chunk_size;
+        let mut remaining = (file_size - offset).min(chunk_size);
+        let mut part_file = tokio::fs::File::create(&part_path)
             .await
-            .with_context(|| format!("write part {}", part_path.display()))?;
+            .with_context(|| format!("create part {}", part_path.display()))?;
+        let mut buf = vec![0_u8; 256 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = file
+                .read(&mut buf[..want])
+                .await
+                .with_context(|| format!("read part {} from {}", part_index, path.display()))?;
+            if n == 0 {
+                bail!("unexpected EOF splitting {}", path.display());
+            }
+            part_file
+                .write_all(&buf[..n])
+                .await
+                .with_context(|| format!("write part {}", part_path.display()))?;
+            remaining -= n as u64;
+        }
+        part_file
+            .flush()
+            .await
+            .with_context(|| format!("flush part {}", part_path.display()))?;
         parts.push((part_key, part_path));
     }
 
@@ -456,17 +669,14 @@ async fn assign_upload_bots(state: &AppState, file_count: usize) -> Result<Vec<(
     if cfg.bots.is_empty() {
         bail!("no Telegram bots configured");
     }
-    let _guard = state.telegram.round_robin.lock().await;
-    let conn = state.db.lock().await;
-    let last = db::get_last_bot_index(&conn)?;
+    let last = state
+        .last_bot_index
+        .load(std::sync::atomic::Ordering::Relaxed);
     let mut assignments = Vec::with_capacity(file_count);
     let bot_count = cfg.bots.len() as i64;
     for offset in 0..file_count {
         let index = (last + 1 + offset as i64).rem_euclid(bot_count);
         assignments.push((index, cfg.bots[index as usize].clone()));
-    }
-    if let Some((last_index, _)) = assignments.last() {
-        db::set_last_bot_index(&conn, *last_index)?;
     }
     Ok(assignments)
 }
@@ -511,6 +721,7 @@ pub(super) fn build_db_rows(
         season_number: metadata.season_number.map(i64::from),
         episode_number: metadata.episode_number.map(i64::from),
         part_number: metadata.part_number.map(i64::from),
+        source_path: request.original_source_path.clone(),
     };
     if !job.is_series {
         job.series_name.clear();
@@ -601,6 +812,7 @@ pub(super) fn build_db_rows(
                 bot_index: uploaded.bot_index,
                 file_size: uploaded.file_size as i64,
                 duration,
+                is_split: false,
             });
         }
     }
@@ -609,9 +821,10 @@ pub(super) fn build_db_rows(
         segments.push(db::NewSegment {
             duration: result.segment_durations.get(&segment_key).copied(),
             segment_key,
-            file_id: "split".into(),
+            file_id: String::new(),
             bot_index,
             file_size,
+            is_split: true,
         });
     }
 
@@ -666,6 +879,17 @@ pub(super) async fn finish_job_error(state: &AppState, job_id: &str, error: Stri
         true
     };
     if should_send {
+        if let Ok(conn) = state.db_conn().await {
+            let job_id_for_db = job_id.to_string();
+            let error_for_db = error.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                db::mark_job_as_failed(&conn, &job_id_for_db, &error_for_db)
+            })
+            .await;
+            if let Err(e) = result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
+                tracing::warn!(job_id = %job_id, error = %e, "failed to mark job as error in DB");
+            }
+        }
         send_job_webhook(state, job_id, JobStatus::Error, Some(error)).await;
     }
 }
@@ -674,9 +898,12 @@ async fn job_timeout_watcher(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         cleanup_old_terminal_jobs(&state).await;
-        let timeout = {
+        let (job_timeout, queue_timeout) = {
             let cfg = state.config.read().await;
-            Duration::from_secs(cfg.job_timeout_seconds as u64)
+            (
+                Duration::from_secs(cfg.job_timeout_seconds as u64),
+                Duration::from_secs(cfg.queue_timeout_seconds as u64),
+            )
         };
         let cleanup = {
             let mut jobs = state.jobs.lock().await;
@@ -686,8 +913,8 @@ async fn job_timeout_watcher(state: Arc<AppState>) {
                     !job.status.is_terminal()
                         && job
                             .started_at
-                            .map(|started| now.duration_since(started) > timeout)
-                            .unwrap_or(false)
+                            .map(|started| now.duration_since(started) > job_timeout)
+                            .unwrap_or_else(|| now.duration_since(job.queued_at) > queue_timeout)
                 })
                 .map(|job| {
                     let job_id = job.job_id.clone();
@@ -707,8 +934,38 @@ async fn job_timeout_watcher(state: Arc<AppState>) {
                 .collect::<Vec<_>>()
         };
         for (job_id, source_path, processing_path, delete_source) in cleanup {
+            if let Ok(conn) = state.db_conn().await {
+                let job_id_for_db = job_id.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    db::mark_job_as_failed(&conn, &job_id_for_db, "timed_out")
+                })
+                .await;
+                if let Err(e) = result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
+                    tracing::warn!(job_id = %job_id, error = %e, "failed to persist timed-out job");
+                }
+            }
             cleanup_job_paths(&source_path, &processing_path, delete_source).await;
             send_job_webhook(&state, &job_id, JobStatus::Error, Some("timed_out".into())).await;
+        }
+        let retention_days = {
+            let cfg = state.config.read().await;
+            cfg.job_retention_days
+        };
+        if retention_days > 0 {
+            match state.db_conn().await {
+                Ok(conn) => {
+                    let result = tokio::task::spawn_blocking(move || {
+                        db::delete_old_jobs(&conn, retention_days as i64)
+                    })
+                    .await;
+                    if let Err(e) = result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
+                        tracing::warn!(error = %e, "failed to delete old jobs");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to acquire DB connection for retention cleanup")
+                }
+            }
         }
     }
 }
@@ -740,9 +997,41 @@ pub(super) async fn cleanup_job_paths(
     delete_source: bool,
 ) {
     if delete_source {
-        let _ = tokio::fs::remove_file(source_path).await;
+        defer_source_delete(source_path).await;
     }
     let _ = tokio::fs::remove_dir_all(processing_path).await;
+}
+
+async fn defer_source_delete(source_path: &FsPath) {
+    if source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".pending_delete"))
+    {
+        return;
+    }
+    let Some(file_name) = source_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let pending_path = source_path.with_file_name(format!("{file_name}.pending_delete"));
+    match tokio::fs::rename(source_path, &pending_path).await {
+        Ok(()) => {
+            tracing::info!(
+                source_path = %source_path.display(),
+                pending_path = %pending_path.display(),
+                "source deletion deferred"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                source_path = %source_path.display(),
+                pending_path = %pending_path.display(),
+                error = %e,
+                "failed to defer source deletion"
+            );
+        }
+    }
 }
 
 pub(super) async fn send_job_webhook(
@@ -774,23 +1063,33 @@ pub(super) async fn send_job_webhook(
             })
         } else {
             drop(jobs);
-            let conn = state.db.lock().await;
-            match db::get_job(&conn, job_id) {
-                Ok(Some(job)) => json!({
-                    "event": "job_terminal",
-                    "job_id": job_id,
-                    "status": status.as_str(),
-                    "filename": job.filename,
-                    "media_type": job.media_type,
-                    "series_name": job.series_name,
-                    "error": error_text,
-                }),
-                _ => json!({
-                    "event": "job_terminal",
-                    "job_id": job_id,
-                    "status": status.as_str(),
-                    "error": error_text,
-                }),
+            match state.db_conn().await {
+                Ok(conn) => match db::get_job(&conn, job_id) {
+                    Ok(Some(job)) => json!({
+                        "event": "job_terminal",
+                        "job_id": job_id,
+                        "status": status.as_str(),
+                        "filename": job.filename,
+                        "media_type": job.media_type,
+                        "series_name": job.series_name,
+                        "error": error_text,
+                    }),
+                    _ => json!({
+                        "event": "job_terminal",
+                        "job_id": job_id,
+                        "status": status.as_str(),
+                        "error": error_text,
+                    }),
+                },
+                Err(e) => {
+                    tracing::warn!(job_id = %job_id, error = %e, "failed to acquire DB connection for job webhook payload");
+                    json!({
+                        "event": "job_terminal",
+                        "job_id": job_id,
+                        "status": status.as_str(),
+                        "error": error_text,
+                    })
+                }
             }
         }
     };
@@ -803,5 +1102,95 @@ pub(super) async fn send_job_webhook(
         Err(e) => {
             tracing::warn!(job_id = %job_id, error = %e, "job webhook failed");
         }
+    }
+}
+
+pub async fn recover_stuck_processing_jobs(state: &Arc<AppState>) {
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to acquire DB connection for stuck processing recovery");
+            return;
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+        let stuck = db::get_stuck_processing_jobs(&conn)?;
+        for job_id in &stuck {
+            db::mark_job_as_failed(&conn, job_id, "Server restart - job interrupted")?;
+        }
+        Ok(stuck)
+    })
+    .await;
+    let stuck = match result {
+        Ok(Ok(jobs)) => jobs,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "failed to query stuck processing jobs");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to query stuck processing jobs");
+            return;
+        }
+    };
+    if stuck.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        count = stuck.len(),
+        "found stuck processing jobs, marking as failed"
+    );
+}
+
+pub async fn clean_orphaned_processing_dirs(state: &Arc<AppState>) {
+    let Ok(mut entries) = tokio::fs::read_dir(&state.processing_dir).await else {
+        return;
+    };
+    // Single batch query: collect all non-terminal job_ids to know what's still active.
+    let active_ids: HashSet<String> = match state.db_conn().await {
+        Ok(conn) => {
+            match tokio::task::spawn_blocking(move || {
+                let mut stmt = conn.prepare(
+                    "SELECT job_id FROM jobs WHERE status IN ('queued','downloading','analyzing','processing','uploading')",
+                )?;
+                let ids: Result<HashSet<String>, rusqlite::Error> = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect();
+                ids
+            })
+            .await
+            {
+                Ok(Ok(ids)) => ids,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "processing directory cleanup batch query failed");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "processing directory cleanup batch task failed");
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to acquire DB connection for processing directory cleanup");
+            return;
+        }
+    };
+    let mut cleaned = 0u32;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !active_ids.contains(dir_name) {
+            let _ = tokio::fs::remove_dir_all(&path).await;
+            cleaned += 1;
+            tracing::info!(dir = %dir_name, "cleaned orphaned processing directory");
+        }
+    }
+    if cleaned > 0 {
+        tracing::info!(cleaned, "processing directory cleanup complete");
     }
 }

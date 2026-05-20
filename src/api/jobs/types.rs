@@ -23,6 +23,7 @@ pub(crate) struct JobMetadata {
 #[allow(dead_code)]
 pub(crate) enum JobStatus {
     Queued,
+    Downloading,
     Analyzing,
     Processing,
     Uploading,
@@ -35,6 +36,7 @@ impl JobStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
+            Self::Downloading => "downloading",
             Self::Analyzing => "analyzing",
             Self::Processing => "processing",
             Self::Uploading => "uploading",
@@ -69,6 +71,7 @@ pub(crate) struct JobState {
     pub(crate) metadata: JobMetadata,
     pub(crate) analysis: Option<media::MediaAnalysis>,
     pub(crate) delete_source_on_finish: bool,
+    pub(crate) original_source_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -80,4 +83,5 @@ pub(crate) struct JobRequest {
     #[allow(dead_code)]
     pub(super) metadata: JobMetadata,
     pub(super) delete_source_on_finish: bool,
+    pub(super) original_source_path: Option<String>,
 }

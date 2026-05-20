@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::fs::File;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
@@ -35,7 +36,6 @@ pub struct TelegramHealthResult {
 pub struct TelegramRuntime {
     upload_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     metrics: Mutex<TelegramMetrics>,
-    pub round_robin: Mutex<()>,
 }
 
 impl TelegramRuntime {
@@ -188,11 +188,8 @@ pub async fn upload_document(
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("invalid upload filename: {}", path.display()))?
         .to_string();
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read {}", path.display()))?;
     let lock = runtime.upload_lock(&bot.token).await;
-    let _guard = lock.lock().await;
+    let mut guard = lock.lock().await;
     let started = Instant::now();
     tracing::info!(
         segment_key = %segment_key,
@@ -203,7 +200,7 @@ pub async fn upload_document(
     );
 
     for attempt in 0..MAX_ATTEMPTS {
-        match send_document_attempt(client, base_url, &bot, &filename, bytes.clone()).await {
+        match send_document_attempt(client, base_url, &bot, path, &filename, file_size).await {
             Ok((file_id, remote_size)) => {
                 if remote_size != file_size {
                     runtime.record_upload_error(bot_index).await;
@@ -249,7 +246,9 @@ pub async fn upload_document(
                     wait_seconds = wait.as_secs(),
                     "telegram upload rate limited; retrying"
                 );
-                sleep(wait).await
+                drop(guard);
+                sleep(wait).await;
+                guard = lock.lock().await;
             }
             Err(TelegramError::Retryable(e)) if attempt + 1 < MAX_ATTEMPTS => {
                 tracing::warn!(
@@ -259,7 +258,9 @@ pub async fn upload_document(
                     bot_index,
                     "Telegram upload attempt failed; retrying"
                 );
+                drop(guard);
                 sleep(Duration::from_secs(2_u64.pow(attempt as u32))).await;
+                guard = lock.lock().await;
             }
             Err(e) => {
                 runtime.record_upload_error(bot_index).await;
@@ -286,6 +287,9 @@ pub async fn get_file_bytes(
     bot_index: i64,
 ) -> Result<Vec<u8>> {
     validate_file_id(file_id)?;
+    if bot_index < 0 {
+        return Err(anyhow!("invalid bot index {bot_index}"));
+    }
     let bot = bots
         .get(bot_index as usize)
         .ok_or_else(|| anyhow!("bot index {bot_index} is not configured"))?;
@@ -329,10 +333,14 @@ async fn send_document_attempt(
     client: &reqwest::Client,
     base_url: &str,
     bot: &BotConfig,
+    path: &Path,
     filename: &str,
-    bytes: Vec<u8>,
+    file_size: u64,
 ) -> Result<(String, u64), TelegramError> {
-    let part = Part::bytes(bytes).file_name(filename.to_string());
+    let file = File::open(path).await.map_err(|e| {
+        TelegramError::Permanent(anyhow!("open upload file {}: {e}", path.display()))
+    })?;
+    let part = Part::stream_with_length(file, file_size).file_name(filename.to_string());
     let form = Form::new()
         .text("chat_id", bot.channel_id.to_string())
         .part("document", part);
@@ -417,6 +425,9 @@ pub async fn get_file_response(
     bot_index: i64,
 ) -> Result<reqwest::Response> {
     validate_file_id(file_id)?;
+    if bot_index < 0 {
+        return Err(anyhow!("invalid bot index {bot_index}"));
+    }
     let bot = bots
         .get(bot_index as usize)
         .ok_or_else(|| anyhow!("bot index {bot_index} is not configured"))?;
@@ -473,6 +484,12 @@ fn file_url(base_url: &str, token: &str, file_path: &str) -> String {
 }
 
 fn validate_file_id(file_id: &str) -> Result<()> {
+    if file_id.len() < 5 {
+        tracing::warn!(
+            len = file_id.len(),
+            "validate_file_id called with suspiciously short file_id"
+        );
+    }
     if (50..=255).contains(&file_id.len())
         && file_id
             .bytes()
@@ -480,7 +497,7 @@ fn validate_file_id(file_id: &str) -> Result<()> {
     {
         Ok(())
     } else {
-        bail!("invalid Telegram file_id")
+        bail!("invalid Telegram file_id (expected 50–255 chars of A-Za-z0-9/_-)")
     }
 }
 
@@ -544,7 +561,11 @@ fn truncate(value: &str, limit: usize) -> String {
     if value.len() <= limit {
         value.to_string()
     } else {
-        value[..limit].to_string()
+        let mut boundary = limit;
+        while boundary > 0 && !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value[..boundary].to_string()
     }
 }
 
@@ -971,5 +992,33 @@ mod tests {
                 "concurrent upload_lock calls must return the same Arc"
             );
         }
+    }
+
+    #[test]
+    fn validate_file_id_rejects_short_input() {
+        let err = validate_file_id("").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid Telegram file_id"),
+            "empty string should be rejected: {err}"
+        );
+
+        let err = validate_file_id("abc").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid Telegram file_id"),
+            "short string (3 chars) should be rejected: {err}"
+        );
+
+        let err = validate_file_id(&"a".repeat(49)).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid Telegram file_id"),
+            "49-char string should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_file_id_accepts_valid_ids() {
+        assert!(validate_file_id(&"A".repeat(50)).is_ok());
+        assert!(validate_file_id(&"aB3_z-".repeat(10)).is_ok());
+        assert!(validate_file_id(&"A".repeat(255)).is_ok());
     }
 }

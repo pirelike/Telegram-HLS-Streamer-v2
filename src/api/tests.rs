@@ -1,14 +1,21 @@
 use super::*;
 use axum::body::{to_bytes, Body};
+use axum::extract::Path as AxumPath;
 use axum::http::{Request, StatusCode};
+use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::any;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
 
 use super::uploads::cleanup_expired_uploads;
 
 fn app_state() -> Arc<AppState> {
+    app_state_with_telegram_base(crate::telegram::DEFAULT_API_BASE.to_string())
+}
+
+fn app_state_with_telegram_base(telegram_base_url: String) -> Arc<AppState> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -18,11 +25,12 @@ fn app_state() -> Arc<AppState> {
     let uploads_dir = dir.join("uploads");
     let processing_dir = dir.join("processing");
     let db_path = dir.join("streamer.db");
-    let watch_settings_path = dir.join("watch_settings.json");
     std::fs::create_dir_all(&uploads_dir).unwrap();
     std::fs::create_dir_all(&processing_dir).unwrap();
-    let conn = crate::db::init_db(&db_path).unwrap();
+    let pool = crate::db::init_db_pool(&db_path).unwrap();
+    let conn = pool.get().unwrap();
     let cfg = Config::load(&conn).unwrap();
+    drop(conn);
     let watch_settings = watch_folder::WatchSettings {
         watch_enabled: false,
         watch_root: String::new(),
@@ -30,24 +38,30 @@ fn app_state() -> Arc<AppState> {
     };
     let (job_queue, job_receiver) = mpsc::channel(100);
     let state = Arc::new(AppState {
-        db: Arc::new(Mutex::new(conn)),
-        db_path,
+        db: RwLock::new(pool),
+        db_path: db_path.clone(),
+        env_path: db_path.parent().unwrap().join(".env"),
         config: RwLock::new(Arc::new(cfg)),
         started_at: Instant::now(),
         bot_health: RwLock::new(Vec::new()),
+        cloudflared: crate::cloudflared::SharedCloudflaredStatus::default(),
         http: reqwest::Client::new(),
         telegram: TelegramRuntime::new(),
-        telegram_base_url: crate::telegram::DEFAULT_API_BASE.to_string(),
+        telegram_base_url,
         uploads_dir,
         processing_dir,
-        watch_settings_path,
         watch_settings: RwLock::new(watch_settings),
         watch_seen: Mutex::new(HashMap::new()),
         pending_uploads: Mutex::new(HashMap::new()),
         upload_rate_limits: Mutex::new(HashMap::new()),
         jobs: Mutex::new(HashMap::new()),
+        played_segments: Mutex::new(HashMap::new()),
         job_queue,
         cache: Arc::new(SegmentCache::new(64 * 1024 * 1024)),
+        ffmpeg_available: true,
+        ffprobe_available: true,
+        selected_encoder: RwLock::new(crate::media::cpu_encoder()),
+        last_bot_index: std::sync::atomic::AtomicI64::new(0),
     });
     start_background_tasks(state.clone(), job_receiver);
     state
@@ -58,11 +72,61 @@ async fn json_response(response: Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn exhaust_db_pool(state: &Arc<AppState>) -> crate::db::DbConn {
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&state.db_path);
+    let pool = r2d2::Pool::builder()
+        .max_size(1)
+        .connection_timeout(Duration::from_millis(10))
+        .build(manager)
+        .unwrap();
+    let held_conn = pool.get().unwrap();
+    *state.db.write().await = pool;
+    held_conn
+}
+
 async fn response_bytes(response: Response) -> Vec<u8> {
     to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap()
         .to_vec()
+}
+
+#[tokio::test]
+async fn orphaned_processing_cleanup_removes_orphans_and_keeps_active_jobs() {
+    let state = app_state();
+    let orphan = state.processing_dir.join("orphan-job");
+    let active = state.processing_dir.join("active-job");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::create_dir_all(&active).unwrap();
+    {
+        let conn = state.db_conn().await.unwrap();
+        crate::db::insert_processing_marker(&conn, "active-job", "active.mkv").unwrap();
+    }
+
+    jobs::processing::clean_orphaned_processing_dirs(&state).await;
+
+    assert!(!orphan.exists());
+    assert!(active.exists());
+}
+
+#[tokio::test]
+async fn request_handlers_return_503_when_db_pool_is_exhausted() {
+    let state = app_state();
+    let _held_conn = exhaust_db_pool(&state).await;
+
+    for request in [
+        Request::post("/api/db/backup").body(Body::empty()).unwrap(),
+        Request::get("/api/bots").body(Body::empty()).unwrap(),
+        Request::get("/hls/missing/master.m3u8")
+            .body(Body::empty())
+            .unwrap(),
+        Request::get("/series/missing").body(Body::empty()).unwrap(),
+    ] {
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = json_response(response).await;
+        assert_eq!(body["error"], "db_unavailable");
+    }
 }
 
 fn multipart_body(fields: &[(&str, Option<&str>, Vec<u8>)]) -> (String, Vec<u8>) {
@@ -123,6 +187,39 @@ async fn fake_webhook_server() -> (String, Arc<FakeWebhook>) {
     (format!("http://{addr}/hook"), fake)
 }
 
+async fn fake_telegram_handler(AxumPath(path): AxumPath<String>) -> AxumResponse {
+    if path.ends_with("/getFile") {
+        return Json(json!({
+            "ok": true,
+            "result": { "file_path": "segment.bin" }
+        }))
+        .into_response();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+    tokio::spawn(async move {
+        for chunk in [
+            axum::body::Bytes::from_static(b"cold "),
+            axum::body::Bytes::from_static(b"segment "),
+            axum::body::Bytes::from_static(b"bytes"),
+        ] {
+            let _ = tx.send(Ok(chunk)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    (StatusCode::OK, Body::from_stream(ReceiverStream::new(rx))).into_response()
+}
+
+async fn fake_telegram_server() -> String {
+    let app = axum::Router::new().route("/*path", any(fake_telegram_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 async fn init_upload(state: Arc<AppState>, filename: &str, total_size: u64) -> Value {
     let response = router(state)
         .oneshot(
@@ -148,7 +245,7 @@ async fn save_complete_job(
     season_number: Option<i64>,
     episode_number: Option<i64>,
 ) {
-    let mut conn = state.db.lock().await;
+    let mut conn = state.db_conn().await.unwrap();
     let mut job = db::NewJob::complete(job_id, filename);
     job.media_type = media_type.into();
     job.series_name = series_name.into();
@@ -187,8 +284,73 @@ async fn save_complete_job(
         bot_index: 0,
         file_size: 123,
         duration: Some(4.0),
+        is_split: false,
     }];
     db::save_job(&mut conn, &job, &tracks, &segments, &[]).unwrap();
+}
+
+#[tokio::test]
+async fn cold_segment_waiter_succeeds_when_leader_disconnects() {
+    let fake_telegram = fake_telegram_server().await;
+    let state = app_state_with_telegram_base(fake_telegram);
+    let cache_dir = state
+        .db_path
+        .parent()
+        .unwrap()
+        .join("cache")
+        .to_string_lossy()
+        .to_string();
+    {
+        let mut cfg = state.config.read().await.as_ref().clone();
+        cfg.cache_dir = cache_dir;
+        cfg.bots = vec![crate::config::BotConfig {
+            token: "12345678:abcdefghijklmnopqrstuvwxyzABCDEFGHI".into(),
+            channel_id: -100,
+            source: crate::config::BotSource::Env,
+            db_id: None,
+            label: "test".into(),
+        }];
+        *state.config.write().await = Arc::new(cfg);
+    }
+    let file_id = "A".repeat(50);
+    {
+        let mut conn = state.db_conn().await.unwrap();
+        let job = db::NewJob::complete("coldwait", "Cold Wait");
+        let segment = db::NewSegment {
+            segment_key: "video_0/video_0001.m4s".into(),
+            file_id,
+            bot_index: 0,
+            file_size: 18,
+            duration: Some(4.0),
+            is_split: false,
+        };
+        db::save_job(&mut conn, &job, &[], &[segment], &[]).unwrap();
+    }
+
+    let leader_response = router(state.clone())
+        .oneshot(
+            Request::get("/segment/coldwait/video_0/video_0001.m4s")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(leader_response.status(), StatusCode::OK);
+    drop(leader_response);
+
+    let follower_response = router(state.clone())
+        .oneshot(
+            Request::get("/segment/coldwait/video_0/video_0001.m4s")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(follower_response.status(), StatusCode::OK);
+    let bytes = response_bytes(follower_response).await;
+    assert_eq!(&bytes, b"cold segment bytes");
+
+    assert!(state.cache.snapshot().entries >= 1);
 }
 
 #[tokio::test]
@@ -234,6 +396,32 @@ async fn upload_init_computes_chunk_count() {
     let body = json_response(response).await;
     assert_eq!(body["chunk_size"], 4);
     assert_eq!(body["total_chunks"], 3);
+}
+
+#[tokio::test]
+async fn url_ingest_rejects_non_http_and_local_urls() {
+    let state = app_state();
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/api/ingest/url")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"file:///tmp/movie.mp4"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = router(state)
+        .oneshot(
+            Request::post("/api/ingest/url")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"http://127.0.0.1/movie.mp4"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -467,7 +655,7 @@ async fn settings_update_does_not_reload_bot_pool() {
     let state = app_state();
     let env_bot_count;
     {
-        let conn = state.db.lock().await;
+        let conn = state.db_conn().await.unwrap();
         db::add_bot(
             &conn,
             "12345678:abcdefghijklmnopqrstuvwxyzabcdefghi",
@@ -530,7 +718,11 @@ async fn watch_settings_validate_paths_and_persist() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(state.watch_settings_path.exists());
+    let conn = state.db_conn().await.unwrap();
+    assert!(crate::db::get_internal_value(&conn, "watch_settings")
+        .unwrap()
+        .is_some());
+    drop(conn);
     assert!(done.exists());
     let body = json_response(response).await;
     assert_eq!(body["watch_running"], true);
@@ -589,7 +781,7 @@ async fn db_export_import_reports_missing_source_bot_map_entries_and_allows_expl
     let body = json_response(response).await;
     assert_eq!(body["merged_jobs"], 1);
     assert_eq!(body["merged_segments"], 1);
-    let conn = target.db.lock().await;
+    let conn = target.db_conn().await.unwrap();
     // Segment was auto-mapped from bot_index=1 to 0
     assert_eq!(
         db::get_segment(&conn, "job1", "video_0/video_0001.m4s")
@@ -643,7 +835,7 @@ async fn db_export_import_reports_missing_source_bot_map_entries_and_allows_expl
     // Data was already merged by auto-fill above (INSERT OR IGNORE)
     assert_eq!(body["merged_jobs"], 0);
     assert_eq!(body["merged_segments"], 0);
-    let conn = target.db.lock().await;
+    let conn = target.db_conn().await.unwrap();
     assert!(db::get_job(&conn, "job1").unwrap().is_some());
     assert_eq!(
         db::get_segment(&conn, "job1", "video_0/video_0001.m4s")
@@ -678,8 +870,49 @@ async fn database_load_replaces_live_db_and_reports_backup() {
     let body = json_response(response).await;
     assert_eq!(body["schema_revision"], db::LATEST_SCHEMA_REVISION);
     assert!(std::path::Path::new(body["backup_path"].as_str().unwrap()).exists());
-    let conn = state.db.lock().await;
+    let conn = state.db_conn().await.unwrap();
     assert!(db::get_job(&conn, "loaded").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn database_load_waits_for_checked_out_pool_connections() {
+    let state = app_state();
+    let held_conn = state.db_conn().await.unwrap();
+    let source_path = state.db_path.parent().unwrap().join("replacement_wait.db");
+    {
+        let mut conn = db::init_db(&source_path).unwrap();
+        let job = db::NewJob::complete("loaded-after-drain", "Loaded After Drain");
+        db::save_job(&mut conn, &job, &[], &[], &[]).unwrap();
+    }
+    let bytes = std::fs::read(&source_path).unwrap();
+    let (content_type, body) = multipart_body(&[("database", Some("replacement.db"), bytes)]);
+    let request_state = state.clone();
+    let handle = tokio::spawn(async move {
+        router(request_state)
+            .oneshot(
+                Request::post("/api/database/load")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !handle.is_finished(),
+        "database load must wait for checked-out old pool connections"
+    );
+    drop(held_conn);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let conn = state.db_conn().await.unwrap();
+    assert!(db::get_job(&conn, "loaded-after-drain").unwrap().is_some());
 }
 
 #[tokio::test]
@@ -725,7 +958,7 @@ async fn bots_are_masked_and_metrics_shape_exists() {
     let state = app_state();
     let token = "12345678:abcdefghijklmnopqrstuvwxyzabcdefghi";
     {
-        let conn = state.db.lock().await;
+        let conn = state.db_conn().await.unwrap();
         db::add_bot(&conn, token, -100, "main").unwrap();
         *state.config.write().await = Arc::new(Config::load(&conn).unwrap());
     }
@@ -807,6 +1040,7 @@ async fn cancelling_job_sends_terminal_webhook() {
             },
             analysis: None,
             delete_source_on_finish: true,
+            original_source_path: None,
         },
     );
 
@@ -1027,6 +1261,7 @@ async fn cancel_during_processing_cleans_up_and_leaves_no_db_row() {
             metadata: jobs::JobMetadata::default(),
             analysis: None,
             delete_source_on_finish: true,
+            original_source_path: None,
         },
     );
 
@@ -1042,15 +1277,18 @@ async fn cancel_during_processing_cleans_up_and_leaves_no_db_row() {
 
     // Processing directory removed
     assert!(!processing_path.exists());
-    // Source file removed (delete_source_on_finish = true)
+    // Source file retained for deferred deletion (delete_source_on_finish = true)
     assert!(!source_path.exists());
+    assert!(source_path
+        .with_file_name("source-cancel.mp4.pending_delete")
+        .exists());
     // Job status is cancelled
     let jobs = state.jobs.lock().await;
     let job = jobs.get("cancel-proc").unwrap();
     assert_eq!(job.status.as_str(), "cancelled");
     drop(jobs);
     // No DB row for this job
-    let conn = state.db.lock().await;
+    let conn = state.db_conn().await.unwrap();
     assert!(db::get_job(&conn, "cancel-proc").unwrap().is_none());
 }
 

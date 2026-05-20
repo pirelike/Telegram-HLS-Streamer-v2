@@ -1,3 +1,61 @@
+
+# AGENTS.md
+
+> This file is auto-loaded by OpenCode for both the `planner` and
+> `investigator` agents. Keep it concise — it goes into every context window.
+> For verbose domain rules, use files in `.opencode/rules/*.md` (already
+> referenced via the `instructions` field in `opencode.json`).
+
+## Project overview
+
+[Replace with 2–4 sentences describing what this project does, its
+language/runtime, and the deployment target.]
+
+## Build, test, and lint commands
+
+- **Install:** `[command]`
+- **Build:** `[command]`
+- **Test (canonical):** `[command]`
+- **Test (single file):** `[command]`
+- **Lint:** `[command]`
+- **Type-check:** `[command]`
+- **Format:** `[command]`
+
+These are the canonical verification commands. The investigator should cite
+this section when reporting verification commands to the planner.
+
+## Conventions
+
+- **Style:** [e.g., "We use 2-space indentation; semicolons required."]
+- **Imports:** [e.g., "Absolute imports via `@/` alias; no deep relative paths."]
+- **File naming:** [e.g., "kebab-case for files, PascalCase for components."]
+- **Test naming:** [e.g., "Co-located `*.test.ts` files; no top-level `__tests__/`."]
+- **Error handling:** [e.g., "Throw typed errors from `lib/errors.ts`; never bare `throw new Error(...)`."]
+
+## Architecture invariants
+
+- [Anything that should never change without explicit discussion.
+  Examples: "All public API calls go through `src/api/client.ts`."
+  "Database access only via the repository layer in `src/db/`."]
+
+## Do-not-touch zones
+
+- [Paths where edits require special caution. Examples:
+  `src/migrations/` — never modify existing migration files.
+  `config/secrets/` — read-only; values are populated at deploy time.]
+
+## Agent guidance
+
+- The default agent is `planner`. Tab to `build` for implementation.
+- For non-trivial work (3+ files, API/schema changes, >30 min effort, or
+  cross-cutting concerns), use `planner` first to produce a reviewable plan.
+- For trivial work (single-file edits, typo fixes, adding a log line),
+  switch directly to `build`.
+- The planner delegates codebase exploration to the `investigator` subagent
+  — do not bypass this by reading dozens of files yourself.
+- Never invoke the investigator for questions about user intent — that is
+  the planner's job via the `question` tool.
+
 ## ⚠️ ALAPELV — OLVASD EL MINDEN FELADAT ELŐTT
 
 **A legegyszerűbb működő megoldást írd meg. Mindig.**
@@ -45,6 +103,9 @@ Az AI agentek krónikusan túlkomplikálnak mindent — absztrakciós rétegeket
 - Kódmódosítás után futtass célzott ellenőrzést. Általános változtatásnál `cargo test`; formázásnál `cargo fmt --check`; lintnél `cargo clippy --all-targets --all-features`.
 - Médiafolyamot érintő változtatásnál, ha Telegram credential be van állítva, a kézi end-to-end ellenőrzés: `python3 scripts/upload_and_wait.py TEST_FILE.mkv --timeout 7200 --start-timeout 180 --request-timeout 180`.
 - Ha dokumentációt frissítesz, tartsd szinkronban az agent fájlokat: `AGENTS.md`, `CODEX.md`, `CLAUDE.md`.
+- **Telegram feltöltési limit**: A Telegram Bot API maximális fájlmérete 20 MB (`TELEGRAM_MAX_FILE_SIZE=20971520`). Minden feltöltött fájlnak (`.m4s`, `.ts`, `.vtt`, `.jpg`) ez alatt kell lennie. A `telegram_max_file_size` config értéket SOHA ne emeld 20 MB fölé.
+- **Minőségmegőrzés**: SOHA ne növeld a kódolási sebességet a videó minőségének rovására. Tilos `-preset ultrafast`-ot vagy más speed-over-quality FFmpeg beállítást használni teljesítményoptimalizálás céljából.
+- **Túlméretes szegmens kezelése**: Ha egy szegmens meghaladja a 20 MB-ot, számold ki a legmagasabb bitrate-et ami még belefér, és azzal kódold újra. A felbontást NE csökkentsd — ugyanaz a felbontás, maximális bitrate. Ha a minimális értelmes bitrate (32k) mellett is túl nagy, keyframe határoknál vágd szét (`-c copy`, nincs újrakódolás).
 
 # Project Instructions
 

@@ -20,6 +20,7 @@ SQLite persistence layer. All reusable DB schema, query, migration, import/expor
 - `NewJob`/`NewTrack`/`NewSegment`/`NewSegmentPart` — insert/update inputs.
 - `JobRow`/`TrackRow`/`SegmentRow`/group rows — read-model outputs.
 - Query and transfer functions are re-exported through `crate::db::*`.
+- `kv_internal` stores private runtime keys such as `_last_bot_index` and versioned watch settings; public runtime settings stay in `settings` with `value_type`.
 
 ## Dependency direction
 

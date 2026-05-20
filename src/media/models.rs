@@ -50,6 +50,7 @@ pub struct ProcessingResult {
     pub subtitle_files: Vec<SubtitleFile>,
     pub segment_durations: std::collections::HashMap<String, f64>,
     pub thumbnail_path: Option<std::path::PathBuf>,
+    pub oversized_segments_repaired: usize,
 }
 
 #[derive(Debug, Clone)]

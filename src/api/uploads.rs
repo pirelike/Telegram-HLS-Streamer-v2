@@ -56,12 +56,24 @@ pub(super) async fn handle_upload_init(
     headers: HeaderMap,
     Json(body): Json<UploadInitRequest>,
 ) -> Response {
-    let ip = client_ip(&headers);
+    let cfg = state.config.read().await.clone();
+    let ip = client_ip(&headers, cfg.behind_proxy);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
-
-    let cfg = state.config.read().await.clone();
+    if !state.ffmpeg_available || !state.ffprobe_available {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tools_unavailable",
+            if !state.ffmpeg_available && !state.ffprobe_available {
+                "ffmpeg and ffprobe are not available"
+            } else if !state.ffmpeg_available {
+                "ffmpeg is not available"
+            } else {
+                "ffprobe is not available"
+            },
+        );
+    }
     if body.total_size == 0 {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -192,7 +204,8 @@ pub(super) async fn handle_upload_chunk(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let ip = client_ip(&headers);
+    let cfg = state.config.read().await.clone();
+    let ip = client_ip(&headers, cfg.behind_proxy);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
@@ -201,6 +214,9 @@ pub(super) async fn handle_upload_chunk(
         Ok(value) => value,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_payload", e),
     };
+    if uuid::Uuid::parse_str(&upload_id).is_err() {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_payload", "invalid upload id format");
+    }
     let chunk_index: u32 = match required_header(&headers, "x-chunk-index").and_then(|v| {
         v.parse::<u32>()
             .map_err(|_| "invalid chunk index".to_string())
@@ -208,83 +224,103 @@ pub(super) async fn handle_upload_chunk(
         Ok(value) => value,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_payload", e),
     };
-
-    let cfg = state.config.read().await.clone();
-    let mut pending = state.pending_uploads.lock().await;
-    let Some(upload) = pending.get_mut(&upload_id) else {
-        return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
+    let (path, _chunk_size, total_chunks, total_size, start_offset) = {
+        let mut pending = state.pending_uploads.lock().await;
+        let Some(upload) = pending.get_mut(&upload_id) else {
+            return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
+        };
+        if upload.ip != ip {
+            return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
+        }
+        if upload.last_activity.elapsed() > Duration::from_secs(cfg.pending_upload_ttl_seconds as u64) {
+            let path = upload.path.clone();
+            pending.remove(&upload_id);
+            drop(pending);
+            let _ = tokio::fs::remove_file(path).await;
+            return api_error(StatusCode::NOT_FOUND, "not_found", "upload expired");
+        }
+        if chunk_index >= upload.total_chunks {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+                "chunk index is out of range",
+            );
+        }
+        let expected = expected_chunk_size(upload, chunk_index);
+        if body.len() as u64 != expected {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+                format!("chunk size must be {expected} bytes"),
+            );
+        }
+        upload.last_activity = Instant::now();
+        if upload.received_chunks.contains(&chunk_index) {
+            return Json(json!({
+                "chunk_index": chunk_index,
+                "received_bytes": upload.received_bytes,
+                "received_chunks": upload.received_chunks.len(),
+                "is_retry": true,
+            }))
+            .into_response();
+        }
+        (
+            upload.path.clone(),
+            upload.chunk_size,
+            upload.total_chunks,
+            upload.total_size,
+            chunk_index as u64 * upload.chunk_size,
+        )
     };
-    if upload.ip != ip {
-        return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
-    }
-    if upload.last_activity.elapsed() > Duration::from_secs(cfg.pending_upload_ttl_seconds as u64) {
-        let path = upload.path.clone();
-        pending.remove(&upload_id);
-        drop(pending);
-        let _ = tokio::fs::remove_file(path).await;
-        return api_error(StatusCode::NOT_FOUND, "not_found", "upload expired");
-    }
-    if chunk_index >= upload.total_chunks {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_payload",
-            "chunk index is out of range",
-        );
-    }
-    let expected = expected_chunk_size(upload, chunk_index);
-    if body.len() as u64 != expected {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_payload",
-            format!("chunk size must be {expected} bytes"),
-        );
-    }
-    upload.last_activity = Instant::now();
-    if upload.received_chunks.contains(&chunk_index) {
-        return Json(json!({
-            "chunk_index": chunk_index,
-            "received_bytes": upload.received_bytes,
-            "received_chunks": upload.received_chunks.len(),
-            "is_retry": true,
-        }))
-        .into_response();
-    }
 
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
-        .open(&upload.path)
+        .open(&path)
         .await
     {
         Ok(file) => file,
         Err(e) => return upload_io_error("chunk_write_failed", e),
     };
-    if let Err(e) = file
-        .seek(std::io::SeekFrom::Start(
-            chunk_index as u64 * upload.chunk_size,
-        ))
-        .await
-    {
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
         return upload_io_error("chunk_write_failed", e);
     }
     if let Err(e) = file.write_all(&body).await {
         return upload_io_error("chunk_write_failed", e);
     }
-    upload.received_chunks.insert(chunk_index);
-    upload.received_bytes += body.len() as u64;
+
+    let mut pending = state.pending_uploads.lock().await;
+    let Some(upload) = pending.get_mut(&upload_id) else {
+        return api_error(StatusCode::NOT_FOUND, "not_found", "upload expired or completed during write");
+    };
+    if upload.ip != ip {
+        return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
+    }
+
+    let is_retry = upload.received_chunks.contains(&chunk_index);
+    if !is_retry {
+        upload.received_chunks.insert(chunk_index);
+        upload.received_bytes += body.len() as u64;
+    }
+    upload.last_activity = Instant::now();
+
+    let received_bytes = upload.received_bytes;
+    let received_chunks_len = upload.received_chunks.len();
+
     tracing::info!(
         upload_id = %upload_id,
         chunk_index,
-        total_chunks = upload.total_chunks,
-        received_chunks = upload.received_chunks.len(),
-        received_bytes = upload.received_bytes,
-        total_size = upload.total_size,
+        total_chunks = total_chunks,
+        received_chunks = received_chunks_len,
+        received_bytes = received_bytes,
+        total_size = total_size,
         "upload chunk stored"
     );
+
     Json(json!({
         "chunk_index": chunk_index,
-        "received_bytes": upload.received_bytes,
-        "received_chunks": upload.received_chunks.len(),
-        "is_retry": false,
+        "received_bytes": received_bytes,
+        "received_chunks": received_chunks_len,
+        "is_retry": is_retry,
     }))
     .into_response()
 }
@@ -294,9 +330,14 @@ pub(super) async fn handle_upload_finalize(
     headers: HeaderMap,
     Json(body): Json<UploadFinalizeRequest>,
 ) -> Response {
-    let ip = client_ip(&headers);
+    let cfg = state.config.read().await.clone();
+    let ip = client_ip(&headers, cfg.behind_proxy);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
+    }
+
+    if uuid::Uuid::parse_str(&body.upload_id).is_err() {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_payload", "invalid upload id format");
     }
 
     let upload = {
@@ -333,7 +374,21 @@ pub(super) async fn handle_upload_finalize(
         title: body.title,
         abr_tiers_override: None,
     });
-    let job_id = match enqueue_job(&state, upload.1, upload.2, metadata, true).await {
+    let original_source_path = upload
+        .2
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(ToOwned::to_owned);
+    let job_id = match enqueue_job(
+        &state,
+        upload.1,
+        upload.2,
+        metadata,
+        true,
+        original_source_path,
+    )
+    .await
+    {
         Ok(job_id) => job_id,
         Err(_) => {
             return api_error(
@@ -422,7 +477,7 @@ fn expected_chunk_size(upload: &PendingUpload, chunk_index: u32) -> u64 {
         .min(upload.chunk_size)
 }
 
-fn sanitize_filename(raw: &str) -> Result<String, String> {
+pub(crate) fn sanitize_filename(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("filename is empty".into());
@@ -455,13 +510,17 @@ fn required_header(headers: &HeaderMap, name: &str) -> Result<String, String> {
         .map_err(|_| format!("invalid {name} header"))
 }
 
-fn client_ip(headers: &HeaderMap) -> std::net::IpAddr {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback ip"))
+fn client_ip(headers: &HeaderMap, behind_proxy: bool) -> std::net::IpAddr {
+    if behind_proxy {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback ip"))
+    } else {
+        "127.0.0.1".parse().expect("loopback ip")
+    }
 }
 
 async fn check_upload_rate_limit(state: &AppState, ip: std::net::IpAddr) -> Option<Response> {
@@ -503,12 +562,12 @@ fn upload_io_error(code: &str, e: std::io::Error) -> Response {
     }
 }
 
-fn is_disk_full(e: &std::io::Error) -> bool {
+pub(crate) fn is_disk_full(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(28)
 }
 
 #[cfg(unix)]
-fn free_space_bytes(path: &FsPath) -> std::io::Result<u64> {
+pub(crate) fn free_space_bytes(path: &FsPath) -> std::io::Result<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -523,6 +582,6 @@ fn free_space_bytes(path: &FsPath) -> std::io::Result<u64> {
 }
 
 #[cfg(not(unix))]
-fn free_space_bytes(_path: &FsPath) -> std::io::Result<u64> {
+pub(crate) fn free_space_bytes(_path: &FsPath) -> std::io::Result<u64> {
     Ok(u64::MAX)
 }

@@ -10,6 +10,14 @@ use super::models::{
     SeriesGroupRow, TrackRow, JOB_SELECT_SQL, SEGMENT_SELECT_SQL, TRACK_SELECT_SQL,
 };
 
+fn setting_value_type(key: &str) -> Result<&'static str> {
+    let spec = crate::settings_registry::setting_spec(key)
+        .ok_or_else(|| anyhow::anyhow!("unknown setting key: {key}"))?;
+    Ok(crate::settings_registry::setting_type_name(
+        spec.setting_type,
+    ))
+}
+
 pub fn save_job(
     conn: &mut Connection,
     job: &NewJob,
@@ -23,8 +31,9 @@ pub fn save_job(
     tx.execute(
         "INSERT OR REPLACE INTO jobs(
             job_id, filename, duration, file_size, video_codec, video_width, video_height, status,
-            media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number,
+            source_path
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             job.job_id,
             job.filename,
@@ -41,6 +50,7 @@ pub fn save_job(
             job.season_number,
             job.episode_number,
             job.part_number,
+            job.source_path,
         ],
     )?;
     tx.execute("DELETE FROM tracks WHERE job_id = ?1", params![job.job_id])?;
@@ -54,11 +64,12 @@ pub fn save_job(
     )?;
 
     for track in tracks {
+        let (mode, bitrate_bps) = super::migrations::track_mode_and_bps(&track.bitrate);
         tx.execute(
             "INSERT INTO tracks(
                 job_id, track_type, track_index, codec, language, title, channels,
-                width, height, bitrate, original_stream_index
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                width, height, bitrate, original_stream_index, mode, bitrate_bps
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 job.job_id,
                 track.track_type,
@@ -71,34 +82,43 @@ pub fn save_job(
                 track.height,
                 track.bitrate,
                 track.original_stream_index,
+                mode,
+                bitrate_bps,
             ],
         )?;
     }
     for segment in segments {
+        let (prefix, name) = split_segment_key(&segment.segment_key);
         tx.execute(
-            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, file_size, duration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, file_size, duration, is_split, prefix, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 job.job_id,
                 segment.segment_key,
                 segment.file_id,
                 segment.bot_index,
                 segment.file_size,
-                segment.duration
+                segment.duration,
+                bool_to_i64(segment.is_split),
+                prefix,
+                name,
             ],
         )?;
     }
     for part in segment_parts {
+        let (prefix, name) = split_segment_key(&part.segment_key);
         tx.execute(
-            "INSERT INTO segment_parts(job_id, segment_key, part_index, file_id, bot_index, file_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO segment_parts(job_id, segment_key, part_index, file_id, bot_index, file_size, prefix, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 job.job_id,
                 part.segment_key,
                 part.part_index,
                 part.file_id,
                 part.bot_index,
-                part.file_size
+                part.file_size,
+                prefix,
+                name,
             ],
         )?;
     }
@@ -106,12 +126,19 @@ pub fn save_job(
     Ok(())
 }
 
+fn split_segment_key(segment_key: &str) -> (&str, &str) {
+    segment_key
+        .split_once('/')
+        .unwrap_or(("legacy", segment_key))
+}
+
 pub fn update_job_metadata(
-    conn: &Connection,
+    conn: &mut Connection,
     job_id: &str,
     update: &super::models::JobMetadataUpdate,
 ) -> Result<bool> {
-    let Some(mut job) = get_job(conn, job_id)? else {
+    let tx = conn.transaction()?;
+    let Some(mut job) = get_job(&tx, job_id)? else {
         return Ok(false);
     };
     if let Some(v) = &update.filename {
@@ -126,21 +153,21 @@ pub fn update_job_metadata(
     if let Some(v) = update.is_series {
         job.is_series = v;
     }
-    if update.season_number.is_some() {
-        job.season_number = update.season_number;
+    if let Some(v) = update.season_number {
+        job.season_number = v;
     }
-    if update.episode_number.is_some() {
-        job.episode_number = update.episode_number;
+    if let Some(v) = update.episode_number {
+        job.episode_number = v;
     }
-    if update.part_number.is_some() {
-        job.part_number = update.part_number;
+    if let Some(v) = update.part_number {
+        job.part_number = v;
     }
     if !job.is_series {
         job.season_number = None;
         job.episode_number = None;
         job.part_number = None;
     }
-    let n = conn.execute(
+    let n = tx.execute(
         "UPDATE jobs SET filename=?2, media_type=?3, series_name=?4, is_series=?5,
          season_number=?6, episode_number=?7, part_number=?8 WHERE job_id=?1",
         params![
@@ -154,11 +181,12 @@ pub fn update_job_metadata(
             job.part_number
         ],
     )?;
+    tx.commit()?;
     Ok(n > 0)
 }
 
 pub fn update_job_metadata_fields(
-    conn: &Connection,
+    conn: &mut Connection,
     job_id: &str,
     filename: Option<String>,
     media_type: Option<String>,
@@ -168,7 +196,8 @@ pub fn update_job_metadata_fields(
     episode_number: Option<Option<i64>>,
     part_number: Option<Option<i64>>,
 ) -> Result<Option<JobRow>> {
-    let Some(mut job) = get_job(conn, job_id)? else {
+    let tx = conn.transaction()?;
+    let Some(mut job) = get_job(&tx, job_id)? else {
         return Ok(None);
     };
     if let Some(v) = filename {
@@ -208,9 +237,10 @@ pub fn update_job_metadata_fields(
         season_number: job.season_number,
         episode_number: job.episode_number,
         part_number: job.part_number,
+        source_path: job.source_path.clone(),
     };
     normalize_job_metadata(&mut new_job);
-    conn.execute(
+    tx.execute(
         "UPDATE jobs SET filename=?2, media_type=?3, series_name=?4, is_series=?5,
          season_number=?6, episode_number=?7, part_number=?8 WHERE job_id=?1",
         params![
@@ -224,7 +254,9 @@ pub fn update_job_metadata_fields(
             new_job.part_number
         ],
     )?;
-    get_job(conn, job_id)
+    let result = get_job(&tx, job_id);
+    tx.commit()?;
+    result
 }
 
 pub fn update_job_thumbnail(conn: &Connection, job_id: &str) -> Result<bool> {
@@ -270,12 +302,13 @@ pub fn get_segment(
     segment_key: &str,
 ) -> Result<Option<SegmentLookup>> {
     conn.query_row(
-        "SELECT file_id, bot_index FROM segments WHERE job_id = ?1 AND segment_key = ?2",
+        "SELECT file_id, bot_index, is_split FROM segments WHERE job_id = ?1 AND segment_key = ?2",
         params![job_id, segment_key],
         |r| {
             Ok(SegmentLookup {
                 file_id: r.get(0)?,
                 bot_index: r.get(1)?,
+                is_split: r.get::<_, i64>(2)? == 1,
             })
         },
     )
@@ -548,10 +581,11 @@ pub fn get_all_settings(conn: &Connection) -> Result<HashMap<String, String>> {
 
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     super::validate_setting_key(key)?;
+    let value_type = setting_value_type(key)?;
     conn.execute(
-        "INSERT INTO settings(key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
-        params![key, value],
+        "INSERT INTO settings(key, value, value_type, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, value_type=excluded.value_type, updated_at=CURRENT_TIMESTAMP",
+        params![key, value, value_type],
     )?;
     Ok(())
 }
@@ -560,10 +594,11 @@ pub fn set_settings(conn: &mut Connection, settings: &HashMap<String, String>) -
     let tx = conn.transaction()?;
     for (key, value) in settings {
         super::validate_setting_key(key)?;
+        let value_type = setting_value_type(key)?;
         tx.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
-            params![key, value],
+            "INSERT INTO settings(key, value, value_type, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, value_type=excluded.value_type, updated_at=CURRENT_TIMESTAMP",
+            params![key, value, value_type],
         )?;
     }
     tx.commit()?;
@@ -578,7 +613,7 @@ pub fn delete_setting(conn: &Connection, key: &str) -> Result<bool> {
 pub fn get_last_bot_index(conn: &Connection) -> Result<i64> {
     let value: Option<String> = conn
         .query_row(
-            "SELECT value FROM settings WHERE key = '_last_bot_index'",
+            "SELECT value FROM kv_internal WHERE key = '_last_bot_index'",
             [],
             |r| r.get(0),
         )
@@ -592,21 +627,50 @@ pub fn get_last_bot_index(conn: &Connection) -> Result<i64> {
 pub fn set_last_bot_index(conn: &Connection, index: i64) -> Result<()> {
     let index = index.max(0).to_string();
     conn.execute(
-        "INSERT INTO settings(key, value, updated_at) VALUES ('_last_bot_index', ?1, CURRENT_TIMESTAMP)
+        "INSERT INTO kv_internal(key, value, updated_at) VALUES ('_last_bot_index', ?1, CURRENT_TIMESTAMP)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
         params![index],
     )?;
     Ok(())
 }
 
+pub fn get_internal_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM kv_internal WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn set_internal_value(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO kv_internal(key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 pub fn get_all_bots(conn: &Connection) -> Result<Vec<DbBotRow>> {
-    let mut stmt = conn.prepare("SELECT id, token, channel_id, label FROM bots ORDER BY id ASC")?;
+    let has_enabled =
+        crate::db::migrations::column_exists(conn, "bots", "enabled").unwrap_or(false);
+    let has_source = crate::db::migrations::column_exists(conn, "bots", "source").unwrap_or(false);
+    let sql = if has_enabled && has_source {
+        "SELECT id, token, channel_id, label, enabled, source FROM bots ORDER BY id ASC"
+    } else {
+        "SELECT id, token, channel_id, label, 1, 'db' FROM bots ORDER BY id ASC"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |r| {
         Ok(DbBotRow {
             id: r.get(0)?,
             token: r.get(1)?,
             channel_id: r.get(2)?,
             label: r.get(3)?,
+            enabled: r.get::<_, i64>(4)? != 0,
+            source: r.get(5)?,
         })
     })?;
     rows.map(|r| r.map_err(Into::into)).collect()
@@ -614,7 +678,7 @@ pub fn get_all_bots(conn: &Connection) -> Result<Vec<DbBotRow>> {
 
 pub fn add_bot(conn: &Connection, token: &str, channel_id: i64, label: &str) -> Result<i64> {
     conn.execute(
-        "INSERT INTO bots(token, channel_id, label) VALUES (?1, ?2, ?3)",
+        "INSERT INTO bots(token, channel_id, label, enabled, source) VALUES (?1, ?2, ?3, 1, 'db')",
         params![token, channel_id, label],
     )?;
     Ok(conn.last_insert_rowid())
@@ -652,4 +716,70 @@ pub fn get_bot_workload_stats(conn: &Connection) -> Result<HashMap<i64, BotWorkl
         out.insert(bot_index, stats);
     }
     Ok(out)
+}
+
+/// Write a lightweight processing marker for crash recovery.
+/// This row gets overwritten by save_job() on completion.
+pub fn insert_processing_marker(conn: &Connection, job_id: &str, filename: &str) -> Result<()> {
+    insert_job_marker(conn, job_id, filename, "processing")
+}
+
+pub fn insert_job_marker(
+    conn: &Connection,
+    job_id: &str,
+    filename: &str,
+    status: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO jobs(job_id, filename, status, created_at) VALUES (?1, ?2, ?3, datetime('now'))",
+        rusqlite::params![job_id, filename, status],
+    )?;
+    Ok(())
+}
+
+pub fn get_stuck_processing_jobs(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT job_id FROM jobs WHERE status = 'processing'")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+pub fn mark_job_as_failed(conn: &Connection, job_id: &str, error: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE jobs SET status = 'error', error = ?2 WHERE job_id = ?1",
+        rusqlite::params![job_id, error],
+    )? > 0)
+}
+
+pub fn mark_job_as_cancelled(conn: &Connection, job_id: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE jobs SET status = 'cancelled', error = NULL WHERE job_id = ?1",
+        rusqlite::params![job_id],
+    )? > 0)
+}
+
+pub fn update_segment_file_id(
+    conn: &Connection,
+    job_id: &str,
+    segment_key: &str,
+    new_file_id: &str,
+    new_bot_index: i64,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE segments SET file_id = ?1, bot_index = ?2 WHERE job_id = ?3 AND segment_key = ?4",
+        params![new_file_id, new_bot_index, job_id, segment_key],
+    )? > 0)
+}
+
+pub fn update_segment_part_file_id(
+    conn: &Connection,
+    job_id: &str,
+    segment_key: &str,
+    part_index: i64,
+    new_file_id: &str,
+    new_bot_index: i64,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE segment_parts SET file_id = ?1, bot_index = ?2 WHERE job_id = ?3 AND segment_key = ?4 AND part_index = ?5",
+        params![new_file_id, new_bot_index, job_id, segment_key, part_index],
+    )? > 0)
 }

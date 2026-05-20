@@ -14,7 +14,7 @@ use super::json::{self, job_json, season_group_json, series_group_json};
 use super::processing::{cleanup_job_paths, enqueue_job, send_job_webhook};
 use super::types::*;
 
-use super::super::{api_error, valid_job_id as valid_slug_id, AppState};
+use super::super::{api_error, db_unavailable, valid_job_id as valid_slug_id, AppState};
 use crate::db;
 
 pub async fn handle_job_status(
@@ -29,30 +29,54 @@ pub async fn handle_job_status(
         return Json(json::job_status_json(
             job,
             json::queue_position(&jobs, &job_id),
+            json::queue_depth(&jobs, &job_id),
         ))
         .into_response();
     }
     drop(jobs);
 
-    let conn = state.db.lock().await;
-    match db::get_job(&conn, &job_id) {
-        Ok(Some(job)) => Json(json!({
-            "job_id": job.job_id,
-            "status": "complete",
-            "progress": 100.0,
-            "step": 5,
-            "total_steps": 5,
-            "description": "complete",
-            "queue_position": Value::Null,
-            "analysis": Value::Null,
-            "error": Value::Null,
-            "filename": job.filename,
-            "duration": job.duration,
-            "file_size": job.file_size,
-            "created_at": job.created_at,
-        }))
-        .into_response(),
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    let job_id_for_db = job_id.clone();
+    let lookup = tokio::task::spawn_blocking(move || db::get_job(&conn, &job_id_for_db)).await;
+    match lookup {
+        Ok(Ok(Some(job))) => {
+            let (progress, step, total_steps, description) = match job.status.as_str() {
+                "complete" => (100.0, 5, 5, "complete".to_string()),
+                "error" => (100.0, 5, 5, "error".to_string()),
+                "cancelled" => (100.0, 5, 5, "cancelled".to_string()),
+                _ => (0.0, 0, 5, job.status.clone()),
+            };
+            let error_value = match &job.error {
+                Some(e) => Value::String(e.clone()),
+                None => Value::Null,
+            };
+            Json(json!({
+                "job_id": job.job_id,
+                "status": job.status,
+                "progress": progress,
+                "step": step,
+                "total_steps": total_steps,
+                "description": description,
+                "queue_position": Value::Null,
+                "queue_depth": Value::Null,
+                "analysis": Value::Null,
+                "error": error_value,
+                "filename": job.filename,
+                "duration": job.duration,
+                "file_size": job.file_size,
+                "created_at": job.created_at,
+            }))
+            .into_response()
+        }
+        Ok(Ok(None)) => api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+        Ok(Err(e)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "job_lookup_failed",
+            e.to_string(),
+        ),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job_lookup_failed",
@@ -118,26 +142,33 @@ pub async fn handle_list_jobs(
         season_number_is_null,
     };
 
-    let conn = state.db.lock().await;
-    let result: anyhow::Result<(Vec<Value>, i64)> = (|| match group_by {
-        Some("series") => {
-            let rows = db::list_series_groups(&conn, &filter)?;
-            let total = db::count_series_groups(&conn, &filter)?;
-            Ok((rows.into_iter().map(series_group_json).collect(), total))
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    let group_by = group_by.map(str::to_string);
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<Value>, i64)> {
+        match group_by.as_deref() {
+            Some("series") => {
+                let rows = db::list_series_groups(&conn, &filter)?;
+                let total = db::count_series_groups(&conn, &filter)?;
+                Ok((rows.into_iter().map(series_group_json).collect(), total))
+            }
+            Some("season") => {
+                let rows = db::list_season_groups(&conn, &filter)?;
+                let total = db::count_season_groups(&conn, &filter)?;
+                Ok((rows.into_iter().map(season_group_json).collect(), total))
+            }
+            _ => {
+                let rows = db::list_jobs(&conn, &filter)?;
+                let total = db::count_jobs(&conn, &filter)?;
+                Ok((rows.into_iter().map(job_json).collect(), total))
+            }
         }
-        Some("season") => {
-            let rows = db::list_season_groups(&conn, &filter)?;
-            let total = db::count_season_groups(&conn, &filter)?;
-            Ok((rows.into_iter().map(season_group_json).collect(), total))
-        }
-        _ => {
-            let rows = db::list_jobs(&conn, &filter)?;
-            let total = db::count_jobs(&conn, &filter)?;
-            Ok((rows.into_iter().map(job_json).collect(), total))
-        }
-    })();
+    })
+    .await;
     match result {
-        Ok((jobs, total)) => Json(json!({
+        Ok(Ok((jobs, total))) => Json(json!({
             "jobs": jobs,
             "total": total,
             "page": page,
@@ -145,6 +176,11 @@ pub async fn handle_list_jobs(
             "has_more": page * limit < total,
         }))
         .into_response(),
+        Ok(Err(e)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "job_list_failed",
+            e.to_string(),
+        ),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job_list_failed",
@@ -232,20 +268,34 @@ pub async fn handle_patch_job(
         }
     }
 
-    let conn = state.db.lock().await;
-    let updated = match db::update_job_metadata_fields(
-        &conn,
-        &job_id,
-        filename,
-        media_type,
-        series_name,
-        is_series,
-        season_number,
-        episode_number,
-        part_number,
-    ) {
-        Ok(Some(job)) => job,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+    let mut conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    let updated = match tokio::task::spawn_blocking(move || {
+        db::update_job_metadata_fields(
+            &mut conn,
+            &job_id,
+            filename,
+            media_type,
+            series_name,
+            is_series,
+            season_number,
+            episode_number,
+            part_number,
+        )
+    })
+    .await
+    {
+        Ok(Ok(Some(job))) => job,
+        Ok(Ok(None)) => return api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+        Ok(Err(e)) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "job_update_failed",
+                e.to_string(),
+            )
+        }
         Err(e) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -264,10 +314,18 @@ pub async fn handle_delete_job(
     if !valid_slug_id(&job_id) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_job_id", "invalid job id");
     }
-    let conn = state.db.lock().await;
-    match db::delete_job(&conn, &job_id) {
-        Ok(true) => Json(json!({ "message": "deleted" })).into_response(),
-        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    match tokio::task::spawn_blocking(move || db::delete_job(&conn, &job_id)).await {
+        Ok(Ok(true)) => Json(json!({ "message": "deleted" })).into_response(),
+        Ok(Ok(false)) => api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+        Ok(Err(e)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "job_delete_failed",
+            e.to_string(),
+        ),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job_delete_failed",
@@ -309,12 +367,26 @@ pub async fn handle_reprocess_job(
         Ok(job) => job,
         Err(response) => return response,
     };
-    let source = match download::reconstruct_job_source(&state, &job).await {
-        Ok(path) => path,
-        Err(e) => return api_error(StatusCode::BAD_GATEWAY, "reconstruct_failed", e.to_string()),
+    let (source, delete_source) = match source_from_uploads(&state, &job).await {
+        Some(path) => (path, false),
+        None => match download::reconstruct_job_source(&state, &job).await {
+            Ok(path) => (path, true),
+            Err(e) => {
+                return api_error(StatusCode::BAD_GATEWAY, "reconstruct_failed", e.to_string())
+            }
+        },
     };
     let metadata = download::metadata_from_job(&job);
-    match enqueue_job(&state, job.filename.clone(), source, metadata, true).await {
+    match enqueue_job(
+        &state,
+        job.filename.clone(),
+        source,
+        metadata,
+        delete_source,
+        job.source_path.clone(),
+    )
+    .await
+    {
         Ok(new_job_id) => Json(json!({
             "job_id": new_job_id,
             "source_job_id": job.job_id,
@@ -322,6 +394,25 @@ pub async fn handle_reprocess_job(
         }))
         .into_response(),
         Err(e) => api_error(StatusCode::SERVICE_UNAVAILABLE, "queue_full", e.to_string()),
+    }
+}
+
+async fn source_from_uploads(state: &AppState, job: &db::JobRow) -> Option<std::path::PathBuf> {
+    let rel = job.source_path.as_deref()?;
+    if rel.contains("..") || rel.contains('/') || rel.contains('\\') || rel.contains('\0') {
+        tracing::warn!(job_id = %job.job_id, source_path = %rel, "ignoring invalid stored source path");
+        return None;
+    }
+    let path = state.uploads_dir.join(rel);
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.is_file() => Some(path),
+        _ => {
+            let pending_path = state.uploads_dir.join(format!("{rel}.pending_delete"));
+            match tokio::fs::metadata(&pending_path).await {
+                Ok(meta) if meta.is_file() => Some(pending_path),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -358,6 +449,15 @@ pub async fn handle_cancel_job(
         ))
     };
     if let Some((source_path, processing_path, delete_source)) = cleanup {
+        if let Ok(conn) = state.db_conn().await {
+            let job_id_clone = job_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = db::mark_job_as_cancelled(&conn, &job_id_clone) {
+                    tracing::warn!(job_id = %job_id_clone, error = %e, "failed to persist cancelled job");
+                }
+            })
+            .await;
+        }
         cleanup_job_paths(&source_path, &processing_path, delete_source).await;
     }
     send_job_webhook(&state, &job_id, JobStatus::Cancelled, None).await;
@@ -372,7 +472,10 @@ pub async fn queue_metrics(state: &AppState) -> Value {
         .filter(|j| {
             matches!(
                 j.status,
-                JobStatus::Analyzing | JobStatus::Processing | JobStatus::Uploading
+                JobStatus::Downloading
+                    | JobStatus::Analyzing
+                    | JobStatus::Processing
+                    | JobStatus::Uploading
             )
         })
         .count();

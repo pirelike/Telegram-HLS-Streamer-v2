@@ -38,7 +38,7 @@ pub async fn select_encoder(cfg: &Config) -> SelectedEncoder {
     }
 }
 
-fn cpu_encoder() -> SelectedEncoder {
+pub fn cpu_encoder() -> SelectedEncoder {
     SelectedEncoder {
         name: "libx264".to_string(),
         vaapi_device: None,
@@ -59,7 +59,7 @@ fn vaapi_device(cfg: &Config) -> Option<String> {
         })
         .collect::<Vec<_>>();
     devices.sort_by_key(|(n, _)| *n);
-    devices.pop().map(|(_, path)| path)
+    devices.first().map(|(_, path)| path.clone())
 }
 
 async fn encoder_probe_ok(encoder: &SelectedEncoder) -> bool {
@@ -97,7 +97,7 @@ pub fn video_filter(encoder: &SelectedEncoder, scale: Option<String>) -> Option<
     }
 }
 
-pub(super) fn add_forced_idr_args(cmd: &mut Command, encoder: &SelectedEncoder) {
+pub fn add_forced_idr_args(cmd: &mut Command, encoder: &SelectedEncoder) {
     if encoder.name == "h264_qsv" {
         cmd.arg("-forced_idr").arg("1");
     } else if encoder.name == "libx264" || encoder.name == "h264_nvenc" {
@@ -105,7 +105,7 @@ pub(super) fn add_forced_idr_args(cmd: &mut Command, encoder: &SelectedEncoder) 
     }
 }
 
-pub(super) fn add_encoder_device_args(cmd: &mut Command, encoder: &SelectedEncoder) {
+pub fn add_encoder_device_args(cmd: &mut Command, encoder: &SelectedEncoder) {
     if let Some(device) = &encoder.vaapi_device {
         cmd.arg("-vaapi_device").arg(device);
     }
