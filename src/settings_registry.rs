@@ -48,10 +48,13 @@ pub const SETTINGS: &[SettingSpec] = &[
     setting!("TRUSTED_PROXY_CIDRS", "TRUSTED_PROXY_CIDRS", "server", SettingType::List, "127.0.0.1/32,::1/128", "Trusted proxy CIDR ranges.", None, None),
     setting!("CORS_ALLOWED_ORIGINS", "CORS_ALLOWED_ORIGINS", "server", SettingType::List, "", "Allowed CORS origins.", None, None),
     setting!("CLOUDFLARED_ENABLED", "CLOUDFLARED_ENABLED", "server", SettingType::Bool, "false", "Enable Cloudflared tunnel management.", None, None),
+    setting!("CLOUDFLARED_CONFIG", "CLOUDFLARED_CONFIG", "server", SettingType::Str, "", "Path to the Cloudflared tunnel config file.", None, None),
     setting!("TELEGRAM_MAX_FILE_SIZE", "TELEGRAM_MAX_FILE_SIZE", "file_handling", SettingType::Int, "20971520", "Telegram per-file upload ceiling.", Some(1), None),
     setting!("MAX_UPLOAD_SIZE", "MAX_UPLOAD_SIZE", "file_handling", SettingType::Int, "107374182400", "Maximum accepted client upload size.", Some(1), None),
     setting!("UPLOAD_CHUNK_SIZE", "UPLOAD_CHUNK_SIZE", "file_handling", SettingType::Int, "10485760", "Server-advertised upload chunk size.", Some(1), None),
     setting!("SEGMENT_TARGET_SIZE", "SEGMENT_TARGET_SIZE", "file_handling", SettingType::Int, "15728640", "Preferred HLS segment size.", Some(1), None),
+    setting!("CACHE_DIR", "CACHE_DIR", "file_handling", SettingType::Str, "./cache/", "Ephemeral cache directory wiped on startup.", None, None),
+    setting!("CACHE_WARMUP_ENABLED", "CACHE_WARMUP_ENABLED", "file_handling", SettingType::Bool, "false", "Enable cache warm-up behavior.", None, None),
     setting!("SEGMENT_CACHE_SIZE_MB", "SEGMENT_CACHE_SIZE_MB", "file_handling", SettingType::Int, "200", "Segment cache budget in MB.", Some(0), None),
     setting!("SEGMENT_PREFETCH_COUNT", "SEGMENT_PREFETCH_COUNT", "file_handling", SettingType::Int, "3", "Segments to prefetch ahead.", Some(0), None),
     setting!("SEGMENT_PREFETCH_MIN_FREE_BYTES", "SEGMENT_PREFETCH_MIN_FREE_BYTES", "file_handling", SettingType::Int, "0", "Minimum free cache bytes before prefetch.", Some(0), None),
@@ -62,6 +65,7 @@ pub const SETTINGS: &[SettingSpec] = &[
     setting!("VIDEO_BITRATE", "VIDEO_BITRATE", "hardware", SettingType::Str, "4M", "Default video bitrate.", None, None),
     setting!("AUDIO_BITRATE", "AUDIO_BITRATE", "hardware", SettingType::Str, "128k", "Default audio bitrate.", None, None),
     setting!("HLS_SEGMENT_DURATION", "HLS_SEGMENT_DURATION", "hls", SettingType::Int, "4", "Target HLS segment duration.", Some(1), None),
+    setting!("AUDIO_SEGMENT_DURATION", "AUDIO_SEGMENT_DURATION", "hls", SettingType::Int, "30", "Audio segment duration in seconds.", Some(1), None),
     setting!("ABR_ENABLED", "ABR_ENABLED", "adaptive_bitrate", SettingType::Bool, "true", "Produce eager ABR tiers.", None, None),
     setting!("ENABLE_COPY_MODE", "ENABLE_COPY_MODE", "adaptive_bitrate", SettingType::Bool, "true", "Enable tier-0 passthrough.", None, None),
     setting!("VIRTUAL_ABR_TIERS", "VIRTUAL_ABR_TIERS", "adaptive_bitrate", SettingType::Bool, "false", "Transcode lower tiers on demand.", None, None),
@@ -69,6 +73,7 @@ pub const SETTINGS: &[SettingSpec] = &[
     setting!("TIER0_BITRATES", "TIER0_BITRATES", "adaptive_bitrate", SettingType::Tiers, "2160:60M,1080:30M,720:15M,480:5M", "Source-height tier-0 bitrates.", None, None),
     setting!("TIER0_BITRATE_DEFAULT", "TIER0_BITRATE_DEFAULT", "adaptive_bitrate", SettingType::Str, "15M", "Fallback tier-0 bitrate.", None, None),
     setting!("JOB_TIMEOUT_SECONDS", "JOB_TIMEOUT_SECONDS", "reliability", SettingType::Int, "7200", "Per-job runtime cap.", Some(1), None),
+    setting!("QUEUE_TIMEOUT_SECONDS", "QUEUE_TIMEOUT_SECONDS", "reliability", SettingType::Int, "7200", "Maximum time a job can wait in the queue before timing out.", Some(1), None),
     setting!("PENDING_UPLOAD_TTL_SECONDS", "PENDING_UPLOAD_TTL_SECONDS", "reliability", SettingType::Int, "86400", "Idle pending upload expiry.", Some(1), None),
     setting!("PENDING_UPLOAD_CLEANUP_INTERVAL_SECONDS", "PENDING_UPLOAD_CLEANUP_INTERVAL_SECONDS", "reliability", SettingType::Int, "300", "Pending upload sweeper interval.", Some(1), None),
     setting!("JOB_RETENTION_DAYS", "JOB_RETENTION_DAYS", "reliability", SettingType::Int, "0", "Completed-job retention period.", Some(0), None),
@@ -318,7 +323,7 @@ fn value_to_json(spec: &SettingSpec, value: &str) -> Value {
     }
 }
 
-fn setting_type_name(setting_type: SettingType) -> &'static str {
+pub fn setting_type_name(setting_type: SettingType) -> &'static str {
     match setting_type {
         SettingType::Int => "int",
         SettingType::Bool => "bool",

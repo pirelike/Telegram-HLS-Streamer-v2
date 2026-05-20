@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::processing;
 use super::types::*;
@@ -52,6 +54,7 @@ fn build_db_rows_registers_uploaded_outputs() {
             ..Default::default()
         },
         delete_source_on_finish: true,
+        original_source_path: Some("movie.mkv".into()),
     };
     let analysis = sample_analysis(PathBuf::from("movie.mkv"));
     let mut segment_durations = HashMap::new();
@@ -84,6 +87,7 @@ fn build_db_rows_registers_uploaded_outputs() {
         }],
         segment_durations,
         thumbnail_path: Some(PathBuf::from("processing/job1/thumbnail/thumbnail.jpg")),
+        oversized_segments_repaired: 0,
     };
     let uploads = vec![
         telegram::UploadedFile {
@@ -117,6 +121,7 @@ fn build_db_rows_registers_uploaded_outputs() {
     assert!(segment_parts.is_empty());
 
     assert_eq!(job.filename, "Movie Title");
+    assert_eq!(job.source_path.as_deref(), Some("movie.mkv"));
     assert!(job.has_thumbnail);
     assert_eq!(tracks.len(), 3);
     assert_eq!(segments.len(), 4);
@@ -129,6 +134,35 @@ fn build_db_rows_registers_uploaded_outputs() {
 }
 
 #[test]
+fn original_source_path_is_filename_label_only() {
+    assert_eq!(
+        processing::sanitize_original_source_path(Some(" movie.mkv ".into()))
+            .unwrap()
+            .as_deref(),
+        Some("movie.mkv")
+    );
+    assert_eq!(
+        processing::sanitize_original_source_path(Some("".into())).unwrap(),
+        None
+    );
+
+    for value in [
+        "../../../etc/passwd",
+        "../../.env",
+        "/etc/passwd",
+        "uploads/movie.mkv",
+        r"..\..\secret.env",
+        "movie..mkv",
+        "movie\0.mkv",
+    ] {
+        assert!(
+            processing::sanitize_original_source_path(Some(value.into())).is_err(),
+            "{value} should be rejected"
+        );
+    }
+}
+
+#[test]
 fn build_db_rows_keeps_split_segment_parent_for_playlists() {
     let request = JobRequest {
         job_id: "job1".into(),
@@ -136,6 +170,7 @@ fn build_db_rows_keeps_split_segment_parent_for_playlists() {
         source_path: PathBuf::from("movie.mkv"),
         metadata: JobMetadata::default(),
         delete_source_on_finish: true,
+        original_source_path: None,
     };
     let analysis = sample_analysis(PathBuf::from("movie.mkv"));
     let mut segment_durations = HashMap::new();
@@ -154,6 +189,7 @@ fn build_db_rows_keeps_split_segment_parent_for_playlists() {
         subtitle_files: Vec::new(),
         segment_durations,
         thumbnail_path: None,
+        oversized_segments_repaired: 0,
     };
     let uploads = vec![
         telegram::UploadedFile {
@@ -176,7 +212,7 @@ fn build_db_rows_keeps_split_segment_parent_for_playlists() {
     assert_eq!(segment_parts.len(), 2);
     assert!(segments.iter().any(|s| {
         s.segment_key == "video_0/video_0001.m4s"
-            && s.file_id == "split"
+            && s.is_split
             && s.file_size == 50
             && s.duration == Some(10.01)
     }));
@@ -259,4 +295,118 @@ fn integrity_mismatch_prevents_db_segment_row() {
     assert!(crate::db::get_job(&conn, "job-integrity")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn job_timeout_distinguishes_queue_vs_processing() {
+    let now = Instant::now();
+
+    // Scenario 1: Queued job older than queue_timeout_seconds → should time out
+    let queued_expired = JobState {
+        job_id: "queued-expired".into(),
+        filename: String::new(),
+        source_path: PathBuf::new(),
+        processing_path: PathBuf::new(),
+        status: JobStatus::Queued,
+        progress: 0.0,
+        step: 0,
+        total_steps: 0,
+        description: "queued too long".into(),
+        queued_at: now - Duration::from_secs(10),
+        started_at: None,
+        finished_at: None,
+        cancel_requested: false,
+        cancel_flag: Arc::new(AtomicBool::new(false)),
+        error: None,
+        metadata: JobMetadata::default(),
+        analysis: None,
+        delete_source_on_finish: false,
+        original_source_path: None,
+    };
+
+    let queue_timeout = Duration::from_secs(5);
+    let job_timeout = Duration::from_secs(9999);
+
+    // Mirror of the watcher's check: !job.status.is_terminal()
+    //   && job.started_at
+    //       .map(|s| now.duration_since(s) > job_timeout)
+    //       .unwrap_or_else(|| now.duration_since(job.queued_at) > queue_timeout)
+    assert!(
+        !queued_expired.status.is_terminal()
+            && queued_expired
+                .started_at
+                .map(|started| now.duration_since(started) > job_timeout)
+                .unwrap_or_else(|| now.duration_since(queued_expired.queued_at) > queue_timeout),
+        "queued job past queue_timeout should be timed out"
+    );
+
+    // Scenario 2: Started job older than job_timeout_seconds → should time out
+    let started_expired = JobState {
+        job_id: "started-expired".into(),
+        filename: String::new(),
+        source_path: PathBuf::new(),
+        processing_path: PathBuf::new(),
+        status: JobStatus::Processing,
+        progress: 0.5,
+        step: 1,
+        total_steps: 5,
+        description: "started too long".into(),
+        queued_at: now - Duration::from_secs(100),
+        started_at: Some(now - Duration::from_secs(10)),
+        finished_at: None,
+        cancel_requested: false,
+        cancel_flag: Arc::new(AtomicBool::new(false)),
+        error: None,
+        metadata: JobMetadata::default(),
+        analysis: None,
+        delete_source_on_finish: false,
+        original_source_path: None,
+    };
+
+    let queue_timeout = Duration::from_secs(9999);
+    let job_timeout = Duration::from_secs(5);
+
+    assert!(
+        !started_expired.status.is_terminal()
+            && started_expired
+                .started_at
+                .map(|started| now.duration_since(started) > job_timeout)
+                .unwrap_or_else(|| now.duration_since(started_expired.queued_at) > queue_timeout),
+        "started job past job_timeout should be timed out"
+    );
+
+    // Scenario 3: Job within both timeouts → should NOT time out
+    let within_timeout = JobState {
+        job_id: "within-timeout".into(),
+        filename: String::new(),
+        source_path: PathBuf::new(),
+        processing_path: PathBuf::new(),
+        status: JobStatus::Queued,
+        progress: 0.0,
+        step: 0,
+        total_steps: 0,
+        description: "still fresh".into(),
+        queued_at: now - Duration::from_secs(2),
+        started_at: None,
+        finished_at: None,
+        cancel_requested: false,
+        cancel_flag: Arc::new(AtomicBool::new(false)),
+        error: None,
+        metadata: JobMetadata::default(),
+        analysis: None,
+        delete_source_on_finish: false,
+        original_source_path: None,
+    };
+
+    // The full expression from the watcher: !terminal && (started_at check OR queue check)
+    // For this job: Queued is not terminal, and 2s < 5s queue_timeout → overall false
+    let should_timeout = !within_timeout.status.is_terminal()
+        && within_timeout
+            .started_at
+            .map(|started| now.duration_since(started) > queue_timeout)
+            .unwrap_or_else(|| now.duration_since(within_timeout.queued_at) > queue_timeout);
+    assert!(
+        !should_timeout,
+        "job within both timeouts should NOT be timed out"
+    );
 }

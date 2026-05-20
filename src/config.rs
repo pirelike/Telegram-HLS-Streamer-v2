@@ -33,11 +33,14 @@ pub struct Config {
     pub trusted_proxy_cidrs: Vec<String>,
     pub cors_allowed_origins: Vec<String>,
     pub cloudflared_enabled: bool,
+    pub cloudflared_config: String,
 
     pub telegram_max_file_size: u64,
     pub max_upload_size: u64,
     pub upload_chunk_size: u64,
     pub segment_target_size: u64,
+    pub cache_dir: String,
+    pub cache_warmup_enabled: bool,
     pub segment_cache_size_mb: u32,
     pub segment_prefetch_count: u32,
     pub segment_prefetch_min_free_bytes: u64,
@@ -50,8 +53,10 @@ pub struct Config {
     pub audio_bitrate: String,
 
     pub hls_segment_duration: u32,
+    pub audio_segment_duration: u32,
 
     pub job_timeout_seconds: u32,
+    pub queue_timeout_seconds: u32,
     pub pending_upload_ttl_seconds: u32,
     pub pending_upload_cleanup_interval_seconds: u32,
     pub job_retention_days: u32,
@@ -90,10 +95,13 @@ impl Default for Config {
             trusted_proxy_cidrs: vec!["127.0.0.1/32".into(), "::1/128".into()],
             cors_allowed_origins: Vec::new(),
             cloudflared_enabled: false,
+            cloudflared_config: String::new(),
             telegram_max_file_size: 20 * 1024 * 1024,
             max_upload_size: 100 * 1024 * 1024 * 1024,
             upload_chunk_size: 10 * 1024 * 1024,
             segment_target_size: 15 * 1024 * 1024,
+            cache_dir: "./cache/".into(),
+            cache_warmup_enabled: false,
             segment_cache_size_mb: 200,
             segment_prefetch_count: 3,
             segment_prefetch_min_free_bytes: 0,
@@ -104,7 +112,9 @@ impl Default for Config {
             video_bitrate: "4M".into(),
             audio_bitrate: "128k".into(),
             hls_segment_duration: 4,
+            audio_segment_duration: 30,
             job_timeout_seconds: 7200,
+            queue_timeout_seconds: 7200,
             pending_upload_ttl_seconds: 86_400,
             pending_upload_cleanup_interval_seconds: 300,
             job_retention_days: 0,
@@ -182,10 +192,13 @@ impl Config {
             "TRUSTED_PROXY_CIDRS" => self.trusted_proxy_cidrs.join(","),
             "CORS_ALLOWED_ORIGINS" => self.cors_allowed_origins.join(","),
             "CLOUDFLARED_ENABLED" => self.cloudflared_enabled.to_string(),
+            "CLOUDFLARED_CONFIG" => self.cloudflared_config.clone(),
             "TELEGRAM_MAX_FILE_SIZE" => self.telegram_max_file_size.to_string(),
             "MAX_UPLOAD_SIZE" => self.max_upload_size.to_string(),
             "UPLOAD_CHUNK_SIZE" => self.upload_chunk_size.to_string(),
             "SEGMENT_TARGET_SIZE" => self.segment_target_size.to_string(),
+            "CACHE_DIR" => self.cache_dir.clone(),
+            "CACHE_WARMUP_ENABLED" => self.cache_warmup_enabled.to_string(),
             "SEGMENT_CACHE_SIZE_MB" => self.segment_cache_size_mb.to_string(),
             "SEGMENT_PREFETCH_COUNT" => self.segment_prefetch_count.to_string(),
             "SEGMENT_PREFETCH_MIN_FREE_BYTES" => self.segment_prefetch_min_free_bytes.to_string(),
@@ -196,7 +209,9 @@ impl Config {
             "VIDEO_BITRATE" => self.video_bitrate.clone(),
             "AUDIO_BITRATE" => self.audio_bitrate.clone(),
             "HLS_SEGMENT_DURATION" => self.hls_segment_duration.to_string(),
+            "AUDIO_SEGMENT_DURATION" => self.audio_segment_duration.to_string(),
             "JOB_TIMEOUT_SECONDS" => self.job_timeout_seconds.to_string(),
+            "QUEUE_TIMEOUT_SECONDS" => self.queue_timeout_seconds.to_string(),
             "PENDING_UPLOAD_TTL_SECONDS" => self.pending_upload_ttl_seconds.to_string(),
             "PENDING_UPLOAD_CLEANUP_INTERVAL_SECONDS" => {
                 self.pending_upload_cleanup_interval_seconds.to_string()
@@ -307,10 +322,13 @@ fn apply_setting(cfg: &mut Config, key: &str, value: &str, source: &str) {
                 cfg.cors_allowed_origins = settings_registry::parse_list(value)
             }
             "CLOUDFLARED_ENABLED" => cfg.cloudflared_enabled = parse_bool(value)?,
+            "CLOUDFLARED_CONFIG" => cfg.cloudflared_config = value.to_string(),
             "TELEGRAM_MAX_FILE_SIZE" => cfg.telegram_max_file_size = parse_int(value)?,
             "MAX_UPLOAD_SIZE" => cfg.max_upload_size = parse_int(value)?,
             "UPLOAD_CHUNK_SIZE" => cfg.upload_chunk_size = parse_int(value)?,
             "SEGMENT_TARGET_SIZE" => cfg.segment_target_size = parse_int(value)?,
+            "CACHE_DIR" => cfg.cache_dir = value.to_string(),
+            "CACHE_WARMUP_ENABLED" => cfg.cache_warmup_enabled = parse_bool(value)?,
             "SEGMENT_CACHE_SIZE_MB" => cfg.segment_cache_size_mb = parse_int(value)?,
             "SEGMENT_PREFETCH_COUNT" => cfg.segment_prefetch_count = parse_int(value)?,
             "SEGMENT_PREFETCH_MIN_FREE_BYTES" => {
@@ -323,7 +341,9 @@ fn apply_setting(cfg: &mut Config, key: &str, value: &str, source: &str) {
             "VIDEO_BITRATE" => cfg.video_bitrate = value.to_string(),
             "AUDIO_BITRATE" => cfg.audio_bitrate = value.to_string(),
             "HLS_SEGMENT_DURATION" => cfg.hls_segment_duration = parse_int(value)?,
+            "AUDIO_SEGMENT_DURATION" => cfg.audio_segment_duration = parse_int(value)?,
             "JOB_TIMEOUT_SECONDS" => cfg.job_timeout_seconds = parse_int(value)?,
+            "QUEUE_TIMEOUT_SECONDS" => cfg.queue_timeout_seconds = parse_int(value)?,
             "PENDING_UPLOAD_TTL_SECONDS" => cfg.pending_upload_ttl_seconds = parse_int(value)?,
             "PENDING_UPLOAD_CLEANUP_INTERVAL_SECONDS" => {
                 cfg.pending_upload_cleanup_interval_seconds = parse_int(value)?
@@ -401,7 +421,7 @@ pub fn is_valid_bot_token(s: &str) -> bool {
     let mut parts = s.splitn(2, ':');
     let id = parts.next().unwrap_or("");
     let secret = parts.next().unwrap_or("");
-    if parts.next().is_some() {
+    if id.is_empty() || secret.is_empty() {
         return false;
     }
     if id.len() < 8 || id.len() > 12 || !id.bytes().all(|b| b.is_ascii_digit()) {
@@ -481,6 +501,9 @@ fn build_bot_pool(conn: &Connection) -> Result<Vec<BotConfig>> {
     }
 
     for row in db::get_all_bots(conn)? {
+        if !row.enabled {
+            continue;
+        }
         let token_t = row.token.trim().to_string();
         if token_t.starts_with("your_") {
             continue;

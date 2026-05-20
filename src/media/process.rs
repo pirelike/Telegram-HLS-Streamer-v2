@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::encoder::{add_encoder_device_args, add_forced_idr_args, video_filter};
 use super::models::*;
@@ -55,36 +55,93 @@ pub async fn process_media(
         tiers = %tier_summary,
         "media processing plan selected"
     );
-    let mut video_playlists = Vec::new();
+    let encode_semaphore = Arc::new(Semaphore::new(cfg.max_parallel_encodes.max(1) as usize));
+    let analysis_for_tiers = Arc::new(analysis.clone());
+    let mut tier_handles = Vec::with_capacity(tiers.len());
 
-    for tier in &tiers {
-        let tier_dir = format!("video_{}", tier.index);
-        let dir = output_dir.join(&tier_dir);
-        tokio::fs::create_dir_all(&dir).await?;
-        let started = Instant::now();
-        tracing::info!(
-            job_id,
-            tier = tier.index,
-            height = tier.height,
-            bitrate = %tier.bitrate,
-            copy = tier.copy,
-            "video tier encode started"
-        );
-        encode_video_tier(analysis, video, tier, &encoder, cfg, &dir, cancel).await?;
-        tracing::info!(
-            job_id,
-            tier = tier.index,
-            elapsed_ms = started.elapsed().as_millis(),
-            "video tier encode complete"
-        );
-        video_playlists.push(VideoPlaylist {
-            playlist_path: dir.join("playlist.m3u8"),
-            tier_dir,
-            width: scaled_width(video.width, video.height, tier.height),
-            height: tier.height,
-            bitrate: tier.bitrate.clone(),
-        });
+    for tier in tiers.iter().cloned() {
+        let analysis = analysis_for_tiers.clone();
+        let video = video.clone();
+        let encoder = encoder.clone();
+        let cfg = cfg.clone();
+        let cancel = cancel.clone();
+        let output_dir = output_dir.to_path_buf();
+        let job_id = job_id.to_string();
+        let encode_semaphore = encode_semaphore.clone();
+
+        tier_handles.push(tokio::spawn(async move {
+            let tier_dir = format!("video_{}", tier.index);
+            let dir = output_dir.join(&tier_dir);
+            tokio::fs::create_dir_all(&dir).await?;
+            let started = Instant::now();
+            tracing::info!(
+                job_id = %job_id,
+                tier = tier.index,
+                height = tier.height,
+                bitrate = %tier.bitrate,
+                copy = tier.copy,
+                "video tier encode started"
+            );
+            let oversized_count = encode_video_tier(
+                &analysis,
+                &video,
+                &tier,
+                &encoder,
+                &cfg,
+                &dir,
+                &cancel,
+                &encode_semaphore,
+            )
+            .await?;
+            tracing::info!(
+                job_id = %job_id,
+                tier = tier.index,
+                elapsed_ms = started.elapsed().as_millis(),
+                "video tier encode complete"
+            );
+            Ok::<_, anyhow::Error>((
+                tier.index,
+                VideoPlaylist {
+                    playlist_path: dir.join("playlist.m3u8"),
+                    tier_dir,
+                    width: scaled_width(video.width, video.height, tier.height),
+                    height: tier.height,
+                    bitrate: tier.bitrate.clone(),
+                },
+                oversized_count,
+            ))
+        }));
     }
+
+    let mut indexed_video_playlists = Vec::with_capacity(tier_handles.len());
+    let mut tier_error = None;
+    let mut total_oversized_repaired = 0usize;
+    for handle in tier_handles {
+        match handle.await {
+            Ok(Ok((index, playlist, oversized))) => {
+                total_oversized_repaired += oversized;
+                indexed_video_playlists.push((index, playlist));
+            }
+            Ok(Err(err)) => {
+                if tier_error.is_none() {
+                    tier_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if tier_error.is_none() {
+                    tier_error = Some(err.into());
+                }
+            }
+        }
+    }
+    if let Some(err) = tier_error {
+        return Err(err);
+    }
+    indexed_video_playlists.sort_by_key(|(index, _)| *index);
+    let video_playlists = indexed_video_playlists
+        .into_iter()
+        .map(|(_, playlist)| playlist)
+        .collect();
 
     let mut audio_playlists = Vec::new();
     for (idx, audio) in analysis.audio_streams.iter().enumerate() {
@@ -181,6 +238,7 @@ pub async fn process_media(
         subtitle_files,
         segment_durations,
         thumbnail_path,
+        oversized_segments_repaired: total_oversized_repaired,
     })
 }
 
@@ -192,10 +250,13 @@ async fn encode_video_tier(
     cfg: &Config,
     dir: &Path,
     cancel: &Arc<AtomicBool>,
-) -> Result<()> {
+    encode_semaphore: &Arc<Semaphore>,
+) -> Result<usize> {
     let ts_dir = dir.join("ts_work");
     tokio::fs::create_dir_all(&ts_dir).await?;
+    let permit = acquire_ffmpeg_permit(encode_semaphore, cancel).await?;
     encode_video_tier_ts(analysis, video, tier, encoder, cfg, &ts_dir, cancel).await?;
+    drop(permit);
     let effective_tier = if tier.copy && copied_segments_need_reencode(&ts_dir, cfg).await? {
         tracing::warn!(
             tier = tier.index,
@@ -209,6 +270,7 @@ async fn encode_video_tier(
             bitrate: tier0_bitrate(cfg, video.height),
             copy: false,
         };
+        let permit = acquire_ffmpeg_permit(encode_semaphore, cancel).await?;
         encode_video_tier_ts(
             analysis,
             video,
@@ -219,14 +281,68 @@ async fn encode_video_tier(
             cancel,
         )
         .await?;
+        drop(permit);
         reencode_tier
     } else {
         tier.clone()
     };
-    repair_oversized_video_segments(&ts_dir, &effective_tier, encoder, cfg, cancel).await?;
+    repair_oversized_video_segments(
+        &ts_dir,
+        &effective_tier,
+        encoder,
+        cfg,
+        cancel,
+        encode_semaphore,
+    )
+    .await?;
     remux_video_ts_to_fmp4(&ts_dir, cfg, dir, cancel).await?;
+
+    let mut oversized_m4s = Vec::new();
+    {
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("m4s") {
+                continue;
+            }
+            let size = entry.metadata().await?.len();
+            if size <= cfg.telegram_max_file_size {
+                continue;
+            }
+            tracing::warn!(
+                file = %path.display(),
+                size,
+                max = cfg.telegram_max_file_size,
+                ".m4s segment exceeds Telegram limit; re-encoding at highest bitrate"
+            );
+            oversized_m4s.push(path);
+        }
+    }
+
+    let m4s_repair_count = oversized_m4s.len();
+
+    for path in oversized_m4s {
+        let duration = probe_duration(&path)
+            .await
+            .unwrap_or(cfg.hls_segment_duration as f64);
+        let bps = max_bitrate_for_segment(cfg.telegram_max_file_size, duration);
+        if repair_needs_split(bps) {
+            tracing::warn!(
+                segment = %path.display(),
+                bitrate_bps = bps,
+                "segment bitrate floor too low; leaving original for upload-time splitting"
+            );
+        } else {
+            tracing::warn!(
+                segment = %path.display(),
+                bitrate_bps = bps,
+                "oversized fMP4 segment left for upload-time splitting to preserve playlist init map"
+            );
+        }
+    }
+
     let _ = tokio::fs::remove_dir_all(&ts_dir).await;
-    Ok(())
+    Ok(m4s_repair_count)
 }
 
 async fn encode_video_tier_ts(
@@ -304,10 +420,11 @@ async fn encode_video_tier_ts(
 
 async fn repair_oversized_video_segments(
     dir: &Path,
-    tier: &VideoTier,
+    _tier: &VideoTier,
     encoder: &SelectedEncoder,
     cfg: &Config,
     cancel: &Arc<AtomicBool>,
+    encode_semaphore: &Arc<Semaphore>,
 ) -> Result<()> {
     let mut oversized = Vec::new();
     let mut entries = tokio::fs::read_dir(dir).await?;
@@ -320,51 +437,46 @@ async fn repair_oversized_video_segments(
         if size <= cfg.telegram_max_file_size {
             continue;
         }
-        let duration = probe_duration(&path)
-            .await
-            .unwrap_or(cfg.hls_segment_duration as f64);
-        let bitrate = repair_bitrate(cfg.telegram_max_file_size, duration);
         tracing::warn!(
             segment = %path.display(),
             size,
             max_size = cfg.telegram_max_file_size,
-            duration,
-            bitrate = %bitrate,
-            "video segment exceeds Telegram limit; re-encoding segment only"
+            "video segment exceeds Telegram limit; re-encoding segment at highest bitrate"
         );
-        oversized.push((path, bitrate));
+        oversized.push(path);
     }
 
     if oversized.is_empty() {
         return Ok(());
     }
 
-    let semaphore = Arc::new(Semaphore::new(cfg.max_parallel_encodes as usize));
-    let tier = tier.clone();
     let encoder = encoder.clone();
     let cfg = cfg.clone();
+    let encode_semaphore = encode_semaphore.clone();
     let mut handles = Vec::with_capacity(oversized.len());
 
-    for (path, bitrate) in oversized {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let tier = tier.clone();
+    for path in oversized {
         let encoder = encoder.clone();
         let cfg = cfg.clone();
         let cancel = cancel.clone();
+        let encode_semaphore = encode_semaphore.clone();
+
+        let duration = probe_duration(&path)
+            .await
+            .unwrap_or(cfg.hls_segment_duration as f64);
+        let bps = max_bitrate_for_segment(cfg.telegram_max_file_size, duration);
+        if repair_needs_split(bps) {
+            tracing::warn!(
+                segment = %path.display(),
+                bitrate_bps = bps,
+                "TS segment bitrate floor too low; leaving original for upload-time splitting"
+            );
+            continue;
+        }
 
         handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            reencode_video_segment(&path, &tier, &encoder, &bitrate, &cfg, &cancel).await?;
-            let repaired = tokio::fs::metadata(&path).await?.len();
-            if repaired > cfg.telegram_max_file_size {
-                bail!(
-                    "repaired segment {} is still too large: {} > {}",
-                    path.display(),
-                    repaired,
-                    cfg.telegram_max_file_size
-                );
-            }
-            Ok::<_, anyhow::Error>(())
+            let _permit = acquire_ffmpeg_permit(&encode_semaphore, &cancel).await?;
+            repair_oversized_segment_max_bitrate(&path, &encoder, &cfg, &cancel).await
         }));
     }
 
@@ -382,25 +494,65 @@ pub(crate) async fn copied_segments_need_reencode(dir: &Path, cfg: &Config) -> R
         return Ok(true);
     }
     let limit = (cfg.hls_segment_duration as f64 * 2.0)
-        .max(cfg.hls_segment_duration as f64 * 1.75)
+        .min(cfg.hls_segment_duration as f64 * 1.75)
         .max(0.001);
     Ok(durations.values().any(|d| *d <= 0.0 || *d > limit))
 }
 
-async fn reencode_video_segment(
+pub(crate) fn max_bitrate_for_segment(max_file_size: u64, duration_secs: f64) -> u64 {
+    let max_size = (max_file_size as f64 * 0.95) as u64;
+    let seconds = duration_secs.max(0.1);
+    (max_size as f64 * 8.0 / seconds) as u64
+}
+
+pub(crate) fn repair_needs_split(bps: u64) -> bool {
+    bps / 1000 <= 32
+}
+
+async fn repair_oversized_segment_max_bitrate(
     path: &Path,
-    tier: &VideoTier,
     encoder: &SelectedEncoder,
-    bitrate: &str,
     cfg: &Config,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let tmp = path.with_extension("ts.tmp");
+    let duration = probe_duration(path)
+        .await
+        .unwrap_or(cfg.hls_segment_duration as f64);
+    let max_size = (cfg.telegram_max_file_size as f64 * 0.95) as u64;
+    let seconds = duration.max(0.1);
+    let bps = ((max_size as f64 * 8.0) / seconds) as u64;
+    let bitrate = format!("{}k", (bps / 1000).max(32));
+
+    let current_size = tokio::fs::metadata(path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    tracing::warn!(
+        segment = %path.display(),
+        size = current_size,
+        max_size,
+        duration,
+        bitrate = %bitrate,
+        "re-encoding oversized segment at highest bitrate"
+    );
+
+    let is_m4s = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e == "m4s")
+        .unwrap_or(false);
+    let tmp = if is_m4s {
+        path.with_extension("m4s.tmp")
+    } else {
+        path.with_extension("ts.tmp")
+    };
+
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y").arg("-nostdin");
     add_encoder_device_args(&mut cmd, encoder);
     cmd.arg("-i")
-        .arg(path)
+        .arg(fmp4_input_arg(path))
         .arg("-map")
         .arg("0:v:0")
         .arg("-an")
@@ -408,11 +560,11 @@ async fn reencode_video_segment(
         .arg("-c:v")
         .arg(&encoder.name)
         .arg("-b:v")
-        .arg(bitrate)
+        .arg(&bitrate)
         .arg("-maxrate")
-        .arg(bitrate)
+        .arg(&bitrate)
         .arg("-bufsize")
-        .arg(double_bitrate(bitrate))
+        .arg(double_bitrate(&bitrate))
         .arg("-flags")
         .arg("+cgop")
         .arg("-sc_threshold")
@@ -426,16 +578,42 @@ async fn reencode_video_segment(
     if let Some(filter) = video_filter(encoder, None) {
         cmd.arg("-vf").arg(filter);
     }
-    cmd.arg("-f").arg("mpegts").arg(&tmp);
+    if is_m4s {
+        cmd.arg("-f")
+            .arg("mp4")
+            .arg("-movflags")
+            .arg("frag_keyframe+empty_moov");
+    } else {
+        cmd.arg("-f").arg("mpegts");
+    }
+    cmd.arg(&tmp);
     run_ffmpeg_cancellable(&mut cmd, cancel)
         .await
-        .with_context(|| format!("re-encoding oversized segment {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "re-encoding oversized segment at max bitrate {}",
+                path.display()
+            )
+        })?;
+
     tokio::fs::rename(&tmp, path).await?;
+
+    let repaired = tokio::fs::metadata(path).await?.len();
+    if repaired > cfg.telegram_max_file_size {
+        bail!(
+            "re-encoded segment {} is still too large after highest-bitrate repair: {} > {}",
+            path.display(),
+            repaired,
+            cfg.telegram_max_file_size
+        );
+    }
+
     tracing::info!(
         segment = %path.display(),
-        tier = tier.index,
-        "oversized video segment repaired"
+        repaired_size = repaired,
+        "oversized segment repaired at highest bitrate"
     );
+
     Ok(())
 }
 
@@ -528,7 +706,7 @@ async fn encode_audio_track(
                 .arg("-f")
                 .arg("hls")
                 .arg("-hls_time")
-                .arg(cfg.hls_segment_duration.to_string())
+                .arg(cfg.audio_segment_duration.to_string())
                 .arg("-hls_playlist_type")
                 .arg("vod")
                 .arg("-hls_segment_type")
@@ -566,7 +744,7 @@ async fn encode_audio_track(
         .arg("-f")
         .arg("hls")
         .arg("-hls_time")
-        .arg(cfg.hls_segment_duration.to_string())
+        .arg(cfg.audio_segment_duration.to_string())
         .arg("-hls_playlist_type")
         .arg("vod")
         .arg("-hls_segment_type")
@@ -596,6 +774,23 @@ async fn run_ffmpeg(cmd: &mut Command) -> Result<()> {
     )
 }
 
+async fn acquire_ffmpeg_permit(
+    semaphore: &Arc<Semaphore>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<OwnedSemaphorePermit> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("cancelled");
+        }
+        tokio::select! {
+            permit = semaphore.clone().acquire_owned() => {
+                return permit.context("acquiring ffmpeg encode permit");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+}
+
 async fn run_ffmpeg_cancellable(cmd: &mut Command, cancel: &Arc<AtomicBool>) -> Result<()> {
     tracing::debug!(cmd = ?cmd, "ffmpeg spawn");
     let started = Instant::now();
@@ -605,8 +800,21 @@ async fn run_ffmpeg_cancellable(cmd: &mut Command, cancel: &Arc<AtomicBool>) -> 
     // Drain stderr in background so FFmpeg never blocks on a full pipe.
     let stderr_task = child.stderr.take().map(|mut stderr| {
         tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf).await;
+            let mut buf = Vec::with_capacity(8192);
+            let mut tmp = [0u8; 4096];
+            loop {
+                match stderr.read(&mut tmp).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.len() > 8192 {
+                            let keep = 8192;
+                            buf = buf.split_off(buf.len() - keep);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
             buf
         })
     });
@@ -757,6 +965,19 @@ pub(crate) fn parse_hls_segment_durations(prefix: &str, playlist: &str) -> HashM
     out
 }
 
+pub(crate) fn fmp4_input_arg(path: &Path) -> String {
+    if path.extension().and_then(|e| e.to_str()) == Some("m4s") {
+        let init = path.parent().unwrap_or(Path::new(".")).join("init.mp4");
+        format!(
+            "concat:{}|{}",
+            init.to_string_lossy(),
+            path.to_string_lossy()
+        )
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 async fn probe_duration(path: &Path) -> Result<f64> {
     let output = Command::new("ffprobe")
         .arg("-v")
@@ -765,7 +986,7 @@ async fn probe_duration(path: &Path) -> Result<f64> {
         .arg("format=duration")
         .arg("-of")
         .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(path)
+        .arg(fmp4_input_arg(path))
         .output()
         .await?;
     if !output.status.success() {
@@ -797,36 +1018,64 @@ fn resolve_audio_bitrate(cfg: &Config, audio: &AudioStream) -> String {
     }
 }
 
-pub(crate) fn repair_bitrate(max_file_size: u64, duration: f64) -> String {
-    let seconds = duration.max(0.1);
-    let bps = ((max_file_size as f64 * 8.0 * 0.85) / seconds) as u64;
-    format!("{}k", (bps / 1000).max(32))
-}
-
-fn bitrate_bits(raw: &str) -> u64 {
+pub(crate) fn bitrate_bits(raw: &str) -> u64 {
     let raw = raw.trim();
-    let Some(unit) = raw.bytes().last() else {
+    if raw.is_empty() {
         return 0;
-    };
-    let number = raw[..raw.len() - 1].parse::<f64>().unwrap_or(0.0);
-    let mult = match unit {
-        b'k' | b'K' => 1_000.0,
-        b'm' | b'M' => 1_000_000.0,
-        b'g' | b'G' => 1_000_000_000.0,
-        _ => 1.0,
-    };
+    }
+    let lower = raw.to_ascii_lowercase();
+    let suffixes = [
+        ("kbps", 1_000.0),
+        ("mbps", 1_000_000.0),
+        ("gbps", 1_000_000_000.0),
+        ("bps", 1.0),
+        ("k", 1_000.0),
+        ("m", 1_000_000.0),
+        ("g", 1_000_000_000.0),
+    ];
+    let (number, mult) = suffixes
+        .iter()
+        .find_map(|(suffix, mult)| {
+            lower
+                .ends_with(suffix)
+                .then(|| (&raw[..raw.len() - suffix.len()], *mult))
+        })
+        .unwrap_or((raw, 1.0));
+    let number = number.trim().parse::<f64>().unwrap_or(0.0);
     (number * mult) as u64
 }
 
-fn double_bitrate(raw: &str) -> String {
+pub(crate) fn double_bitrate(raw: &str) -> String {
     let raw = raw.trim();
-    let Some(unit) = raw.chars().last() else {
-        return raw.to_string();
-    };
-    let number = raw[..raw.len() - unit.len_utf8()]
-        .parse::<f64>()
-        .unwrap_or(0.0);
-    format!("{}{}", number * 2.0, unit)
+    if raw.is_empty() {
+        return "0".to_string();
+    }
+    let last_char = raw.chars().last().unwrap();
+    if last_char.is_ascii_alphabetic() {
+        let unit = last_char;
+        let number_str = &raw[..raw.len() - unit.len_utf8()];
+        if let Ok(number) = number_str.parse::<f64>() {
+            let doubled = number * 2.0;
+            if doubled.fract() == 0.0 {
+                format!("{:.0}{}", doubled, unit)
+            } else {
+                format!("{}{}", doubled, unit)
+            }
+        } else {
+            raw.to_string()
+        }
+    } else {
+        if let Ok(number) = raw.parse::<f64>() {
+            let doubled = number * 2.0;
+            if doubled.fract() == 0.0 {
+                format!("{:.0}", doubled)
+            } else {
+                format!("{}", doubled)
+            }
+        } else {
+            raw.to_string()
+        }
+    }
 }
 
 pub(crate) fn is_text_subtitle(codec: &str) -> bool {
@@ -836,7 +1085,7 @@ pub(crate) fn is_text_subtitle(codec: &str) -> bool {
     )
 }
 
-fn scaled_width(source_width: i64, source_height: i64, target_height: i64) -> i64 {
+pub(crate) fn scaled_width(source_width: i64, source_height: i64, target_height: i64) -> i64 {
     if source_width <= 0 || source_height <= 0 || target_height <= 0 {
         return 0;
     }

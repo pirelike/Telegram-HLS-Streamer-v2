@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use serde_json::{json, Value};
 
-use super::{api_error, valid_job_id, AppState};
+use super::{api_error, db_unavailable, valid_job_id, AppState};
 use crate::db;
 
 pub(super) async fn handle_home() -> Html<String> {
@@ -135,7 +135,7 @@ async fn series_path_response(
     let series_name = match resolve_series_slug(&state, category, slug).await {
         Ok(Some(name)) => name,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "series not found"),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
+        Err(response) => return response,
     };
     let base = format!("{root_href}/{slug}");
     let ctx = match suffix {
@@ -187,9 +187,10 @@ async fn resolve_series_slug(
     state: &AppState,
     category: &str,
     slug: &str,
-) -> anyhow::Result<Option<String>> {
-    let conn = state.db.lock().await;
-    let names = db::distinct_series_names(&conn, Some(category))?;
+) -> Result<Option<String>, Response> {
+    let conn = state.db_conn().await.map_err(db_unavailable)?;
+    let names = db::distinct_series_names(&conn, Some(category))
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()))?;
     Ok(names.into_iter().find(|name| slugify(name) == slug))
 }
 

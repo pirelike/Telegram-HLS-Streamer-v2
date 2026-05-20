@@ -196,12 +196,6 @@ nested/video_0001.m4s?token=ignored
         false
     }
 
-    #[test]
-    fn repair_bitrate_uses_telegram_limit_and_duration() {
-        assert_eq!(process::repair_bitrate(1_000_000, 2.0), "3400k");
-        assert_eq!(process::repair_bitrate(1_000, 0.0), "68k");
-    }
-
     #[tokio::test]
     async fn copy_alignment_check_flags_empty_or_long_segments() {
         let base = std::env::temp_dir().join(format!(
@@ -310,5 +304,164 @@ nested/video_0001.m4s?token=ignored
             title: String::new(),
         };
         assert_eq!(output_audio_channels(&audio_31), 4);
+    }
+
+    #[test]
+    fn oversized_bitrate_calculation_stays_under_limit() {
+        let max_file_size = 20 * 1024 * 1024u64;
+        let duration = 6.0f64;
+        let bps = process::max_bitrate_for_segment(max_file_size, duration);
+        let bitrate_kbps = bps / 1000;
+        assert!(bitrate_kbps > 32, "should re-encode, not split");
+        let theoretical_max_bytes = (bps as f64 / 8.0) * duration;
+        assert!(
+            theoretical_max_bytes <= max_file_size as f64,
+            "calculated bitrate exceeds limit"
+        );
+        let short_duration = 0.5f64;
+        let bps_short = process::max_bitrate_for_segment(max_file_size, short_duration);
+        assert!(
+            !process::repair_needs_split(bps_short),
+            "short segment has very high bitrate, should re-encode not split, got {} bps",
+            bps_short
+        );
+        let normal_duration = 4.0f64;
+        let bps_normal = process::max_bitrate_for_segment(max_file_size, normal_duration);
+        assert!(
+            !process::repair_needs_split(bps_normal),
+            "normal segment should not need split, got {} bps",
+            bps_normal
+        );
+    }
+
+    #[test]
+    fn max_bitrate_for_segment_targets_95_percent_of_limit() {
+        let max_file_size = 20 * 1024 * 1024u64;
+        let duration = 10.0f64;
+        let bps = process::max_bitrate_for_segment(max_file_size, duration);
+        let max_bytes_for_bitrate = (bps as f64 / 8.0) * duration;
+        assert!(
+            max_bytes_for_bitrate <= (max_file_size as f64 * 0.95),
+            "max_bytes {} should be within 95% of limit {}",
+            max_bytes_for_bitrate,
+            max_file_size as f64 * 0.95
+        );
+    }
+
+    #[test]
+    fn oversized_segment_long_duration_triggers_split() {
+        let max_file_size = 20 * 1024 * 1024u64;
+        let bps = process::max_bitrate_for_segment(max_file_size, 5000.0);
+        assert!(
+            process::repair_needs_split(bps),
+            "very long segment at 20MB limit should need split, got {} bps",
+            bps
+        );
+    }
+
+    #[test]
+    fn repair_needs_split_at_32kbps_floor() {
+        assert!(process::repair_needs_split(31999));
+        assert!(process::repair_needs_split(32000));
+        assert!(process::repair_needs_split(32001));
+        assert!(!process::repair_needs_split(33000));
+        assert!(!process::repair_needs_split(1_000_000));
+    }
+
+    #[test]
+    fn fmp4_input_arg_uses_concat_for_m4s() {
+        use std::path::PathBuf;
+        let m4s = PathBuf::from("/tmp/video_0/video_0001.m4s");
+        let arg = process::fmp4_input_arg(&m4s);
+        assert!(
+            arg.starts_with("concat:"),
+            "expected concat format for m4s, got: {arg}"
+        );
+        assert!(
+            arg.contains("init.mp4"),
+            "should include init.mp4, got: {arg}"
+        );
+        assert!(
+            arg.contains("video_0001.m4s"),
+            "should include the segment, got: {arg}"
+        );
+
+        let ts = PathBuf::from("/tmp/video_0/video_0001.ts");
+        let arg = process::fmp4_input_arg(&ts);
+        assert_eq!(arg, "/tmp/video_0/video_0001.ts", "ts should be plain path");
+    }
+
+    #[test]
+    fn double_bitrate_doubles_preserving_unit() {
+        assert_eq!(process::double_bitrate("5000k"), "10000k");
+        assert_eq!(process::double_bitrate("2M"), "4M");
+        assert_eq!(process::double_bitrate("1500K"), "3000K");
+    }
+
+    #[test]
+    fn bitrate_bits_parses_units() {
+        assert_eq!(process::bitrate_bits("500k"), 500_000);
+        assert_eq!(process::bitrate_bits("1M"), 1_000_000);
+        assert_eq!(process::bitrate_bits("1G"), 1_000_000_000);
+        assert_eq!(process::bitrate_bits("100k"), 100_000);
+        assert_eq!(process::bitrate_bits("128000"), 128_000);
+        assert_eq!(process::bitrate_bits("128kbps"), 128_000);
+        assert_eq!(process::bitrate_bits("2Mbps"), 2_000_000);
+    }
+
+    #[test]
+    fn scaled_width_computes_even_width() {
+        assert_eq!(process::scaled_width(1920, 1080, 720), 1280);
+        assert_eq!(process::scaled_width(1920, 1080, 480), 852);
+        assert_eq!(process::scaled_width(1920, 1080, 360), 640);
+        assert_eq!(process::scaled_width(0, 0, 720), 0);
+        assert_eq!(process::scaled_width(1920, 1080, 1080), 1920);
+    }
+
+    #[tokio::test]
+    async fn oversized_m4s_detection_identifies_files_over_limit() {
+        let base = std::env::temp_dir().join(format!(
+            "thls_oversized_detect_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+
+        let ok_size = 1024u64;
+        let max_size = 2048u64;
+        tokio::fs::write(base.join("video_0000.m4s"), vec![0u8; ok_size as usize])
+            .await
+            .unwrap();
+        tokio::fs::write(
+            base.join("video_0001.m4s"),
+            vec![0u8; (max_size + 1) as usize],
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            base.join("video_0002.ts"),
+            vec![0u8; (max_size + 100) as usize],
+        )
+        .await
+        .unwrap();
+
+        let mut oversized = Vec::new();
+        let mut entries = tokio::fs::read_dir(&base).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("m4s") {
+                continue;
+            }
+            let size = entry.metadata().await.unwrap().len();
+            if size > max_size {
+                oversized.push(path);
+            }
+        }
+        assert_eq!(oversized.len(), 1);
+        assert!(oversized[0].ends_with("video_0001.m4s"));
+
+        let _ = tokio::fs::remove_dir_all(base).await;
     }
 }

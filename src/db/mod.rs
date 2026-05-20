@@ -12,9 +12,39 @@ pub use transfer::*;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
-pub const LATEST_SCHEMA_REVISION: i64 = 10;
+pub const LATEST_SCHEMA_REVISION: i64 = 18;
+
+pub type DbPool = Pool<SqliteConnectionManager>;
+pub type DbConn = r2d2::PooledConnection<SqliteConnectionManager>;
+
+pub fn init_db_pool(path: &Path) -> Result<DbPool> {
+    let conn = init_db(path)?;
+    conn.close().map_err(|(_, e)| anyhow::anyhow!(e))?;
+
+    let manager = sqlite_connection_manager(path);
+    Pool::builder()
+        .max_size(8)
+        .build(manager)
+        .context("creating sqlite connection pool")
+}
+
+pub(crate) fn init_db_pool_lazy(path: &Path) -> DbPool {
+    let manager = sqlite_connection_manager(path);
+    Pool::builder()
+        .max_size(8)
+        .min_idle(Some(0))
+        .build_unchecked(manager)
+}
+
+fn sqlite_connection_manager(path: &Path) -> SqliteConnectionManager {
+    let manager = SqliteConnectionManager::file(path)
+        .with_init(|conn| conn.execute_batch(SQLITE_CONNECTION_PRAGMAS));
+    manager
+}
 
 pub fn init_db(path: &Path) -> Result<Connection> {
     let mut conn = open_with_integrity(path)?;
@@ -32,6 +62,14 @@ pub fn init_db(path: &Path) -> Result<Connection> {
     }
 
     migrations::apply_migrations(&mut conn, current)?;
+
+    // Safety net: verify foreign keys are enabled after all migrations.
+    let fk_on: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    if fk_on != 1 {
+        tracing::error!("foreign_keys pragma is OFF after migrations; forcing ON");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    }
+
     Ok(conn)
 }
 
@@ -47,9 +85,18 @@ pub fn current_schema_revision(conn: &Connection) -> Result<i64> {
 }
 
 fn apply_connection_pragmas(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch(SQLITE_CONNECTION_PRAGMAS)?;
     Ok(())
 }
+
+const SQLITE_CONNECTION_PRAGMAS: &str = "\
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA temp_store = MEMORY;
+PRAGMA cache_size = -64000;
+PRAGMA mmap_size = 268435456;";
 
 fn open_with_integrity(path: &Path) -> Result<Connection> {
     if !path.exists() {
@@ -86,7 +133,7 @@ fn next_corrupted_path(path: &Path) -> PathBuf {
 
 fn validate_setting_key(key: &str) -> Result<()> {
     use crate::settings_registry;
-    if key.starts_with('_') || settings_registry::is_public_setting_key(key) {
+    if settings_registry::is_public_setting_key(key) {
         Ok(())
     } else {
         anyhow::bail!("unknown setting key: {key}");
@@ -130,23 +177,61 @@ mod tests {
         assert_eq!(current_schema_revision(conn).unwrap(), rev);
     }
 
+    fn assert_connection_pragmas(conn: &Connection) {
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let temp_store: i64 = conn
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .unwrap();
+        let cache_size: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(fk, 1);
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1);
+        assert_eq!(busy_timeout, 5000);
+        assert_eq!(temp_store, 2);
+        assert_eq!(cache_size, -64000);
+    }
+
     #[test]
     fn fresh_db_creation_is_revision_9_and_idempotent() {
         let path = temp_db_path("streamer.db");
         let conn = init_db(&path).unwrap();
-        assert_schema_rev(&conn, 10);
+        assert_schema_rev(&conn, LATEST_SCHEMA_REVISION);
         assert!(migrations::column_exists(&conn, "tracks", "original_stream_index").unwrap());
         assert!(migrations::column_exists(&conn, "segments", "duration").unwrap());
         assert!(migrations::index_exists(&conn, "idx_segments_bot_index").unwrap());
+        assert!(migrations::index_exists(&conn, "idx_jobs_media_created").unwrap());
+        assert!(migrations::index_exists(&conn, "idx_jobs_series_created").unwrap());
         assert!(migrations::table_exists(&conn, "segment_parts").unwrap());
+        assert!(migrations::column_exists(&conn, "jobs", "source_path").unwrap());
+        assert!(migrations::column_exists(&conn, "jobs", "created_at_unix").unwrap());
+        assert!(migrations::column_exists(&conn, "tracks", "bitrate_bps").unwrap());
+        assert!(migrations::column_exists(&conn, "tracks", "mode").unwrap());
+        assert!(migrations::column_exists(&conn, "segments", "prefix").unwrap());
+        assert!(migrations::column_exists(&conn, "segments", "name").unwrap());
+        assert!(migrations::table_exists(&conn, "kv_internal").unwrap());
+        assert_connection_pragmas(&conn);
         drop(conn);
 
         let conn = init_db(&path).unwrap();
-        assert_schema_rev(&conn, 10);
+        assert_schema_rev(&conn, LATEST_SCHEMA_REVISION);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, LATEST_SCHEMA_REVISION);
     }
 
     #[test]
@@ -169,11 +254,11 @@ mod tests {
         drop(conn);
 
         let conn = init_db(&path).unwrap();
-        assert_schema_rev(&conn, 10);
+        assert_schema_rev(&conn, LATEST_SCHEMA_REVISION);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, LATEST_SCHEMA_REVISION);
     }
 
     #[test]
@@ -194,9 +279,16 @@ mod tests {
         conn.execute("INSERT INTO segments(job_id, segment_key, file_id, bot_index) VALUES ('job1', 'video_0/video_0001.ts', 'file', 0)", []).unwrap();
         drop(conn);
 
+        std::env::set_var("THLS_BOOTSTRAP_FROM_LEGACY", "1");
         let conn = init_db(&path).unwrap();
-        assert_schema_rev(&conn, 10);
+        std::env::remove_var("THLS_BOOTSTRAP_FROM_LEGACY");
+        assert_schema_rev(&conn, LATEST_SCHEMA_REVISION);
         assert!(get_job(&conn, "job1").unwrap().is_some());
+        assert!(get_job(&conn, "job1")
+            .unwrap()
+            .unwrap()
+            .source_path
+            .is_none());
         assert_eq!(
             get_segment(&conn, "job1", "video_0/video_0001.ts")
                 .unwrap()
@@ -212,7 +304,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         migrations::ensure_schema_migrations_table(&conn).unwrap();
         conn.execute(
-            "INSERT INTO schema_migrations(revision, name) VALUES (11, 'future')",
+            "INSERT INTO schema_migrations(revision, name) VALUES (999, 'future')",
             [],
         )
         .unwrap();
@@ -227,8 +319,22 @@ mod tests {
         let path = temp_db_path("corrupt.db");
         std::fs::write(&path, b"not sqlite").unwrap();
         let conn = init_db(&path).unwrap();
-        assert_schema_rev(&conn, 10);
+        assert_schema_rev(&conn, LATEST_SCHEMA_REVISION);
         assert!(PathBuf::from(format!("{}.corrupted", path.display())).exists());
+    }
+
+    #[test]
+    fn pool_allows_multiple_usable_connections() {
+        let path = temp_db_path("pool.db");
+        let pool = init_db_pool(&path).unwrap();
+        let conn1 = pool.get().unwrap();
+        let conn2 = pool.get().unwrap();
+
+        assert_schema_rev(&conn1, LATEST_SCHEMA_REVISION);
+        assert_schema_rev(&conn2, LATEST_SCHEMA_REVISION);
+        assert_connection_pragmas(&conn1);
+        assert_connection_pragmas(&conn2);
+        assert!(pool.state().connections >= 2);
     }
 
     #[test]
@@ -279,6 +385,7 @@ mod tests {
             bot_index: 2,
             file_size: 123,
             duration: Some(4.0),
+            is_split: false,
         }];
         save_job(&mut conn, &job, &tracks, &segments, &[]).unwrap();
 
@@ -297,6 +404,24 @@ mod tests {
                 .bot_index,
             2
         );
+        let (mode, bitrate_bps): (String, i64) = conn
+            .query_row(
+                "SELECT mode, bitrate_bps FROM tracks WHERE job_id = 'job1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "encode");
+        assert_eq!(bitrate_bps, 5_000_000);
+        let (prefix, name): (String, String) = conn
+            .query_row(
+                "SELECT prefix, name FROM segments WHERE job_id = 'job1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(prefix, "video_0");
+        assert_eq!(name, "video_0001.m4s");
         assert_eq!(
             get_segments_for_prefix(&conn, "job1", "video_0")
                 .unwrap()
@@ -365,6 +490,7 @@ mod tests {
             bot_index: 1,
             file_size: 42,
             duration: Some(4.0),
+            is_split: false,
         }];
         save_job(&mut source, &job, &[], &segments, &[]).unwrap();
         let export = export_to_dict(&source).unwrap();
@@ -455,23 +581,29 @@ mod tests {
         let conn = init_db(&active).unwrap();
         drop(conn);
         let conn = Connection::open(&source).unwrap();
+        migrations::ensure_schema_migrations_table(&conn).unwrap();
         migrations::run_migration_1(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations(revision, name) VALUES (1, 'legacy source')",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let result = replace_database_file(&active, &source).unwrap();
         assert!(result.backup_path.exists());
-        assert_eq!(result.schema_revision, 10);
+        assert_eq!(result.schema_revision, LATEST_SCHEMA_REVISION);
         assert!(!source.exists());
         let conn = init_db(&active).unwrap();
-        assert_schema_rev(&conn, 10);
+        assert_schema_rev(&conn, LATEST_SCHEMA_REVISION);
     }
 
     #[test]
     fn round_robin_counter_survives_db_reopen() {
         let path = temp_db_path("rr.db");
         {
-            let mut conn = init_db(&path).unwrap();
-            set_last_bot_index(&mut conn, 7).unwrap();
+            let conn = init_db(&path).unwrap();
+            set_last_bot_index(&conn, 7).unwrap();
             assert_eq!(get_last_bot_index(&conn).unwrap(), 7);
         }
         // Reopen the same DB file
@@ -479,5 +611,279 @@ mod tests {
             let conn = init_db(&path).unwrap();
             assert_eq!(get_last_bot_index(&conn).unwrap(), 7);
         }
+    }
+
+    #[test]
+    fn processing_marker_creates_row() {
+        let path = temp_db_path("crash_recovery_1.db");
+        let conn = init_db(&path).unwrap();
+        insert_processing_marker(&conn, "job1", "test.mkv").unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM jobs WHERE job_id = 'job1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "processing");
+    }
+
+    #[test]
+    fn job_marker_does_not_replace_existing_job_or_cascade_children() {
+        let path = temp_db_path("marker_no_replace.db");
+        let mut conn = init_db(&path).unwrap();
+
+        let job = NewJob::complete("job1", "complete.mkv");
+        let segments = vec![NewSegment {
+            segment_key: "video_0/video_0001.m4s".into(),
+            file_id: "file-id".into(),
+            bot_index: 0,
+            file_size: 123,
+            duration: Some(4.0),
+            is_split: false,
+        }];
+        let parts = vec![NewSegmentPart {
+            job_id: "job1".into(),
+            segment_key: "video_0/video_0001.m4s".into(),
+            part_index: 0,
+            file_id: "part-id".into(),
+            bot_index: 0,
+            file_size: 50,
+        }];
+        save_job(&mut conn, &job, &[], &segments, &parts).unwrap();
+
+        insert_job_marker(&conn, "job1", "retry.mkv", "queued").unwrap();
+
+        let saved = get_job(&conn, "job1").unwrap().unwrap();
+        assert_eq!(saved.filename, "complete.mkv");
+        assert_eq!(saved.status, "complete");
+        assert_eq!(get_segments_for_job(&conn, "job1").unwrap().len(), 1);
+        assert_eq!(
+            get_segment_parts(&conn, "job1", "video_0/video_0001.m4s")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn get_stuck_processing_jobs_returns_stuck() {
+        let path = temp_db_path("crash_recovery_2.db");
+        let conn = init_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, created_at) VALUES ('job1', 'test.mkv', 'processing', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        let stuck = get_stuck_processing_jobs(&conn).unwrap();
+        assert_eq!(stuck, vec!["job1".to_string()]);
+    }
+
+    #[test]
+    fn mark_job_as_failed_updates_status() {
+        let path = temp_db_path("crash_recovery_3.db");
+        let conn = init_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, created_at) VALUES ('job1', 'test.mkv', 'processing', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        let updated = mark_job_as_failed(&conn, "job1", "test error").unwrap();
+        assert!(updated);
+        let status: String = conn
+            .query_row("SELECT status FROM jobs WHERE job_id = 'job1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "error");
+    }
+
+    #[test]
+    fn foreign_keys_pragma_on_after_init() {
+        let path = temp_db_path("fk_test.db");
+        let conn = init_db(&path).unwrap();
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn insert_split_segment_is_split_true() {
+        let path = temp_db_path("split_segment.db");
+        let mut conn = init_db(&path).unwrap();
+
+        let job = NewJob::complete("test_job_split", "test_split.mkv");
+        let segments = vec![NewSegment {
+            segment_key: "video_0/seg_001.ts".into(),
+            file_id: "".into(),
+            bot_index: 0,
+            file_size: 1024,
+            duration: Some(10.0),
+            is_split: true,
+        }];
+        save_job(&mut conn, &job, &[], &segments, &[]).unwrap();
+
+        // Verify via get_segment (SegmentLookup)
+        let lookup = get_segment(&conn, "test_job_split", "video_0/seg_001.ts")
+            .unwrap()
+            .expect("split segment should exist");
+        assert!(lookup.is_split, "split segment should have is_split=true");
+        assert_eq!(
+            lookup.file_id, "",
+            "split segment should have empty file_id"
+        );
+
+        // Verify via get_segments_for_job (SegmentRow)
+        let rows = get_segments_for_job(&conn, "test_job_split").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].is_split,
+            "SegmentRow should also have is_split=true"
+        );
+        assert_eq!(rows[0].file_id, "");
+    }
+
+    #[test]
+    fn insert_normal_segment_is_split_false() {
+        let path = temp_db_path("normal_segment.db");
+        let mut conn = init_db(&path).unwrap();
+
+        let job = NewJob::complete("test_job_normal", "test_normal.mkv");
+        let segments = vec![NewSegment {
+            segment_key: "video_0/seg_001.ts".into(),
+            file_id: "some_file_id_123".into(),
+            bot_index: 0,
+            file_size: 2048,
+            duration: Some(10.0),
+            is_split: false,
+        }];
+        save_job(&mut conn, &job, &[], &segments, &[]).unwrap();
+
+        // Verify via get_segment (SegmentLookup)
+        let lookup = get_segment(&conn, "test_job_normal", "video_0/seg_001.ts")
+            .unwrap()
+            .expect("normal segment should exist");
+        assert!(
+            !lookup.is_split,
+            "normal segment should have is_split=false"
+        );
+        assert_eq!(lookup.file_id, "some_file_id_123");
+
+        // Verify via get_segments_for_job (SegmentRow)
+        let rows = get_segments_for_job(&conn, "test_job_normal").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].is_split,
+            "SegmentRow should also have is_split=false"
+        );
+        assert_eq!(rows[0].file_id, "some_file_id_123");
+    }
+
+    #[test]
+    fn update_segment_file_id_replaces_stale_id() {
+        let path = temp_db_path("update_fid.db");
+        let mut conn = init_db(&path).unwrap();
+        let job = NewJob {
+            job_id: "test_update_fid".into(),
+            filename: "movie.mkv".into(),
+            duration: 10.0,
+            file_size: 1000,
+            video_codec: "h264".into(),
+            video_width: 1920,
+            video_height: 1080,
+            status: "complete".into(),
+            media_type: "Film".into(),
+            series_name: String::new(),
+            has_thumbnail: false,
+            is_series: false,
+            season_number: None,
+            episode_number: None,
+            part_number: None,
+            source_path: None,
+        };
+        let segments = vec![NewSegment {
+            segment_key: "video_0/video_0001.m4s".into(),
+            file_id: "stale_file_id".into(),
+            bot_index: 0,
+            file_size: 500,
+            duration: Some(4.0),
+            is_split: false,
+        }];
+        save_job(&mut conn, &job, &[], &segments, &[]).unwrap();
+
+        let updated = queries::update_segment_file_id(
+            &conn,
+            "test_update_fid",
+            "video_0/video_0001.m4s",
+            "fresh_file_id",
+            1,
+        )
+        .unwrap();
+        assert!(updated);
+
+        let lookup = queries::get_segment(&conn, "test_update_fid", "video_0/video_0001.m4s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lookup.file_id, "fresh_file_id");
+        assert_eq!(lookup.bot_index, 1);
+    }
+
+    #[test]
+    fn update_segment_part_file_id_replaces_stale_id() {
+        let path = temp_db_path("update_part_fid.db");
+        let mut conn = init_db(&path).unwrap();
+        let job = NewJob {
+            job_id: "test_update_part_fid".into(),
+            filename: "movie.mkv".into(),
+            duration: 10.0,
+            file_size: 1000,
+            video_codec: "h264".into(),
+            video_width: 1920,
+            video_height: 1080,
+            status: "complete".into(),
+            media_type: "Film".into(),
+            series_name: String::new(),
+            has_thumbnail: false,
+            is_series: false,
+            season_number: None,
+            episode_number: None,
+            part_number: None,
+            source_path: None,
+        };
+        let segments = vec![NewSegment {
+            segment_key: "video_0/video_0001.m4s".into(),
+            file_id: String::new(),
+            bot_index: 0,
+            file_size: 1000,
+            duration: Some(4.0),
+            is_split: true,
+        }];
+        let parts = vec![NewSegmentPart {
+            job_id: "test_update_part_fid".into(),
+            segment_key: "video_0/video_0001.m4s".into(),
+            part_index: 0,
+            file_id: "stale_part_id".into(),
+            bot_index: 0,
+            file_size: 500,
+        }];
+        save_job(&mut conn, &job, &[], &segments, &parts).unwrap();
+
+        let updated = queries::update_segment_part_file_id(
+            &conn,
+            "test_update_part_fid",
+            "video_0/video_0001.m4s",
+            0,
+            "fresh_part_id",
+            2,
+        )
+        .unwrap();
+        assert!(updated);
+
+        let lookup =
+            queries::get_segment_parts(&conn, "test_update_part_fid", "video_0/video_0001.m4s")
+                .unwrap();
+        assert_eq!(lookup[0].file_id, "fresh_part_id");
+        assert_eq!(lookup[0].bot_index, 2);
     }
 }

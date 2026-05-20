@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,6 +12,11 @@ pub struct SegmentCache {
     hits: AtomicU64,
     pub(super) misses: AtomicU64,
     evictions: AtomicU64,
+    // Mirrors CacheInner.bytes / map.len() for lock-free reads in snapshot().
+    // Updated under the inner lock so they stay consistent with the map;
+    // momentary skew between bytes and entries is acceptable for metrics.
+    bytes: AtomicU64,
+    entries: AtomicUsize,
 }
 
 pub(super) struct CacheInner {
@@ -24,12 +30,25 @@ pub(super) struct CacheInner {
 #[derive(Clone)]
 pub(super) struct CacheEntry {
     pub(super) bytes: Arc<Vec<u8>>,
+    pub(super) file_path: Option<PathBuf>,
     pub(super) content_type: &'static str,
 }
 
 pub(super) struct Inflight {
-    pub(super) outcome: Mutex<Option<std::result::Result<(), String>>>,
+    pub(super) outcome: Mutex<Option<std::result::Result<Option<CacheEntry>, String>>>,
     pub(super) notify: Notify,
+}
+
+impl Inflight {
+    pub(super) async fn wait_for_outcome(&self) -> std::result::Result<Option<CacheEntry>, String> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(outcome) = self.outcome.lock().await.clone() {
+                return outcome;
+            }
+            notified.await;
+        }
+    }
 }
 
 pub struct CacheSnapshot {
@@ -53,18 +72,15 @@ impl SegmentCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            entries: AtomicUsize::new(0),
         }
     }
 
     pub fn snapshot(&self) -> CacheSnapshot {
-        let inner = self.inner.try_lock();
-        let (size_bytes, entries) = match inner {
-            Ok(g) => (g.bytes, g.map.len()),
-            Err(_) => (0, 0),
-        };
         CacheSnapshot {
-            size_bytes,
-            entries,
+            size_bytes: self.bytes.load(Ordering::Relaxed),
+            entries: self.entries.load(Ordering::Relaxed),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
@@ -91,6 +107,10 @@ impl SegmentCache {
         }
     }
 
+    pub(super) async fn get_bytes(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        self.get(key).await.map(|entry| entry.bytes)
+    }
+
     pub(super) async fn insert(
         &self,
         key: String,
@@ -101,23 +121,43 @@ impl SegmentCache {
         if let Some(b) = budget_override {
             g.budget = b;
         }
+        let is_new_key = !g.map.contains_key(&key);
         if let Some(prev) = g.map.remove(&key) {
-            g.bytes = g.bytes.saturating_sub(prev.bytes.len() as u64);
+            let prev_size = prev.bytes.len() as u64;
+            g.bytes = g.bytes.saturating_sub(prev_size);
+            self.bytes.fetch_sub(prev_size, Ordering::Relaxed);
+            remove_cache_file(prev.file_path);
             if let Some(pos) = g.order.iter().position(|k| k == &key) {
                 g.order.remove(pos);
             }
         }
         let size = entry.bytes.len() as u64;
         g.bytes += size;
+        self.bytes.fetch_add(size, Ordering::Relaxed);
         g.map.insert(key.clone(), entry);
         g.order.push(key);
+        if is_new_key {
+            self.entries.fetch_add(1, Ordering::Relaxed);
+        }
         while g.bytes > g.budget && !g.order.is_empty() {
             let victim = g.order.remove(0);
             if let Some(e) = g.map.remove(&victim) {
-                g.bytes = g.bytes.saturating_sub(e.bytes.len() as u64);
+                let e_size = e.bytes.len() as u64;
+                g.bytes = g.bytes.saturating_sub(e_size);
+                self.bytes.fetch_sub(e_size, Ordering::Relaxed);
+                self.entries.fetch_sub(1, Ordering::Relaxed);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
+                remove_cache_file(e.file_path);
             }
         }
+    }
+}
+
+fn remove_cache_file(path: Option<PathBuf>) {
+    if let Some(path) = path {
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(path).await;
+        });
     }
 }
 
@@ -146,7 +186,7 @@ pub(super) async fn finish_inflight(
     {
         let mut outcome = inflight.outcome.lock().await;
         *outcome = Some(match result {
-            Ok(_) => Ok(()),
+            Ok(entry) => Ok(Some(entry.clone())),
             Err(e) => Err(e.to_string()),
         });
     }

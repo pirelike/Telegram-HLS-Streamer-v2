@@ -8,9 +8,11 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use super::{api_error, AppState};
+use super::{api_error, db_unavailable, AppState};
 use crate::config::{self, BotConfig, Config};
 use crate::db;
+use crate::env_writer;
+use crate::media;
 use crate::settings_registry;
 use crate::telegram;
 
@@ -58,8 +60,16 @@ pub(super) async fn handle_post_settings(
     }
 
     {
-        let mut conn = state.db.lock().await;
-        if let Err(e) = db::set_settings(&mut conn, &normalized) {
+        let mut conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
+        let settings_for_db = normalized.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || db::set_settings(&mut conn, &settings_for_db))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
+        {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "settings_write_failed",
@@ -67,10 +77,13 @@ pub(super) async fn handle_post_settings(
             );
         }
     }
+    if let Err(e) = write_settings_to_env(&state, &normalized).await {
+        tracing::warn!(error = %e, "failed to update .env file");
+    }
     let mut new_cfg = state.config.read().await.as_ref().clone();
     config::apply_normalized_settings(&mut new_cfg, &normalized);
     let response = settings_response(&new_cfg);
-    *state.config.write().await = Arc::new(new_cfg);
+    store_config(&state, new_cfg, updates_encoder_settings(&normalized)).await;
     Json(response).into_response()
 }
 
@@ -98,25 +111,38 @@ pub(super) async fn handle_reset_settings(
     }
 
     {
-        let conn = state.db.lock().await;
-        for key in &keys {
-            if let Err(e) = db::delete_setting(&conn, key) {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "settings_reset_failed",
-                    e.to_string(),
-                );
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
+        let keys_for_db = keys.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            for key in &keys_for_db {
+                db::delete_setting(&conn, key)?;
             }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_reset_failed",
+                e.to_string(),
+            );
         }
     }
     let restored: HashMap<String, String> = keys
         .iter()
         .filter_map(|key| config::env_or_default_value(key).map(|value| (key.clone(), value)))
         .collect();
+    if let Err(e) = write_settings_to_env(&state, &restored).await {
+        tracing::warn!(error = %e, "failed to update .env file on reset");
+    }
     let mut new_cfg = state.config.read().await.as_ref().clone();
     config::apply_normalized_settings(&mut new_cfg, &restored);
     let response = settings_response(&new_cfg);
-    *state.config.write().await = Arc::new(new_cfg);
+    store_config(&state, new_cfg, resets_encoder_settings(&keys)).await;
     Json(response).into_response()
 }
 
@@ -124,9 +150,19 @@ pub(super) async fn handle_get_bots(State(state): State<Arc<AppState>>) -> Respo
     let cfg = state.config.read().await.clone();
     let session_metrics = state.telegram.metrics_snapshot().await;
     let workloads = {
-        let conn = state.db.lock().await;
-        match db::get_bot_workload_stats(&conn) {
-            Ok(stats) => stats,
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
+        match tokio::task::spawn_blocking(move || db::get_bot_workload_stats(&conn)).await {
+            Ok(Ok(stats)) => stats,
+            Ok(Err(e)) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "bot_stats_failed",
+                    e.to_string(),
+                )
+            }
             Err(e) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -244,27 +280,37 @@ pub(super) async fn handle_add_bot(
     }
 
     let (id, new_cfg) = {
-        let conn = state.db.lock().await;
-        match db::bot_exists(&conn, &token) {
-            Ok(true) => {
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
+        let token_for_db = token.clone();
+        let label = body.label.unwrap_or_default();
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<(i64, Config)> {
+            if db::bot_exists(&conn, &token_for_db)? {
+                anyhow::bail!("duplicate_bot");
+            }
+            let id = db::add_bot(&conn, &token_for_db, body.channel_id, &label)?;
+            let cfg = Config::load(&conn)?;
+            Ok((id, cfg))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) if e.to_string() == "duplicate_bot" => {
                 return api_error(
                     StatusCode::CONFLICT,
                     "duplicate_bot",
                     "bot token already exists",
                 )
             }
-            Ok(false) => {}
-            Err(e) => {
+            Ok(Err(e)) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "bot_lookup_failed",
+                    "bot_add_failed",
                     e.to_string(),
                 )
             }
-        }
-        let label = body.label.unwrap_or_default();
-        let id = match db::add_bot(&conn, &token, body.channel_id, &label) {
-            Ok(id) => id,
             Err(e) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -272,18 +318,7 @@ pub(super) async fn handle_add_bot(
                     e.to_string(),
                 )
             }
-        };
-        let cfg = match Config::load(&conn) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "config_reload_failed",
-                    e.to_string(),
-                )
-            }
-        };
-        (id, cfg)
+        }
     };
     *state.config.write().await = Arc::new(new_cfg);
     Json(json!({ "id": id, "message": "bot added" })).into_response()
@@ -301,24 +336,33 @@ pub(super) async fn handle_delete_bot(
         );
     }
     let new_cfg = {
-        let conn = state.db.lock().await;
-        match db::delete_bot(&conn, bot_id) {
-            Ok(true) => {}
-            Ok(false) => return api_error(StatusCode::NOT_FOUND, "bot_not_found", "bot not found"),
-            Err(e) => {
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Config>> {
+            if !db::delete_bot(&conn, bot_id)? {
+                return Ok(None);
+            }
+            Ok(Some(Config::load(&conn)?))
+        })
+        .await
+        {
+            Ok(Ok(Some(cfg))) => cfg,
+            Ok(Ok(None)) => {
+                return api_error(StatusCode::NOT_FOUND, "bot_not_found", "bot not found")
+            }
+            Ok(Err(e)) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "bot_delete_failed",
                     e.to_string(),
                 )
             }
-        }
-        match Config::load(&conn) {
-            Ok(cfg) => cfg,
             Err(e) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "config_reload_failed",
+                    "bot_delete_failed",
                     e.to_string(),
                 )
             }
@@ -332,6 +376,34 @@ fn settings_response(cfg: &Config) -> Value {
     json!({ "categories": settings_registry::categories_for_values(&values) })
 }
 
+async fn store_config(state: &AppState, cfg: Config, refresh_encoder: bool) {
+    if refresh_encoder {
+        let selected = media::select_encoder(&cfg).await;
+        tracing::info!(
+            encoder = %selected.name,
+            vaapi_device = selected.vaapi_device.as_deref().unwrap_or(""),
+            "encoder selection refreshed after settings update"
+        );
+        *state.selected_encoder.write().await = selected;
+    }
+    *state.config.write().await = Arc::new(cfg);
+}
+
+fn updates_encoder_settings(settings: &HashMap<String, String>) -> bool {
+    settings.keys().any(|key| is_encoder_setting(key))
+}
+
+fn resets_encoder_settings(keys: &[String]) -> bool {
+    keys.iter().any(|key| is_encoder_setting(key))
+}
+
+fn is_encoder_setting(key: &str) -> bool {
+    matches!(
+        key,
+        "ENABLE_HW_ACCEL" | "PREFERRED_ENCODER" | "VAAPI_DEVICE"
+    )
+}
+
 fn mask_bot_token(token: &str) -> String {
     let Some((id, secret)) = token.split_once(':') else {
         return "***".into();
@@ -340,4 +412,23 @@ fn mask_bot_token(token: &str) -> String {
     let tail_chars: Vec<char> = secret.chars().rev().take(3).collect();
     let tail: String = tail_chars.into_iter().rev().collect();
     format!("{id}:{head}***{tail}")
+}
+
+async fn write_settings_to_env(
+    state: &AppState,
+    settings: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let mut env_map: HashMap<&str, String> = HashMap::new();
+    for (key, value) in settings {
+        if let Some(spec) = settings_registry::setting_spec(key) {
+            env_map.insert(spec.env, value.clone());
+        }
+    }
+    if env_map.is_empty() {
+        return Ok(());
+    }
+    let env_path = state.env_path.clone();
+    tokio::task::spawn_blocking(move || env_writer::write_env_values(&env_path, &env_map))
+        .await??;
+    Ok(())
 }

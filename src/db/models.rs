@@ -22,6 +22,8 @@ pub struct JobRow {
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
     pub part_number: Option<i64>,
+    pub error: Option<String>,
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -41,6 +43,9 @@ pub struct NewJob {
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
     pub part_number: Option<i64>,
+    /// Upload-local filename label only. This must not contain path separators or `..`;
+    /// the DB enforces the same invariant so reprocess cannot escape uploads_dir.
+    pub source_path: Option<String>,
 }
 
 impl NewJob {
@@ -61,6 +66,7 @@ impl NewJob {
             season_number: None,
             episode_number: None,
             part_number: None,
+            source_path: None,
         }
     }
 }
@@ -104,6 +110,8 @@ pub struct SegmentRow {
     pub bot_index: i64,
     pub file_size: i64,
     pub duration: Option<f64>,
+    #[serde(default)]
+    pub is_split: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,12 +121,16 @@ pub struct NewSegment {
     pub bot_index: i64,
     pub file_size: i64,
     pub duration: Option<f64>,
+    #[serde(default)]
+    pub is_split: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentLookup {
     pub file_id: String,
     pub bot_index: i64,
+    #[serde(default)]
+    pub is_split: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -149,15 +161,26 @@ pub struct SegmentPartLookup {
     pub file_size: i64,
 }
 
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobMetadataUpdate {
     pub filename: Option<String>,
     pub media_type: Option<String>,
     pub series_name: Option<String>,
     pub is_series: Option<bool>,
-    pub season_number: Option<i64>,
-    pub episode_number: Option<i64>,
-    pub part_number: Option<i64>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub season_number: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub episode_number: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub part_number: Option<Option<i64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -210,6 +233,8 @@ pub struct DbBotRow {
     pub token: String,
     pub channel_id: i64,
     pub label: String,
+    pub enabled: bool,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -248,10 +273,10 @@ pub struct DatabaseBackupResult {
 
 // --- SQL constants ---
 
-pub(super) const JOB_SELECT_SQL: &str = "SELECT job_id, filename, duration, file_size, video_codec, video_width, video_height, status, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number FROM jobs";
+pub(super) const JOB_SELECT_SQL: &str = "SELECT job_id, filename, duration, file_size, video_codec, video_width, video_height, status, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number, error, source_path FROM jobs";
 pub(super) const TRACK_SELECT_SQL: &str = "SELECT id, job_id, track_type, track_index, codec, language, title, channels, width, height, bitrate, original_stream_index FROM tracks";
 pub(super) const SEGMENT_SELECT_SQL: &str =
-    "SELECT id, job_id, segment_key, file_id, bot_index, file_size, duration FROM segments";
+    "SELECT id, job_id, segment_key, file_id, bot_index, file_size, duration, is_split FROM segments";
 pub(super) const SEGMENT_PART_SELECT_SQL: &str =
     "SELECT id, job_id, segment_key, part_index, file_id, bot_index, file_size FROM segment_parts";
 
@@ -275,6 +300,8 @@ pub(super) fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> 
         season_number: row.get(13)?,
         episode_number: row.get(14)?,
         part_number: row.get(15)?,
+        error: row.get(16)?,
+        source_path: row.get(17)?,
     })
 }
 
@@ -304,6 +331,7 @@ pub(super) fn segment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Segm
         bot_index: row.get(4)?,
         file_size: row.get(5)?,
         duration: row.get(6)?,
+        is_split: row.get::<_, i64>(7)? == 1,
     })
 }
 

@@ -23,7 +23,7 @@ HTTP layer for THLS. This folder owns Axum routes, request/response shaping, bro
 - `router()` — builds the Axum router with all routes.
 - `SegmentCache` — re-exported from `playback`, used by `main.rs` and `AppState`.
 - `start_background_tasks()` — re-exported from `jobs`.
-- `load_watch_settings()` — re-exported from `watch_folder`.
+- `load_watch_settings(conn, legacy_path)` — re-exported from `watch_folder`; loads versioned DB-backed watch settings and migrates/tolerates legacy JSON.
 - `api_error()` — JSON error-response helper for sibling modules.
 - `valid_job_id()` — route parameter validator for job/segment paths.
 

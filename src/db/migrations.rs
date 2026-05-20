@@ -60,6 +60,46 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         name: "add_segment_parts",
         run: run_migration_10,
     },
+    Migration {
+        revision: 11,
+        name: "add_is_split_column",
+        run: run_migration_11,
+    },
+    Migration {
+        revision: 12,
+        name: "add_job_listing_composite_indexes",
+        run: run_migration_12,
+    },
+    Migration {
+        revision: 13,
+        name: "add_jobs_error_column",
+        run: run_migration_13,
+    },
+    Migration {
+        revision: 14,
+        name: "add_jobs_source_path_column",
+        run: run_migration_14,
+    },
+    Migration {
+        revision: 15,
+        name: "enforce_jobs_constraints",
+        run: run_migration_15,
+    },
+    Migration {
+        revision: 16,
+        name: "enforce_segments_is_split_check",
+        run: run_migration_16,
+    },
+    Migration {
+        revision: 17,
+        name: "add_data_model_metadata_tables",
+        run: run_migration_17,
+    },
+    Migration {
+        revision: 18,
+        name: "add_normalized_media_columns",
+        run: run_migration_18,
+    },
 ];
 
 // Public wrappers for test access
@@ -93,6 +133,42 @@ pub(crate) fn run_migration_9(conn: &Connection) -> Result<()> {
 pub(crate) fn run_migration_10(conn: &Connection) -> Result<()> {
     migration_10_add_segment_parts(conn)
 }
+pub(crate) fn run_migration_11(conn: &Connection) -> Result<()> {
+    migration_11_add_is_split_column(conn)
+}
+pub(crate) fn run_migration_12(conn: &Connection) -> Result<()> {
+    migration_12_add_job_listing_composite_indexes(conn)
+}
+pub(crate) fn run_migration_13(conn: &Connection) -> Result<()> {
+    migration_13_add_jobs_error_column(conn)
+}
+pub(crate) fn run_migration_14(conn: &Connection) -> Result<()> {
+    migration_14_add_jobs_source_path_column(conn)
+}
+pub(crate) fn run_migration_15(conn: &Connection) -> Result<()> {
+    migration_15_enforce_jobs_constraints(conn)
+}
+pub(crate) fn run_migration_16(conn: &Connection) -> Result<()> {
+    migration_16_enforce_segments_is_split_check(conn)
+}
+pub(crate) fn run_migration_17(conn: &Connection) -> Result<()> {
+    migration_17_add_data_model_metadata_tables(conn)
+}
+pub(crate) fn run_migration_18(conn: &Connection) -> Result<()> {
+    migration_18_add_normalized_media_columns(conn)
+}
+
+fn table_sql_contains(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            rusqlite::params![table],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(sql.is_some_and(|s| s.contains(needle)))
+}
 
 pub(super) fn ensure_schema_migrations_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -110,6 +186,11 @@ pub(super) fn bootstrap_schema_migrations(conn: &Connection) -> Result<()> {
         ensure_schema_migrations_table(conn)?;
         return Ok(());
     }
+    if std::env::var_os("THLS_BOOTSTRAP_FROM_LEGACY").is_none() {
+        bail!(
+            "database has THLS tables but no schema_migrations; set THLS_BOOTSTRAP_FROM_LEGACY=1 to bootstrap a legacy database"
+        );
+    }
     let rev = detect_legacy_revision(conn)?;
     ensure_schema_migrations_table(conn)?;
     for migration in MIGRATIONS.iter().filter(|m| m.revision <= rev) {
@@ -125,24 +206,28 @@ pub(super) fn apply_migrations(conn: &mut Connection, current: i64) -> Result<()
     use anyhow::Context;
     let mut applied = 0;
     for migration in MIGRATIONS.iter().filter(|m| m.revision > current) {
-        if migration.revision == 8 {
+        if matches!(migration.revision, 8 | 15 | 16) {
             conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
         }
-        let tx = conn.transaction()?;
-        (migration.run)(&tx).with_context(|| {
-            format!(
-                "running migration {} ({})",
-                migration.revision, migration.name
-            )
-        })?;
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations(revision, name) VALUES (?1, ?2)",
-            params![migration.revision, migration.name],
-        )?;
-        tx.commit()?;
-        if migration.revision == 8 {
+        let result = (|| -> Result<()> {
+            let tx = conn.transaction()?;
+            (migration.run)(&tx).with_context(|| {
+                format!(
+                    "running migration {} ({})",
+                    migration.revision, migration.name
+                )
+            })?;
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_migrations(revision, name) VALUES (?1, ?2)",
+                params![migration.revision, migration.name],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if matches!(migration.revision, 8 | 15 | 16) {
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         }
+        result?;
         tracing::info!(
             revision = migration.revision,
             name = migration.name,
@@ -208,7 +293,7 @@ fn add_column_if_missing(
 fn validate_table_name(table: &str) -> Result<&str> {
     match table {
         "jobs" | "tracks" | "segments" | "settings" | "bots" | "schema_migrations"
-        | "segment_parts" => Ok(table),
+        | "segment_parts" | "kv_internal" => Ok(table),
         _ => bail!("unknown sqlite table: {table}"),
     }
 }
@@ -254,7 +339,17 @@ fn validate_column_name(column: &str) -> Result<&str> {
         | "token"
         | "channel_id"
         | "label"
-        | "part_index" => Ok(column),
+        | "part_index"
+        | "is_split"
+        | "error"
+        | "source_path"
+        | "enabled"
+        | "source"
+        | "value_type"
+        | "bitrate_bps"
+        | "mode"
+        | "created_at_unix"
+        | "prefix" => Ok(column),
         _ => bail!("unknown sqlite column: {column}"),
     }
 }
@@ -323,6 +418,63 @@ fn detect_legacy_revision(conn: &Connection) -> Result<i64> {
     }
     if index_exists(conn, "idx_segments_bot_index")? {
         rev = 9;
+    } else {
+        return Ok(rev);
+    }
+    if table_exists(conn, "segment_parts")? {
+        rev = 10;
+    } else {
+        return Ok(rev);
+    }
+    if column_exists(conn, "segments", "is_split")? {
+        rev = 11;
+    } else {
+        return Ok(rev);
+    }
+    if index_exists(conn, "idx_jobs_media_created")?
+        && index_exists(conn, "idx_jobs_series_created")?
+    {
+        rev = 12;
+    } else {
+        return Ok(rev);
+    }
+    if column_exists(conn, "jobs", "error")? {
+        rev = 13;
+    } else {
+        return Ok(rev);
+    }
+    if column_exists(conn, "jobs", "source_path")? {
+        rev = 14;
+    } else {
+        return Ok(rev);
+    }
+    if table_sql_contains(conn, "jobs", "status IN")? {
+        rev = 15;
+    } else {
+        return Ok(rev);
+    }
+    if table_sql_contains(conn, "segments", "is_split IN")? {
+        rev = 16;
+    } else {
+        return Ok(rev);
+    }
+    if table_exists(conn, "kv_internal")?
+        && column_exists(conn, "bots", "enabled")?
+        && column_exists(conn, "bots", "source")?
+        && column_exists(conn, "settings", "value_type")?
+        && table_sql_contains(conn, "segment_parts", "part_index >= 0")?
+    {
+        rev = 17;
+    } else {
+        return Ok(rev);
+    }
+    if column_exists(conn, "tracks", "bitrate_bps")?
+        && column_exists(conn, "tracks", "mode")?
+        && column_exists(conn, "jobs", "created_at_unix")?
+        && column_exists(conn, "segments", "prefix")?
+        && column_exists(conn, "segments", "name")?
+    {
+        rev = 18;
     }
     Ok(rev)
 }
@@ -515,6 +667,101 @@ fn migration_10_add_segment_parts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_11_add_is_split_column(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "segments", "is_split", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute_batch("UPDATE segments SET is_split = 1 WHERE file_id = 'split';")?;
+    Ok(())
+}
+
+fn migration_12_add_job_listing_composite_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_media_created ON jobs(media_type, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_jobs_series_created ON jobs(series_name, created_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn migration_16_enforce_segments_is_split_check(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS segments_new;
+         CREATE TABLE segments_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            segment_key TEXT NOT NULL CHECK (segment_key GLOB '*/*'),
+            file_id TEXT NOT NULL,
+            bot_index INTEGER NOT NULL CHECK (bot_index >= 0),
+            file_size INTEGER DEFAULT 0,
+            duration REAL DEFAULT NULL,
+            is_split INTEGER NOT NULL DEFAULT 0 CHECK (is_split IN (0,1)),
+            UNIQUE (job_id, segment_key)
+         );
+         INSERT OR IGNORE INTO segments_new(id, job_id, segment_key, file_id, bot_index, file_size, duration, is_split)
+         SELECT id, job_id, segment_key, file_id, bot_index, file_size, duration, is_split FROM segments;
+         DROP TABLE segments;
+         ALTER TABLE segments_new RENAME TO segments;
+         CREATE INDEX IF NOT EXISTS idx_segments_job ON segments(job_id);
+         CREATE INDEX IF NOT EXISTS idx_segments_bot_index ON segments(bot_index);",
+    )?;
+    Ok(())
+}
+
+fn migration_13_add_jobs_error_column(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "jobs", "error", "TEXT")
+}
+
+fn migration_14_add_jobs_source_path_column(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "jobs", "source_path", "TEXT DEFAULT NULL")?;
+    migration_12_add_job_listing_composite_indexes(conn)
+}
+
+fn migration_15_enforce_jobs_constraints(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "UPDATE jobs SET status = 'complete'
+           WHERE status IS NULL
+              OR status NOT IN ('queued','downloading','analyzing','processing','uploading','complete','error','cancelled');
+         UPDATE jobs SET error = NULL WHERE status != 'error';
+         UPDATE jobs SET error = 'unknown error' WHERE status = 'error' AND error IS NULL;
+         UPDATE jobs SET source_path = NULL
+           WHERE source_path IS NOT NULL
+             AND (source_path GLOB '*[/\\\\]*' OR source_path LIKE '%..%');",
+    )?;
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS jobs_new;
+         CREATE TABLE jobs_new (
+            job_id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            duration REAL DEFAULT 0,
+            file_size INTEGER DEFAULT 0,
+            video_codec TEXT NOT NULL DEFAULT 'unknown',
+            video_width INTEGER DEFAULT 0,
+            video_height INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'complete' CHECK (status IN ('queued','downloading','analyzing','processing','uploading','complete','error','cancelled')),
+            error TEXT DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            media_type TEXT NOT NULL DEFAULT 'Film' CHECK (media_type IN ('Film','Series','Anime Film','Anime TV','Anime')),
+            series_name TEXT DEFAULT '',
+            has_thumbnail INTEGER NOT NULL DEFAULT 0 CHECK (has_thumbnail IN (0,1)),
+            is_series INTEGER NOT NULL DEFAULT 0 CHECK (is_series IN (0,1)),
+            season_number INTEGER DEFAULT NULL,
+            episode_number INTEGER DEFAULT NULL,
+            part_number INTEGER DEFAULT NULL,
+            source_path TEXT DEFAULT NULL CHECK (source_path IS NULL OR (source_path NOT GLOB '*[/\\\\]*' AND source_path NOT LIKE '%..%')),
+            CHECK (is_series = 1 OR (season_number IS NULL AND episode_number IS NULL AND part_number IS NULL)),
+            CHECK ((status='error') = (error IS NOT NULL))
+         );
+         INSERT INTO jobs_new(job_id, filename, duration, file_size, video_codec, video_width, video_height, status, error, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number, source_path)
+         SELECT job_id, filename, duration, file_size, video_codec, video_width, video_height, status, error, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number, source_path FROM jobs;
+         DROP TABLE jobs;
+         ALTER TABLE jobs_new RENAME TO jobs;
+         CREATE INDEX IF NOT EXISTS idx_jobs_series ON jobs(series_name);
+         CREATE INDEX IF NOT EXISTS idx_jobs_media_type ON jobs(media_type);
+         CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_jobs_media_created ON jobs(media_type, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_jobs_series_created ON jobs(series_name, created_at DESC);",
+    )?;
+    Ok(())
+}
+
 fn rebuild_jobs_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DROP TABLE IF EXISTS jobs_new;
@@ -600,12 +847,407 @@ fn rebuild_bots_table(conn: &Connection) -> Result<()> {
             token TEXT NOT NULL UNIQUE,
             channel_id INTEGER NOT NULL CHECK (channel_id < 0),
             label TEXT DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+            source TEXT NOT NULL DEFAULT 'db' CHECK (source IN ('env','db')),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
          );
-         INSERT OR IGNORE INTO bots_new(id, token, channel_id, label, created_at)
-         SELECT id, token, channel_id, label, created_at FROM bots WHERE channel_id < 0 AND token != '';
-         DROP TABLE bots;
-         ALTER TABLE bots_new RENAME TO bots;",
+          INSERT OR IGNORE INTO bots_new(id, token, channel_id, label, enabled, source, created_at)
+          SELECT id, token, channel_id, label, 1, 'db', created_at FROM bots WHERE channel_id < 0 AND token != '';
+          DROP TABLE bots;
+          ALTER TABLE bots_new RENAME TO bots;",
     )?;
     Ok(())
+}
+
+fn migration_17_add_data_model_metadata_tables(conn: &Connection) -> Result<()> {
+    use crate::settings_registry::{setting_type_name, SETTINGS};
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS kv_internal (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+         );
+         INSERT OR IGNORE INTO kv_internal(key, value)
+         SELECT key, value FROM settings WHERE key = '_last_bot_index';
+         DELETE FROM settings WHERE key LIKE '\\_%' ESCAPE '\\';",
+    )?;
+
+    if !column_exists(conn, "settings", "value_type")? {
+        conn.execute_batch(
+            "ALTER TABLE settings ADD COLUMN value_type TEXT NOT NULL DEFAULT 'str'
+             CHECK (value_type IN ('int','bool','str','list','tiers'));",
+        )?;
+    }
+    for spec in SETTINGS {
+        conn.execute(
+            "UPDATE settings SET value_type = ?2 WHERE key = ?1",
+            params![spec.key, setting_type_name(spec.setting_type)],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO kv_internal(key, value) VALUES ('settings_schema_version', '1')
+         ON CONFLICT(key) DO UPDATE SET value='1', updated_at=CURRENT_TIMESTAMP",
+        [],
+    )?;
+
+    add_column_if_missing(
+        conn,
+        "bots",
+        "enabled",
+        "INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1))",
+    )?;
+    add_column_if_missing(
+        conn,
+        "bots",
+        "source",
+        "TEXT NOT NULL DEFAULT 'db' CHECK (source IN ('env','db'))",
+    )?;
+    conn.execute_batch(
+        "UPDATE bots SET enabled = CASE WHEN enabled = 0 THEN 0 ELSE 1 END;
+         UPDATE bots SET source = 'db' WHERE source NOT IN ('env','db');",
+    )?;
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS segment_parts_new;
+         CREATE TABLE segment_parts_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            segment_key TEXT NOT NULL CHECK (segment_key GLOB '*/*'),
+            part_index INTEGER NOT NULL CHECK (part_index >= 0),
+            file_id TEXT NOT NULL,
+            bot_index INTEGER NOT NULL CHECK (bot_index >= 0),
+            file_size INTEGER NOT NULL CHECK (file_size >= 0),
+            UNIQUE (job_id, segment_key, part_index)
+         );
+         INSERT OR IGNORE INTO segment_parts_new(id, job_id, segment_key, part_index, file_id, bot_index, file_size)
+         SELECT id, job_id, segment_key, part_index, file_id, bot_index, file_size
+           FROM segment_parts
+          WHERE instr(segment_key, '/') > 0 AND part_index >= 0 AND bot_index >= 0 AND file_size >= 0;
+         DROP TABLE segment_parts;
+         ALTER TABLE segment_parts_new RENAME TO segment_parts;
+         CREATE INDEX IF NOT EXISTS idx_segment_parts_segment ON segment_parts(job_id, segment_key);",
+    )?;
+    Ok(())
+}
+
+fn migration_18_add_normalized_media_columns(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "tracks",
+        "mode",
+        "TEXT NOT NULL DEFAULT 'encode' CHECK (mode IN ('encode','copy'))",
+    )?;
+    add_column_if_missing(
+        conn,
+        "tracks",
+        "bitrate_bps",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (bitrate_bps >= 0)",
+    )?;
+    let mut tracks = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, bitrate FROM tracks")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            tracks.push(row?);
+        }
+    }
+    for (id, bitrate) in tracks {
+        let (mode, bps) = track_mode_and_bps(&bitrate);
+        conn.execute(
+            "UPDATE tracks SET mode = ?2, bitrate_bps = ?3 WHERE id = ?1",
+            params![id, mode, bps],
+        )?;
+    }
+
+    add_column_if_missing(conn, "jobs", "created_at_unix", "INTEGER")?;
+    conn.execute_batch(
+        "UPDATE jobs
+            SET created_at_unix = COALESCE(
+                created_at_unix,
+                unixepoch(created_at),
+                unixepoch(replace(created_at, 'T', ' ')),
+                unixepoch()
+            );
+         CREATE INDEX IF NOT EXISTS idx_jobs_created_at_unix ON jobs(created_at_unix DESC);",
+    )?;
+
+    add_column_if_missing(conn, "segments", "prefix", "TEXT")?;
+    add_column_if_missing(conn, "segments", "name", "TEXT")?;
+    add_column_if_missing(conn, "segment_parts", "prefix", "TEXT")?;
+    add_column_if_missing(conn, "segment_parts", "name", "TEXT")?;
+    backfill_segment_key_parts(conn, "segments")?;
+    backfill_segment_key_parts(conn, "segment_parts")?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_job_prefix_name
+            ON segments(job_id, prefix, name);
+         CREATE INDEX IF NOT EXISTS idx_segments_job_prefix
+            ON segments(job_id, prefix);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_segment_parts_job_prefix_name_part
+            ON segment_parts(job_id, prefix, name, part_index);
+         CREATE INDEX IF NOT EXISTS idx_segment_parts_job_prefix
+            ON segment_parts(job_id, prefix);",
+    )?;
+    Ok(())
+}
+
+fn backfill_segment_key_parts(conn: &Connection, table: &str) -> Result<()> {
+    let table = validate_table_name(table)?;
+    conn.execute_batch(&format!(
+        "UPDATE {table}
+            SET prefix = substr(segment_key, 1, instr(segment_key, '/') - 1),
+                name = substr(segment_key, instr(segment_key, '/') + 1)
+          WHERE prefix IS NULL OR name IS NULL;"
+    ))?;
+    Ok(())
+}
+
+pub(crate) fn track_mode_and_bps(bitrate: &str) -> (&'static str, i64) {
+    let value = bitrate.trim();
+    if value.eq_ignore_ascii_case("copy") {
+        return ("copy", 0);
+    }
+    ("encode", parse_bitrate_bps(value).unwrap_or(0))
+}
+
+fn parse_bitrate_bps(value: &str) -> Option<i64> {
+    let lower = value.trim().to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(raw) = lower.strip_suffix("kbps") {
+        (raw, 1_000)
+    } else if let Some(raw) = lower.strip_suffix('k') {
+        (raw, 1_000)
+    } else if let Some(raw) = lower.strip_suffix("mbps") {
+        (raw, 1_000_000)
+    } else if let Some(raw) = lower.strip_suffix('m') {
+        (raw, 1_000_000)
+    } else if let Some(raw) = lower.strip_suffix("gbps") {
+        (raw, 1_000_000_000)
+    } else if let Some(raw) = lower.strip_suffix('g') {
+        (raw, 1_000_000_000)
+    } else if let Some(raw) = lower.strip_suffix("bps") {
+        (raw, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    digits.trim().parse::<i64>().ok()?.checked_mul(multiplier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_migration_11_add_is_split() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        run_migration_1(&conn).unwrap();
+        run_migration_2(&conn).unwrap();
+        run_migration_3(&conn).unwrap();
+        run_migration_4(&conn).unwrap();
+        run_migration_5(&conn).unwrap();
+        run_migration_6(&conn).unwrap();
+        run_migration_7(&conn).unwrap();
+        run_migration_8(&conn).unwrap();
+        run_migration_9(&conn).unwrap();
+        run_migration_10(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO jobs (job_id, filename) VALUES (?1, ?2)",
+            rusqlite::params!["job1", "test.mkv"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (job_id, filename) VALUES (?1, ?2)",
+            rusqlite::params!["job2", "test2.mkv"],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO segments (job_id, segment_key, file_id, bot_index, file_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["job1", "seg/1", "split", 0, 0],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO segments (job_id, segment_key, file_id, bot_index, file_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["job1", "seg/2", "normal.ts", 0, 100],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO segments (job_id, segment_key, file_id, bot_index, file_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["job2", "seg/3", "video.ts", 1, 200],
+        ).unwrap();
+
+        run_migration_11(&conn).unwrap();
+
+        assert!(crate::db::migrations::column_exists(&conn, "segments", "is_split").unwrap());
+
+        let split_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE is_split = 1 AND file_id = 'split'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(split_count, 1);
+
+        let normal_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE is_split = 0 AND file_id != 'split'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(normal_count, 2);
+
+        let mismatch: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE is_split = 1 AND file_id != 'split'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mismatch, 0);
+    }
+
+    #[test]
+    fn test_migration_12_adds_composite_listing_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        run_migration_1(&conn).unwrap();
+        run_migration_2(&conn).unwrap();
+        run_migration_3(&conn).unwrap();
+        run_migration_4(&conn).unwrap();
+        run_migration_5(&conn).unwrap();
+        run_migration_6(&conn).unwrap();
+        run_migration_7(&conn).unwrap();
+        run_migration_8(&conn).unwrap();
+        run_migration_9(&conn).unwrap();
+        run_migration_10(&conn).unwrap();
+        run_migration_11(&conn).unwrap();
+
+        run_migration_12(&conn).unwrap();
+
+        assert!(index_exists(&conn, "idx_jobs_media_created").unwrap());
+        assert!(index_exists(&conn, "idx_jobs_series_created").unwrap());
+    }
+
+    #[test]
+    fn test_migration_15_enforce_jobs_constraints() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migration_1(&conn).unwrap();
+        run_migration_2(&conn).unwrap();
+        run_migration_3(&conn).unwrap();
+        run_migration_4(&conn).unwrap();
+        run_migration_5(&conn).unwrap();
+        run_migration_6(&conn).unwrap();
+        run_migration_7(&conn).unwrap();
+        run_migration_8(&conn).unwrap();
+        run_migration_9(&conn).unwrap();
+        run_migration_10(&conn).unwrap();
+        run_migration_11(&conn).unwrap();
+        run_migration_12(&conn).unwrap();
+        run_migration_13(&conn).unwrap();
+        run_migration_14(&conn).unwrap();
+
+        // Seed a valid job
+        conn.execute(
+            "INSERT INTO jobs(job_id, filename, status) VALUES ('j1', 'f.mkv', 'complete')",
+            [],
+        )
+        .unwrap();
+
+        run_migration_15(&conn).unwrap();
+
+        // Verify CHECK rejects invalid status
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs(job_id, filename, status) VALUES ('j2', 'f2.mkv', 'bogus')",
+                [],
+            )
+            .is_err());
+
+        // Verify CHECK rejects status='error' with NULL error
+        assert!(conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, error) VALUES ('j3', 'f3.mkv', 'error', NULL)",
+            [],
+        ).is_err());
+
+        // Verify CHECK rejects status='complete' with non-NULL error
+        assert!(conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, error) VALUES ('j4', 'f4.mkv', 'complete', 'oops')",
+            [],
+        ).is_err());
+
+        // Verify CHECK rejects source_path with /
+        assert!(conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, source_path) VALUES ('j5', 'f5.mkv', 'complete', 'dir/file.mkv')",
+            [],
+        ).is_err());
+
+        // Verify CHECK rejects source_path with ..
+        assert!(conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, source_path) VALUES ('j6', 'f6.mkv', 'complete', '../escape.mkv')",
+            [],
+        ).is_err());
+
+        // Verify valid inserts succeed
+        conn.execute(
+            "INSERT INTO jobs(job_id, filename, status) VALUES ('j7', 'f7.mkv', 'processing')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, error) VALUES ('j8', 'f8.mkv', 'error', 'failed')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO jobs(job_id, filename, status, source_path) VALUES ('j9', 'f9.mkv', 'complete', 'movie.mkv')",
+            [],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_migration_16_enforce_segments_is_split_check() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migration_1(&conn).unwrap();
+        run_migration_2(&conn).unwrap();
+        run_migration_3(&conn).unwrap();
+        run_migration_4(&conn).unwrap();
+        run_migration_5(&conn).unwrap();
+        run_migration_6(&conn).unwrap();
+        run_migration_7(&conn).unwrap();
+        run_migration_8(&conn).unwrap();
+        run_migration_9(&conn).unwrap();
+        run_migration_10(&conn).unwrap();
+        run_migration_11(&conn).unwrap();
+        run_migration_12(&conn).unwrap();
+        run_migration_13(&conn).unwrap();
+        run_migration_14(&conn).unwrap();
+        run_migration_15(&conn).unwrap();
+
+        // Seed a job + valid segment with is_split=0
+        conn.execute(
+            "INSERT INTO jobs(job_id, filename, status) VALUES ('j1', 'f.mkv', 'complete')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, is_split) VALUES ('j1', 'vid/seg.m4s', 'fid', 1, 0)",
+            [],
+        ).unwrap();
+
+        run_migration_16(&conn).unwrap();
+
+        // is_split=0 ok, is_split=1 ok, is_split=2 fails
+        conn.execute(
+            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, is_split) VALUES ('j1', 'vid/s2.m4s', 'fid2', 1, 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, is_split) VALUES ('j1', 'vid/s3.m4s', 'fid3', 1, 1)",
+            [],
+        ).unwrap();
+        assert!(conn.execute(
+            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, is_split) VALUES ('j1', 'vid/s4.m4s', 'fid4', 1, 2)",
+            [],
+        ).is_err());
+    }
 }

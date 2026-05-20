@@ -513,7 +513,10 @@ function pollStatus(jobId) {
                 let label;
                 if (data.status === 'queued') {
                     const pos = data.queue_position;
-                    label = pos != null ? `Queued... (position ${pos})` : 'Queued for processing...';
+                    const depth = data.queue_depth;
+                    label = pos != null && depth != null
+                        ? `Queued... (position ${pos} of ${depth})`
+                        : pos != null ? `Queued... (position ${pos})` : 'Queued for processing...';
                 } else if (data.status === 'analyzing') { label = data.description || 'Analyzing video streams...'; }
                 else if (data.status === 'processing') { label = data.description || 'Processing video, audio, subtitles, and thumbnail...'; }
                 else if (data.status === 'uploading') {

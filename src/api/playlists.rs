@@ -4,7 +4,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use super::{api_error, valid_job_id, AppState};
+use super::{api_error, db_unavailable, valid_job_id, AppState};
 use crate::config::Config;
 use crate::db::{self, JobRow, SegmentRow, TrackRow};
 use crate::media;
@@ -19,17 +19,28 @@ pub(super) async fn handle_master(
         return api_error(StatusCode::BAD_REQUEST, "invalid_job_id", "invalid job id");
     }
     let cfg = state.config.read().await.clone();
-    let conn = state.db.lock().await;
-    let job = match db::get_job(&conn, &job_id) {
-        Ok(Some(job)) => job,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    let job_id_for_db = job_id.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(JobRow, Vec<TrackRow>)> {
+        let job =
+            db::get_job(&conn, &job_id_for_db)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
+        let tracks = db::get_job_tracks(&conn, &job_id_for_db, None)?;
+        Ok((job, tracks))
+    })
+    .await;
+    let (job, tracks) = match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) if e.to_string() == "job not found" => {
+            return api_error(StatusCode::NOT_FOUND, "not_found", "job not found")
+        }
+        Ok(Err(e)) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+        }
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
     };
-    let tracks = match db::get_job_tracks(&conn, &job_id, None) {
-        Ok(t) => t,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-    };
-    drop(conn);
 
     let body = build_master_playlist(&cfg, &job, &tracks);
     playlist_response(body)
@@ -43,17 +54,29 @@ pub(super) async fn handle_legacy_video(
         return api_error(StatusCode::BAD_REQUEST, "invalid_job_id", "invalid job id");
     }
     let cfg = state.config.read().await.clone();
-    let conn = state.db.lock().await;
-    let job = match db::get_job(&conn, &job_id) {
-        Ok(Some(j)) => j,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    let job_id_for_db = job_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(JobRow, Vec<SegmentRow>)> {
+            let job = db::get_job(&conn, &job_id_for_db)?
+                .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+            let segs = db::get_segments_for_prefix(&conn, &job_id_for_db, "video_0")?;
+            Ok((job, segs))
+        })
+        .await;
+    let (job, segs) = match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) if e.to_string() == "job not found" => {
+            return api_error(StatusCode::NOT_FOUND, "not_found", "job not found")
+        }
+        Ok(Err(e)) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+        }
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
     };
-    let segs = match db::get_segments_for_prefix(&conn, &job_id, "video_0") {
-        Ok(s) => s,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-    };
-    drop(conn);
     if segs.is_empty() {
         return api_error(StatusCode::NOT_FOUND, "not_found", "no video segments");
     }
@@ -98,17 +121,29 @@ pub(super) async fn handle_media_playlist(
         return api_error(StatusCode::NOT_FOUND, "not_found", "unknown playlist");
     };
 
-    let conn = state.db.lock().await;
-    let job = match db::get_job(&conn, &job_id) {
-        Ok(Some(j)) => j,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    let job_id_for_db = job_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(JobRow, Vec<SegmentRow>)> {
+            let job = db::get_job(&conn, &job_id_for_db)?
+                .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+            let segs = db::get_segments_for_prefix(&conn, &job_id_for_db, &prefix)?;
+            Ok((job, segs))
+        })
+        .await;
+    let (job, segs) = match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) if e.to_string() == "job not found" => {
+            return api_error(StatusCode::NOT_FOUND, "not_found", "job not found")
+        }
+        Ok(Err(e)) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+        }
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
     };
-    let segs = match db::get_segments_for_prefix(&conn, &job_id, &prefix) {
-        Ok(s) => s,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-    };
-    drop(conn);
     if segs.is_empty() {
         return api_error(StatusCode::NOT_FOUND, "not_found", "no segments");
     }
@@ -140,17 +175,29 @@ async fn handle_virtual_playlist(
             "virtual tier not configured",
         );
     }
-    let conn = state.db.lock().await;
-    let job = match db::get_job(&conn, job_id) {
-        Ok(Some(j)) => j,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "job not found"),
+    let conn = match state.db_conn().await {
+        Ok(conn) => conn,
+        Err(e) => return db_unavailable(e),
+    };
+    let job_id_for_db = job_id.to_string();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(JobRow, Vec<SegmentRow>)> {
+            let job = db::get_job(&conn, &job_id_for_db)?
+                .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+            let segs = db::get_segments_for_prefix(&conn, &job_id_for_db, "video_0")?;
+            Ok((job, segs))
+        })
+        .await;
+    let (job, segs) = match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) if e.to_string() == "job not found" => {
+            return api_error(StatusCode::NOT_FOUND, "not_found", "job not found")
+        }
+        Ok(Err(e)) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+        }
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
     };
-    let segs = match db::get_segments_for_prefix(&conn, job_id, "video_0") {
-        Ok(s) => s,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-    };
-    drop(conn);
     if segs.is_empty() {
         return api_error(StatusCode::NOT_FOUND, "not_found", "no source segments");
     }
@@ -550,6 +597,8 @@ mod tests {
             season_number: None,
             episode_number: None,
             part_number: None,
+            error: None,
+            source_path: None,
         }
     }
 
@@ -579,6 +628,7 @@ mod tests {
             bot_index: 0,
             file_size: 1000,
             duration,
+            is_split: false,
         }
     }
 
