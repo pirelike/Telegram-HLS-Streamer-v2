@@ -24,11 +24,15 @@ pub(crate) struct PendingUpload {
     pub(super) chunk_size: u64,
     pub(super) path: PathBuf,
     pub(super) received_chunks: HashSet<u32>,
+    /// Chunks currently being written; prevents duplicate concurrent writes.
+    pub(super) in_flight: HashSet<u32>,
     pub(super) received_bytes: u64,
     pub(super) ip: std::net::IpAddr,
     #[allow(dead_code)]
     pub(super) created_at: Instant,
     pub(super) last_activity: Instant,
+    /// Set to true when finalize is in progress; prevents duplicate finalize enqueues.
+    pub(super) finalizing: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,10 +176,12 @@ pub(super) async fn handle_upload_init(
         chunk_size: cfg.upload_chunk_size,
         path,
         received_chunks: HashSet::new(),
+        in_flight: HashSet::new(),
         received_bytes: 0,
         ip,
         created_at: Instant::now(),
         last_activity: Instant::now(),
+        finalizing: false,
     };
     state
         .pending_uploads
@@ -255,7 +261,9 @@ pub(super) async fn handle_upload_chunk(
             );
         }
         upload.last_activity = Instant::now();
-        if upload.received_chunks.contains(&chunk_index) {
+        // Return early if already received or currently being written by a concurrent request.
+        // Both checks are under the same mutex, so only one writer can proceed per chunk.
+        if upload.received_chunks.contains(&chunk_index) || upload.in_flight.contains(&chunk_index) {
             return Json(json!({
                 "chunk_index": chunk_index,
                 "received_bytes": upload.received_bytes,
@@ -264,6 +272,7 @@ pub(super) async fn handle_upload_chunk(
             }))
             .into_response();
         }
+        upload.in_flight.insert(chunk_index);
         (
             upload.path.clone(),
             upload.chunk_size,
@@ -279,12 +288,24 @@ pub(super) async fn handle_upload_chunk(
         .await
     {
         Ok(file) => file,
-        Err(e) => return upload_io_error("chunk_write_failed", e),
+        Err(e) => {
+            // Clear in_flight so the client can retry this chunk.
+            if let Some(upload) = state.pending_uploads.lock().await.get_mut(&upload_id) {
+                upload.in_flight.remove(&chunk_index);
+            }
+            return upload_io_error("chunk_write_failed", e);
+        }
     };
     if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
+        if let Some(upload) = state.pending_uploads.lock().await.get_mut(&upload_id) {
+            upload.in_flight.remove(&chunk_index);
+        }
         return upload_io_error("chunk_write_failed", e);
     }
     if let Err(e) = file.write_all(&body).await {
+        if let Some(upload) = state.pending_uploads.lock().await.get_mut(&upload_id) {
+            upload.in_flight.remove(&chunk_index);
+        }
         return upload_io_error("chunk_write_failed", e);
     }
 
@@ -296,6 +317,7 @@ pub(super) async fn handle_upload_chunk(
         return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
     }
 
+    upload.in_flight.remove(&chunk_index);
     let is_retry = upload.received_chunks.contains(&chunk_index);
     if !is_retry {
         upload.received_chunks.insert(chunk_index);
@@ -341,12 +363,19 @@ pub(super) async fn handle_upload_finalize(
     }
 
     let upload = {
-        let pending = state.pending_uploads.lock().await;
-        let Some(upload) = pending.get(&body.upload_id) else {
+        let mut pending = state.pending_uploads.lock().await;
+        let Some(upload) = pending.get_mut(&body.upload_id) else {
             return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
         };
         if upload.ip != ip {
             return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
+        }
+        if upload.finalizing {
+            return api_error(
+                StatusCode::CONFLICT,
+                "already_finalizing",
+                "finalize already in progress for this upload",
+            );
         }
         if upload.received_chunks.len() != upload.total_chunks as usize
             || upload.received_bytes != upload.total_size
@@ -357,6 +386,9 @@ pub(super) async fn handle_upload_finalize(
                 "upload is incomplete",
             );
         }
+        // Mark as finalizing before releasing the lock so a concurrent finalize request
+        // sees it and returns 409 instead of enqueuing a duplicate job.
+        upload.finalizing = true;
         (
             upload.upload_id.clone(),
             upload.filename.clone(),
@@ -391,11 +423,15 @@ pub(super) async fn handle_upload_finalize(
     {
         Ok(job_id) => job_id,
         Err(_) => {
+            // Reset finalizing so the client can retry.
+            if let Some(u) = state.pending_uploads.lock().await.get_mut(&upload.0) {
+                u.finalizing = false;
+            }
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "queue_full",
                 "job queue is unavailable",
-            )
+            );
         }
     };
 

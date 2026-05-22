@@ -229,8 +229,14 @@ pub(super) async fn handle_database_load(
             "database field is required",
         );
     };
-    let source =
-        std::env::temp_dir().join(format!("thls_database_load_{}.db", uuid::Uuid::new_v4()));
+    // Stage the replacement file next to the active DB so the final rename is
+    // intra-filesystem and atomic; staging under temp_dir() can be on a different
+    // mount and cause cross-device rename failure after the active DB is moved aside.
+    let source = state
+        .db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!(".thls_db_load_{}.tmp", uuid::Uuid::new_v4()));
     if let Err(e) = tokio::fs::write(&source, bytes).await {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -393,6 +399,16 @@ async fn replace_live_database(
         let conn = db::init_db(&source)?;
         conn.close().map_err(|(_, e)| anyhow::anyhow!(e))?;
     }
+    // Block live DB replacement while any non-terminal job exists. A job that finishes
+    // after the swap would write stale state into the newly loaded database.
+    {
+        let jobs = state.jobs.lock().await;
+        if jobs.values().any(|j| !j.status.is_terminal()) {
+            anyhow::bail!(
+                "cannot replace database while jobs are active; wait for all jobs to finish"
+            );
+        }
+    }
     let old_pool = {
         let guard = state.db.read().await;
         guard.clone()
@@ -406,15 +422,16 @@ async fn replace_live_database(
         }
     }
     wait_for_pool_drain(&guard).await?;
-    let old_pool = std::mem::replace(&mut *guard, db::init_db_pool_lazy(&state.db_path));
-    drop(old_pool);
+    // Rename the file first, then install the new pool. This closes the gap where the pool
+    // could be pointing at a path that no longer exists (causing 500s on any DB request).
     let result = db::replace_database_file(&state.db_path, &source)?;
     let new_pool = db::init_db_pool(&state.db_path)?;
     let new_conn = new_pool.get()?;
     let cfg = Config::load(&new_conn)?;
     drop(new_conn);
-    *guard = new_pool;
+    let old_pool = std::mem::replace(&mut *guard, new_pool);
     drop(guard);
+    drop(old_pool);
     *state.config.write().await = Arc::new(cfg);
     Ok(result)
 }

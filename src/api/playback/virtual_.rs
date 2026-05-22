@@ -107,9 +107,31 @@ async fn virtual_fetch_into_cache(
         "virtual abr segment requested"
     );
 
+    // Look up source dims so the scale filter preserves the real aspect ratio.
+    let (source_width, source_height) = {
+        let conn = state
+            .db_conn()
+            .await
+            .context("db connection for source dims")?;
+        let job_id_for_db = job_id.to_string();
+        tokio::task::spawn_blocking(move || db::get_job(&conn, &job_id_for_db))
+            .await??
+            .map(|j| (j.video_width, j.video_height))
+            .unwrap_or((0, 0))
+    };
+
     if filename == "init.mp4" {
-        let init_bytes =
-            build_virtual_init(state, cfg, encoder, job_id, target_height, &bitrate).await?;
+        let init_bytes = build_virtual_init(
+            state,
+            cfg,
+            encoder,
+            job_id,
+            target_height,
+            &bitrate,
+            source_width,
+            source_height,
+        )
+        .await?;
         let cache_key = format!("{job_id}/{key}");
         let entry = super::cache_entry_for_bytes(cfg, &cache_key, filename, init_bytes).await?;
         state
@@ -134,6 +156,8 @@ async fn virtual_fetch_into_cache(
         &source_bytes,
         target_height,
         &bitrate,
+        source_width,
+        source_height,
     )
     .await
     .with_context(|| format!("transcoding virtual {key}"))?;
@@ -159,6 +183,8 @@ async fn build_virtual_init(
     job_id: &str,
     target_height: u32,
     bitrate: &str,
+    source_width: i64,
+    source_height: i64,
 ) -> Result<Vec<u8>> {
     // Find first source media segment (lowest filename in video_0/, excluding init).
     let segs = {
@@ -185,6 +211,8 @@ async fn build_virtual_init(
         &media_source,
         target_height,
         bitrate,
+        source_width,
+        source_height,
     )
     .await?;
     let init_part = extract_init_from_fmp4(&transcoded)?;
@@ -289,6 +317,8 @@ async fn transcode_segment(
     media_bytes: &[u8],
     target_height: u32,
     bitrate: &str,
+    source_width: i64,
+    source_height: i64,
 ) -> Result<Vec<u8>> {
     let tmp_dir = std::env::temp_dir();
     let in_path = tmp_dir.join(format!(
@@ -312,6 +342,8 @@ async fn transcode_segment(
         &out_path,
         target_height,
         bitrate,
+        source_width,
+        source_height,
     )
     .await
     {
@@ -325,9 +357,18 @@ async fn transcode_segment(
                 "virtual abr hardware transcode failed; retrying with libx264"
             );
             let cpu = media::cpu_encoder();
-            transcode_segment_with_encoder(cfg, &cpu, &in_path, &out_path, target_height, bitrate)
-                .await
-                .context("cpu fallback for virtual transcode")
+            transcode_segment_with_encoder(
+                cfg,
+                &cpu,
+                &in_path,
+                &out_path,
+                target_height,
+                bitrate,
+                source_width,
+                source_height,
+            )
+            .await
+            .context("cpu fallback for virtual transcode")
         }
         Err(err) => Err(err),
     };
@@ -342,8 +383,16 @@ async fn transcode_segment_with_encoder(
     out_path: &std::path::Path,
     target_height: u32,
     bitrate: &str,
+    source_width: i64,
+    source_height: i64,
 ) -> Result<Vec<u8>> {
-    let scale = format!("scale='trunc({target_height}*16/9/2)*2':{target_height}");
+    let scaled_w = media::scaled_width(source_width, source_height, target_height as i64);
+    let scale = if scaled_w > 0 {
+        format!("scale={scaled_w}:{target_height}")
+    } else {
+        // Fallback for legacy jobs where source dims are zero
+        format!("scale='trunc({target_height}*16/9/2)*2':{target_height}")
+    };
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-nostdin").arg("-loglevel").arg("error").arg("-y");
     media::add_encoder_device_args(&mut cmd, encoder);

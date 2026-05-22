@@ -189,8 +189,20 @@ fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
 
 pub fn backup_database_file(conn: &Connection, active_path: &Path) -> Result<DatabaseBackupResult> {
     let schema_revision = current_schema_revision(conn)?;
-    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-        tracing::warn!(error = %e, "WAL checkpoint failed before backup");
+    // wal_checkpoint(TRUNCATE) returns one row: (busy, log, checkpointed).
+    // busy > 0 means readers hold the WAL; log > checkpointed means frames remain.
+    // Either case means the .db file alone is an incomplete snapshot — fail rather
+    // than silently produce a stale backup.
+    let (busy, log, checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .context("WAL checkpoint before backup")?;
+    if busy > 0 || checkpointed < log {
+        anyhow::bail!(
+            "WAL checkpoint incomplete (busy={busy}, checkpointed={checkpointed}/{log}); \
+             retry when no readers hold the WAL"
+        );
     }
     let backup_path = super::backup_path(active_path);
     if active_path.exists() {

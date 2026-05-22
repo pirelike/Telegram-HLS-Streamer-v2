@@ -313,32 +313,36 @@ async fn encode_video_tier(
                 file = %path.display(),
                 size,
                 max = cfg.telegram_max_file_size,
-                ".m4s segment exceeds Telegram limit; re-encoding at highest bitrate"
+                ".m4s segment exceeds Telegram limit; will be split at upload time"
             );
             oversized_m4s.push(path);
         }
     }
 
-    let m4s_repair_count = oversized_m4s.len();
+    // m4s repair is deferred to upload-time byte-splitting; no in-place re-encode is done.
+    // Report 0 repaired so callers have an honest count.
+    let m4s_repair_count = 0usize;
 
-    for path in oversized_m4s {
-        let duration = probe_duration(&path)
+    for path in &oversized_m4s {
+        let duration = probe_duration(path)
             .await
             .unwrap_or(cfg.hls_segment_duration as f64);
         let bps = max_bitrate_for_segment(cfg.telegram_max_file_size, duration);
         if repair_needs_split(bps) {
-            tracing::warn!(
-                segment = %path.display(),
-                bitrate_bps = bps,
-                "segment bitrate floor too low; leaving original for upload-time splitting"
-            );
-        } else {
-            tracing::warn!(
-                segment = %path.display(),
-                bitrate_bps = bps,
-                "oversized fMP4 segment left for upload-time splitting to preserve playlist init map"
+            // Upload-time splitting also cannot help here — the segment duration is too long
+            // to fit within the Telegram limit at any sane bitrate. Fail loudly.
+            anyhow::bail!(
+                "oversized .m4s segment {} cannot be split at upload time (required bitrate {}bps too low); \
+                 lower source bitrate or reduce hls_segment_duration",
+                path.display(),
+                bps
             );
         }
+        tracing::warn!(
+            segment = %path.display(),
+            bitrate_bps = bps,
+            "oversized .m4s segment will be split at upload time"
+        );
     }
 
     let _ = tokio::fs::remove_dir_all(&ts_dir).await;

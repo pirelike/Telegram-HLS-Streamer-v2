@@ -128,7 +128,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/jobs/:job_id/reprocess", post(handle_reprocess_job))
         .route("/api/upload/init", post(handle_upload_init))
-        .route("/api/upload/chunk", post(handle_upload_chunk))
+        .route(
+            "/api/upload/chunk",
+            post(handle_upload_chunk).layer({
+                // Chunk bodies must not exceed upload_chunk_size + small header slop.
+                // This rejects oversized chunks before they are fully buffered in memory.
+                let chunk_limit = state
+                    .config
+                    .try_read()
+                    .map(|cfg| cfg.upload_chunk_size)
+                    .unwrap_or(10 * 1024 * 1024)
+                    + 16 * 1024;
+                DefaultBodyLimit::max(chunk_limit as usize)
+            }),
+        )
         .route("/api/upload/finalize", post(handle_upload_finalize))
         .route("/api/ingest/url", post(handle_url_ingest))
         .route("/api/upload/status/:upload_id", get(handle_upload_status))
@@ -149,8 +162,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/db/export", post(handle_db_export))
         .route("/api/db/backup", post(handle_db_backup))
-        .route("/api/db/import", post(handle_db_import))
-        .route("/api/database/load", post(handle_database_load))
+        // These routes enforce their own per-field size limits via read_field_bytes_limit /
+        // to_bytes, so the global body limit is disabled only for them.
+        .route(
+            "/api/db/import",
+            post(handle_db_import).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/database/load",
+            post(handle_database_load).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/metrics", get(handle_metrics))
         .route("/hls/:job_id/master.m3u8", get(playlists::handle_master))
         .route(
@@ -163,7 +184,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/segment/:job_id/*key", get(playback::handle_segment))
         .route("/thumbnail/:job_id", get(playlists::handle_thumbnail))
-        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
