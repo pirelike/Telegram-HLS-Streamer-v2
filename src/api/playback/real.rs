@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -10,10 +9,32 @@ use axum::response::{IntoResponse, Response};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::cache::{claim_inflight, finish_inflight, CacheEntry};
+use super::cache::{claim_inflight, finish_inflight, CacheEntry, Inflight};
 use super::{api_error, db_unavailable, AppState};
 use crate::config::Config;
 use crate::telegram;
+
+struct InflightGuard {
+    state: Arc<AppState>,
+    key: String,
+    inflight: Option<Arc<Inflight>>,
+    fired: bool,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if self.inflight.is_some() && !self.fired {
+            let state = self.state.clone();
+            let key = self.key.clone();
+            let inflight = self.inflight.take().unwrap();
+            let err =
+                Err::<CacheEntry, _>(anyhow::anyhow!("leader task panicked or was cancelled"));
+            tokio::spawn(async move {
+                finish_inflight(&state, &key, inflight, &err).await;
+            });
+        }
+    }
+}
 use crate::{db, media};
 
 pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: String) -> Response {
@@ -43,10 +64,10 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
         {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string());
             }
             Err(e) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string());
             }
         }
     };
@@ -71,13 +92,13 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
         {
             Ok(Ok(Some(s))) => (s.file_id, s.bot_index),
             Ok(Ok(None)) => {
-                return api_error(StatusCode::NOT_FOUND, "not_found", "segment not found")
+                return api_error(StatusCode::NOT_FOUND, "not_found", "segment not found");
             }
             Ok(Err(e)) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string());
             }
             Err(e) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string());
             }
         }
     };
@@ -189,6 +210,12 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
 
     tokio::spawn(async move {
         use tokio_stream::StreamExt as _;
+        let mut guard = InflightGuard {
+            state: state2.clone(),
+            key: cache_key_owned.clone(),
+            inflight: Some(inflight.clone()),
+            fired: false,
+        };
         let t0 = std::time::Instant::now();
         let mut all_bytes: Vec<u8> = Vec::new();
         let mut client_disconnected = false;
@@ -208,8 +235,15 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
                     if !client_disconnected {
                         let _ = tx.send(Err(std::io::Error::other(e))).await;
                     }
-                    state2.telegram.record_download_error(bot_index).await;
-                    finish_inflight(&state2, &cache_key_owned, inflight, &Err(err)).await;
+                    guard.state.telegram.record_download_error(bot_index).await;
+                    guard.fired = true;
+                    finish_inflight(
+                        &guard.state,
+                        &guard.key,
+                        guard.inflight.take().unwrap(),
+                        &Err(err),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -218,7 +252,7 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
         let nbytes = all_bytes.len() as u64;
         let entry = match super::cache_entry_for_bytes(
             &cfg_for_cache,
-            &cache_key_owned,
+            &guard.key,
             &response_key,
             all_bytes,
         )
@@ -226,26 +260,36 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
         {
             Ok(entry) => entry,
             Err(e) => {
+                guard.fired = true;
                 finish_inflight(
-                    &state2,
-                    &cache_key_owned,
-                    inflight,
+                    &guard.state,
+                    &guard.key,
+                    guard.inflight.take().unwrap(),
                     &Err::<CacheEntry, _>(e),
                 )
                 .await;
                 return;
             }
         };
-        state2
+        guard
+            .state
             .cache
-            .insert(cache_key_owned.clone(), entry.clone(), Some(cache_budget))
+            .insert(guard.key.clone(), entry.clone(), Some(cache_budget))
             .await;
-        state2
+        guard
+            .state
             .telegram
             .record_download_success(bot_index, nbytes, elapsed)
             .await;
-        finish_inflight(&state2, &cache_key_owned, inflight, &Ok(entry)).await;
-        mark_segment_played_and_cleanup(&state2, &job_id_for_cleanup, &response_key).await;
+        guard.fired = true;
+        finish_inflight(
+            &guard.state,
+            &guard.key,
+            guard.inflight.take().unwrap(),
+            &Ok(entry),
+        )
+        .await;
+        mark_segment_played_and_cleanup(&guard.state, &job_id_for_cleanup, &response_key).await;
     });
 
     spawn_prefetch_real(state, job_id, key);
@@ -872,10 +916,9 @@ pub(super) fn spawn_prefetch_real(state: Arc<AppState>, job_id: String, key: Str
 pub(crate) fn spawn_cache_warmup(state: Arc<AppState>, job_id: String) {
     tokio::spawn(async move {
         let cfg = state.config.read().await.clone();
-        if !cfg.cache_warmup_enabled || cfg.segment_prefetch_count == 0 {
+        if !cfg.cache_warmup_enabled {
             return;
         }
-        let per_track = cfg.segment_prefetch_count as usize;
         let segs = {
             let conn = match state.db_conn().await {
                 Ok(conn) => conn,
@@ -901,23 +944,12 @@ pub(crate) fn spawn_cache_warmup(state: Arc<AppState>, job_id: String) {
                 }
             }
         };
-        let mut by_prefix: BTreeMap<String, Vec<db::SegmentRow>> = BTreeMap::new();
-        for seg in segs {
-            let Some((prefix, _)) = seg.segment_key.split_once('/') else {
-                continue;
-            };
-            if !matches!(
-                prefix.split_once('_').map(|(kind, _)| kind),
-                Some("video" | "audio" | "subtitle")
-            ) {
-                continue;
+        for seg in select_cache_warmup_segments(&segs) {
+            if cfg.segment_prefetch_min_free_bytes > 0
+                && state.cache.free_bytes().await < cfg.segment_prefetch_min_free_bytes
+            {
+                return;
             }
-            by_prefix.entry(prefix.to_string()).or_default().push(seg);
-        }
-        for seg in by_prefix
-            .values()
-            .flat_map(|track| track.iter().take(per_track))
-        {
             let cache_key = format!("{job_id}/{}", seg.segment_key);
             if state.cache.get(&cache_key).await.is_some() {
                 continue;
@@ -966,4 +998,37 @@ pub(crate) fn spawn_cache_warmup(state: Arc<AppState>, job_id: String) {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     });
+}
+
+pub(super) fn select_cache_warmup_segments(segs: &[db::SegmentRow]) -> Vec<db::SegmentRow> {
+    let mut video: Vec<&db::SegmentRow> = segs
+        .iter()
+        .filter(|s| s.segment_key.starts_with("video_") && !s.segment_key.ends_with("/init.mp4"))
+        .collect();
+    let mut audio: Vec<&db::SegmentRow> = segs
+        .iter()
+        .filter(|s| s.segment_key.starts_with("audio_"))
+        .collect();
+    video.sort_by_key(|s| warmup_sort_key(&s.segment_key, "video_0"));
+    audio.sort_by_key(|s| warmup_sort_key(&s.segment_key, "audio_0"));
+
+    let mut selected = Vec::new();
+    if let Some(seg) = video.first() {
+        selected.push((*seg).clone());
+    }
+    if let Some(seg) = audio.first() {
+        selected.push((*seg).clone());
+    }
+    if let Some(seg) = segs
+        .iter()
+        .find(|s| s.segment_key == "thumbnail/thumbnail.jpg")
+    {
+        selected.push(seg.clone());
+    }
+    selected
+}
+
+fn warmup_sort_key<'a>(segment_key: &'a str, preferred_prefix: &str) -> (u8, &'a str) {
+    let prefix = segment_key.split_once('/').map(|(p, _)| p).unwrap_or("");
+    (u8::from(prefix != preferred_prefix), segment_key)
 }

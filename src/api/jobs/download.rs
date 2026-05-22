@@ -28,14 +28,26 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
         let job = db::get_job(&conn, &job_id_clone)?;
         let tracks = db::get_job_tracks(&conn, &job_id_clone, None)?;
         let segment_count = db::count_job_segments(&conn, &job_id_clone)?;
-        Ok::<(Option<db::JobRow>, Vec<db::TrackRow>, i64), anyhow::Error>((job, tracks, segment_count))
+        Ok::<(Option<db::JobRow>, Vec<db::TrackRow>, i64), anyhow::Error>((
+            job,
+            tracks,
+            segment_count,
+        ))
     })
     .await;
 
     let (job_opt, tracks, segment_count) = match db_result {
         Ok(Ok(val)) => val,
-        Ok(Err(e)) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "blocking_error", e.to_string()),
+        Ok(Err(e)) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
+        }
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "blocking_error",
+                e.to_string(),
+            )
+        }
     };
 
     let Some(job) = job_opt else {
@@ -72,10 +84,7 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
 pub(super) async fn complete_job(state: &AppState, job_id: &str) -> Result<db::JobRow, Response> {
     let conn = state.db_conn().await.map_err(db_unavailable)?;
     let job_id_clone = job_id.to_string();
-    let db_result = tokio::task::spawn_blocking(move || {
-        db::get_job(&conn, &job_id_clone)
-    })
-    .await;
+    let db_result = tokio::task::spawn_blocking(move || db::get_job(&conn, &job_id_clone)).await;
 
     match db_result {
         Ok(Ok(Some(job))) if job.status == "complete" => Ok(job),
@@ -112,10 +121,8 @@ pub(super) async fn reconstruct_job_source(
             .await
             .context("getting sqlite connection for reconstruction")?;
         let job_id_clone = job.job_id.clone();
-        tokio::task::spawn_blocking(move || {
-            db::get_segments_for_job(&conn, &job_id_clone)
-        })
-        .await??
+        tokio::task::spawn_blocking(move || db::get_segments_for_job(&conn, &job_id_clone))
+            .await??
     };
     let video_segments = prefix_segments(&segments, "video_0");
     if video_segments.is_empty() {
@@ -238,7 +245,10 @@ async fn reconstruct_downloads(
     state: &AppState,
     segments: &[db::SegmentRow],
 ) -> Result<Vec<ReconstructDownload>> {
-    let conn = state.db_conn().await.context("getting connection for reconstruct downloads")?;
+    let conn = state
+        .db_conn()
+        .await
+        .context("getting connection for reconstruct downloads")?;
     let segments_vec = segments.to_vec();
     tokio::task::spawn_blocking(move || {
         let mut downloads = Vec::new();
@@ -250,8 +260,9 @@ async fn reconstruct_downloads(
                         format!("getting parts for split segment {}", segment.segment_key)
                     })?;
                 for (part_index, part) in parts.into_iter().enumerate() {
-                    let expected_size = u64::try_from(part.file_size)
-                        .with_context(|| format!("invalid part size for {}", segment.segment_key))?;
+                    let expected_size = u64::try_from(part.file_size).with_context(|| {
+                        format!("invalid part size for {}", segment.segment_key)
+                    })?;
                     downloads.push(ReconstructDownload {
                         label: format!("{} part {part_index}", segment.segment_key),
                         file_id: part.file_id,
@@ -282,7 +293,6 @@ async fn reconstruct_downloads(
     })
     .await?
 }
-
 
 async fn stream_download_to_path_at(
     state: Arc<AppState>,

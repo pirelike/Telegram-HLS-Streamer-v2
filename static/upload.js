@@ -1,6 +1,7 @@
 // ─── Constants ────────────────────────────────────────────────────────────────
 let CHUNK_SIZE = 10 * 1024 * 1024;
 const MAX_RETRIES = 5;
+const UPLOAD_CONCURRENCY = 3;
 const ALLOWED_EXTENSIONS = new Set(['mp4', 'mkv', 'avi', 'mov', 'webm', 'ts', 'm4v', 'flv']);
 const PENDING_UPLOAD_KEY = 'hls_pending_upload';
 
@@ -9,6 +10,7 @@ let isCancelled = false;
 let currentJobId = null;
 let selectedCategory = 'Film';
 let pendingFiles = [];
+let currentUploadController = null;
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const uploadArea = document.getElementById('uploadArea');
@@ -361,6 +363,10 @@ function checkResume() {
 // ─── Cancel ───────────────────────────────────────────────────────────────────
 function cancelUpload() {
     isCancelled = true;
+    if (currentUploadController) {
+        currentUploadController.abort();
+        currentUploadController = null;
+    }
     clearPendingUpload();
     if (currentJobId) {
         fetch(`/api/cancel/${currentJobId}`, {method:'POST'}).catch(()=>{});
@@ -397,7 +403,8 @@ async function uploadSingleFile(file, metadata, dbFields) {
     speedText.textContent = '';
     currentJobId = null;
 
-    let uploadId = null, resumeFrom = 0, totalChunks = 0;
+    let uploadId = null, totalChunks = 0;
+    let receivedIndices = new Set();
     const pending = getPendingUpload();
     if (pending && pending.filename === file.name && pending.fileSize === file.size) {
         try {
@@ -406,9 +413,9 @@ async function uploadSingleFile(file, metadata, dbFields) {
                 const d = await s.json();
                 CHUNK_SIZE = Number(d.chunk_size || pending.chunkSize || CHUNK_SIZE);
                 totalChunks = Number(d.total_chunks || pending.totalChunks || 0);
-                resumeFrom = d.received_chunks || 0;
+                receivedIndices = receivedSetFromStatus(d, totalChunks, pending.nextChunk);
                 uploadId = pending.uploadId;
-                statusText.textContent = `Resuming "${file.name}" from chunk ${resumeFrom}/${totalChunks}...`;
+                statusText.textContent = `Resuming "${file.name}" (${receivedIndices.size}/${totalChunks} chunks already uploaded)...`;
             } else { clearPendingUpload(); }
         } catch { clearPendingUpload(); }
     }
@@ -425,30 +432,49 @@ async function uploadSingleFile(file, metadata, dbFields) {
         uploadId = init.upload_id;
         CHUNK_SIZE = Number(init.chunk_size);
         totalChunks = Number(init.total_chunks);
+        receivedIndices = new Set();
         addActivity(`Upload slot ready: ${totalChunks} chunks of ${formatBytes(CHUNK_SIZE)}`);
     }
 
-    let uploadedBytes = resumeFrom * CHUNK_SIZE;
+    currentUploadController = new AbortController();
+    const missingChunks = [];
+    for (let i = 0; i < totalChunks; i++) {
+        if (!receivedIndices.has(i)) missingChunks.push(i);
+    }
+
+    let uploadedSinceStart = 0;
     const startTime = Date.now();
-    for (let i = resumeFrom; i < totalChunks; i++) {
-        if (isCancelled) throw new Error('Upload cancelled.');
-        const start = i * CHUNK_SIZE, end = Math.min(start + CHUNK_SIZE, file.size);
-        await sendChunkWithRetry(uploadId, i, file.slice(start, end));
-        uploadedBytes = end;
-        savePendingUpload(uploadId, file.name, file.size, CHUNK_SIZE, totalChunks, i + 1);
-        const pct = Math.round(uploadedBytes / file.size * 100);
-        progressBar.style.width = pct + '%';
-        progressPct.textContent = pct + '%';
-        statusText.textContent = `Uploading ${file.name}... (${formatBytes(uploadedBytes)} / ${formatBytes(file.size)})`;
-        progressStep.textContent = `Chunk ${i+1} / ${totalChunks}`;
-        const elapsed = (Date.now() - startTime) / 1000;
-        if (elapsed > 0) {
-            const speed = (uploadedBytes - resumeFrom * CHUNK_SIZE) / elapsed;
-            speedText.textContent = `${formatBytes(speed)}/s — ~${formatTime((file.size - uploadedBytes) / speed)} remaining`;
+    let uploadedBytes = bytesForReceivedChunks(file.size, totalChunks, CHUNK_SIZE, receivedIndices);
+    updateUploadProgress(file, uploadedBytes, receivedIndices.size, totalChunks, startTime, uploadedSinceStart);
+    let nextWork = 0;
+    const workerCount = Math.min(UPLOAD_CONCURRENCY, missingChunks.length);
+    async function worker() {
+        while (nextWork < missingChunks.length) {
+            if (isCancelled) throw new Error('Upload cancelled.');
+            const i = missingChunks[nextWork++];
+            const start = i * CHUNK_SIZE, end = Math.min(start + CHUNK_SIZE, file.size);
+            await sendChunkWithRetry(uploadId, i, file.slice(start, end), currentUploadController.signal);
+            if (isCancelled) throw new Error('Upload cancelled.');
+            if (!receivedIndices.has(i)) {
+                receivedIndices.add(i);
+                const chunkBytes = end - start;
+                uploadedBytes += chunkBytes;
+                uploadedSinceStart += chunkBytes;
+            }
+            savePendingUpload(uploadId, file.name, file.size, CHUNK_SIZE, totalChunks, receivedIndices.size);
+            updateUploadProgress(file, uploadedBytes, receivedIndices.size, totalChunks, startTime, uploadedSinceStart);
+            if (receivedIndices.size === totalChunks || receivedIndices.size % 5 === 0) {
+                addActivity(`Uploaded ${receivedIndices.size} of ${totalChunks} chunks`);
+            }
         }
-        if ((i + 1) === totalChunks || (i + 1) % 5 === 0) {
-            addActivity(`Uploaded chunk ${i + 1} of ${totalChunks}`);
-        }
+    }
+    try {
+        await Promise.all(Array.from({length: workerCount}, () => worker()));
+    } catch (err) {
+        if (currentUploadController) currentUploadController.abort();
+        throw err;
+    } finally {
+        currentUploadController = null;
     }
 
     if (isCancelled) throw new Error('Upload cancelled.');
@@ -481,19 +507,51 @@ async function uploadSingleFile(file, metadata, dbFields) {
     return pollStatus(job_id);
 }
 
-async function sendChunkWithRetry(uploadId, chunkIndex, chunkBlob) {
+function receivedSetFromStatus(status, totalChunks, fallbackNextChunk) {
+    if (Array.isArray(status.received_indices)) {
+        return new Set(status.received_indices.map(Number).filter(i => Number.isInteger(i) && i >= 0 && i < totalChunks));
+    }
+    const contiguous = Number(status.received_chunks || fallbackNextChunk || 0);
+    return new Set(Array.from({length: Math.min(contiguous, totalChunks)}, (_, i) => i));
+}
+
+function bytesForReceivedChunks(fileSize, totalChunks, chunkSize, receivedIndices) {
+    let bytes = 0;
+    for (const i of receivedIndices) {
+        const start = i * chunkSize, end = Math.min(start + chunkSize, fileSize);
+        if (i >= 0 && i < totalChunks && end > start) bytes += end - start;
+    }
+    return bytes;
+}
+
+function updateUploadProgress(file, uploadedBytes, receivedCount, totalChunks, startTime, uploadedSinceStart) {
+    const pct = file.size > 0 ? Math.round(uploadedBytes / file.size * 100) : 100;
+    progressBar.style.width = pct + '%';
+    progressPct.textContent = pct + '%';
+    statusText.textContent = `Uploading ${file.name}... (${formatBytes(uploadedBytes)} / ${formatBytes(file.size)})`;
+    progressStep.textContent = `Chunks ${receivedCount} / ${totalChunks}`;
+    const elapsed = (Date.now() - startTime) / 1000;
+    if (elapsed > 0 && uploadedSinceStart > 0) {
+        const speed = uploadedSinceStart / elapsed;
+        speedText.textContent = `${formatBytes(speed)}/s — ~${formatTime((file.size - uploadedBytes) / speed)} remaining`;
+    }
+}
+
+async function sendChunkWithRetry(uploadId, chunkIndex, chunkBlob, signal) {
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        if (isCancelled) return;
+        if (isCancelled) throw new Error('Upload cancelled.');
         try {
             const resp = await fetch('/api/upload/chunk', {
                 method: 'POST',
                 headers: {'X-Upload-Id': uploadId, 'X-Chunk-Index': chunkIndex.toString(), 'Content-Type': 'application/octet-stream'},
                 body: chunkBlob,
+                signal,
             });
             if (resp.ok) return;
             const e = await resp.json();
             throw new Error(e.message || e.error || `HTTP ${resp.status}`);
         } catch (err) {
+            if (isCancelled || err.name === 'AbortError') throw new Error('Upload cancelled.');
             if (attempt < MAX_RETRIES - 1) {
                 const wait = Math.pow(2, attempt) * 1000;
                 speedText.textContent = `Chunk ${chunkIndex} failed, retrying in ${wait/1000}s... (${err.message})`;

@@ -78,7 +78,11 @@ pub(super) async fn handle_post_settings(
         }
     }
     if let Err(e) = write_settings_to_env(&state, &normalized).await {
-        tracing::warn!(error = %e, "failed to update .env file");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "env_write_failed",
+            format!("settings applied to database but not persisted to .env: {e}. Changes will be lost on restart."),
+        );
     }
     let mut new_cfg = state.config.read().await.as_ref().clone();
     config::apply_normalized_settings(&mut new_cfg, &normalized);

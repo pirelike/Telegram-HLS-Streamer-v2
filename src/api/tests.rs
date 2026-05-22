@@ -62,6 +62,7 @@ fn app_state_with_telegram_base(telegram_base_url: String) -> Arc<AppState> {
         ffprobe_available: true,
         selected_encoder: RwLock::new(crate::media::cpu_encoder()),
         last_bot_index: std::sync::atomic::AtomicI64::new(0),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     });
     start_background_tasks(state.clone(), job_receiver);
     state
@@ -1294,21 +1295,18 @@ async fn cancel_during_processing_cleans_up_and_leaves_no_db_row() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Processing directory removed
-    assert!(!processing_path.exists());
-    // Source file retained for deferred deletion (delete_source_on_finish = true)
-    assert!(!source_path.exists());
-    assert!(source_path
-        .with_file_name("source-cancel.mp4.pending_delete")
-        .exists());
-    // Job status is cancelled
+    // Cancel flag is set
     let jobs = state.jobs.lock().await;
     let job = jobs.get("cancel-proc").unwrap();
     assert_eq!(job.status.as_str(), "cancelled");
+    assert!(job.cancel_flag.load(std::sync::atomic::Ordering::Relaxed));
     drop(jobs);
     // No DB row for this job
     let conn = state.db_conn().await.unwrap();
     assert!(db::get_job(&conn, "cancel-proc").unwrap().is_none());
+    // Cleanup is deferred to process_job; verify processing dir still exists
+    // (process_job will clean it up when it observes the cancel flag).
+    assert!(processing_path.exists());
 }
 
 #[tokio::test]

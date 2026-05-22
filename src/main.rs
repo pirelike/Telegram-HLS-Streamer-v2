@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
     let addr = SocketAddr::new(cfg.host, cfg.port);
     let cache_budget = (cfg.segment_cache_size_mb as u64) * 1024 * 1024;
     let (job_queue, job_receiver) = mpsc::channel(100);
+    let shutdown_token = CancellationToken::new();
     let state = Arc::new(api::AppState {
         db: RwLock::new(db_pool),
         db_path,
@@ -96,6 +98,7 @@ async fn main() -> Result<()> {
         ffprobe_available,
         selected_encoder: RwLock::new(selected_encoder),
         last_bot_index: std::sync::atomic::AtomicI64::new(last_bot_index),
+        shutdown_token: shutdown_token.clone(),
     });
     api::start_background_tasks(state.clone(), job_receiver);
     cloudflared::start_manager(state.clone());
@@ -103,19 +106,65 @@ async fn main() -> Result<()> {
     crate::api::jobs::processing::recover_stuck_processing_jobs(&state).await;
     crate::api::jobs::processing::clean_orphaned_processing_dirs(&state).await;
 
-    let app = api::router(state);
+    let app = api::router(state.clone());
 
     tracing::info!(%addr, "thls listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let server_shutdown = shutdown_token.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+        server_shutdown.cancel();
+    });
+    let graceful = shutdown_token.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move { graceful.cancelled().await })
         .await?;
-    Ok(())
-}
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    tracing::info!("http server stopped, draining in-flight jobs");
+    let drain_deadline = Duration::from_secs(30);
+    let drain_start = Instant::now();
+    loop {
+        let active = {
+            let jobs = state.jobs.lock().await;
+            jobs.values().filter(|j| !j.status.is_terminal()).count()
+        };
+        if active == 0 {
+            tracing::info!("all jobs drained");
+            break;
+        }
+        if drain_start.elapsed() > drain_deadline {
+            tracing::warn!(
+                active,
+                "drain deadline exceeded, marking remaining jobs as error"
+            );
+            let mut jobs = state.jobs.lock().await;
+            for (_, job) in jobs.iter_mut() {
+                if !job.status.is_terminal() {
+                    job.cancel_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    job.status = api::jobs::JobStatus::Error;
+                    job.error = Some("shutdown_timeout".into());
+                    job.finished_at = Some(Instant::now());
+                }
+            }
+            if let Ok(conn) = state.db_conn().await {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = db::mark_non_terminal_jobs_failed(&conn, "shutdown_timeout");
+                })
+                .await;
+            }
+            break;
+        }
+        tracing::info!(
+            active,
+            elapsed_secs = drain_start.elapsed().as_secs(),
+            "waiting for in-flight jobs"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    Ok(())
 }
 
 async fn prepare_cache_dir(

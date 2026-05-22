@@ -205,6 +205,6 @@ pub(super) async fn finish_inflight(
             Err(e) => Err(e.to_string()),
         });
     }
-    state.cache.inflight.lock().await.remove(cache_key);
     inflight.notify.notify_waiters();
+    state.cache.inflight.lock().await.remove(cache_key);
 }

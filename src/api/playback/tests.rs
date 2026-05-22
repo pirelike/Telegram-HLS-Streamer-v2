@@ -4,10 +4,24 @@ use std::time::Instant;
 use axum::body::to_bytes;
 
 use crate::config::Config;
+use crate::db::SegmentRow;
 
 use super::cache::{CacheEntry, Inflight};
 use super::virtual_::*;
 use super::*;
+
+fn segment_row(key: &str) -> SegmentRow {
+    SegmentRow {
+        id: 0,
+        job_id: "job".into(),
+        segment_key: key.into(),
+        file_id: format!("file-{key}"),
+        bot_index: 0,
+        file_size: 1,
+        duration: Some(4.0),
+        is_split: false,
+    }
+}
 
 #[tokio::test]
 async fn cache_hits_misses_evictions() {
@@ -49,6 +63,34 @@ async fn cache_get_bytes_returns_reupload_payload() {
         .await
         .unwrap();
     assert_eq!(bytes.as_slice(), b"segment bytes");
+}
+
+#[test]
+fn cache_warmup_selects_only_first_playable_video_audio_and_thumbnail() {
+    let segs = vec![
+        segment_row("video_0/init.mp4"),
+        segment_row("video_1/video_0001.m4s"),
+        segment_row("video_0/video_0002.m4s"),
+        segment_row("video_0/video_0001.m4s"),
+        segment_row("audio_1/audio_0001.m4s"),
+        segment_row("audio_0/audio_0001.m4s"),
+        segment_row("sub_0/subtitles.vtt"),
+        segment_row("thumbnail/thumbnail.jpg"),
+    ];
+
+    let keys: Vec<_> = super::real::select_cache_warmup_segments(&segs)
+        .into_iter()
+        .map(|s| s.segment_key)
+        .collect();
+
+    assert_eq!(
+        keys,
+        vec![
+            "video_0/video_0001.m4s",
+            "audio_0/audio_0001.m4s",
+            "thumbnail/thumbnail.jpg"
+        ]
+    );
 }
 
 #[tokio::test]

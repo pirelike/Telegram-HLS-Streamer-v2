@@ -221,7 +221,11 @@ pub(super) async fn handle_upload_chunk(
         Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_payload", e),
     };
     if uuid::Uuid::parse_str(&upload_id).is_err() {
-        return api_error(StatusCode::BAD_REQUEST, "invalid_payload", "invalid upload id format");
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            "invalid upload id format",
+        );
     }
     let chunk_index: u32 = match required_header(&headers, "x-chunk-index").and_then(|v| {
         v.parse::<u32>()
@@ -238,7 +242,9 @@ pub(super) async fn handle_upload_chunk(
         if upload.ip != ip {
             return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
         }
-        if upload.last_activity.elapsed() > Duration::from_secs(cfg.pending_upload_ttl_seconds as u64) {
+        if upload.last_activity.elapsed()
+            > Duration::from_secs(cfg.pending_upload_ttl_seconds as u64)
+        {
             let path = upload.path.clone();
             pending.remove(&upload_id);
             drop(pending);
@@ -263,7 +269,8 @@ pub(super) async fn handle_upload_chunk(
         upload.last_activity = Instant::now();
         // Return early if already received or currently being written by a concurrent request.
         // Both checks are under the same mutex, so only one writer can proceed per chunk.
-        if upload.received_chunks.contains(&chunk_index) || upload.in_flight.contains(&chunk_index) {
+        if upload.received_chunks.contains(&chunk_index) || upload.in_flight.contains(&chunk_index)
+        {
             return Json(json!({
                 "chunk_index": chunk_index,
                 "received_bytes": upload.received_bytes,
@@ -282,11 +289,7 @@ pub(super) async fn handle_upload_chunk(
         )
     };
 
-    let mut file = match tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .await
-    {
+    let mut file = match tokio::fs::OpenOptions::new().write(true).open(&path).await {
         Ok(file) => file,
         Err(e) => {
             // Clear in_flight so the client can retry this chunk.
@@ -311,7 +314,11 @@ pub(super) async fn handle_upload_chunk(
 
     let mut pending = state.pending_uploads.lock().await;
     let Some(upload) = pending.get_mut(&upload_id) else {
-        return api_error(StatusCode::NOT_FOUND, "not_found", "upload expired or completed during write");
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "upload expired or completed during write",
+        );
     };
     if upload.ip != ip {
         return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
@@ -359,7 +366,11 @@ pub(super) async fn handle_upload_finalize(
     }
 
     if uuid::Uuid::parse_str(&body.upload_id).is_err() {
-        return api_error(StatusCode::BAD_REQUEST, "invalid_payload", "invalid upload id format");
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            "invalid upload id format",
+        );
     }
 
     let upload = {
