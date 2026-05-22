@@ -3,6 +3,8 @@ use std::time::Instant;
 
 use axum::body::to_bytes;
 
+use crate::config::Config;
+
 use super::cache::{CacheEntry, Inflight};
 use super::virtual_::*;
 use super::*;
@@ -47,6 +49,51 @@ async fn cache_get_bytes_returns_reupload_payload() {
         .await
         .unwrap();
     assert_eq!(bytes.as_slice(), b"segment bytes");
+}
+
+#[tokio::test]
+async fn disk_cache_disabled_keeps_entry_memory_only() {
+    let mut cfg = Config::default();
+    cfg.disk_cache_enabled = false;
+    cfg.cache_dir = std::env::temp_dir()
+        .join(format!("thls-disk-cache-disabled-{}", uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .into_owned();
+
+    let entry = cache_entry_for_bytes(
+        &cfg,
+        "job/video_0001.m4s",
+        "video_0001.m4s",
+        b"abc".to_vec(),
+    )
+    .await
+    .unwrap();
+
+    assert!(entry.file_path.is_none());
+    assert!(!std::path::Path::new(&cfg.cache_dir).exists());
+}
+
+#[tokio::test]
+async fn disk_cache_enabled_writes_file_backed_entry() {
+    let mut cfg = Config::default();
+    cfg.disk_cache_enabled = true;
+    cfg.cache_dir = std::env::temp_dir()
+        .join(format!("thls-disk-cache-enabled-{}", uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .into_owned();
+
+    let entry = cache_entry_for_bytes(
+        &cfg,
+        "job/video_0001.m4s",
+        "video_0001.m4s",
+        b"abc".to_vec(),
+    )
+    .await
+    .unwrap();
+    let path = entry.file_path.unwrap();
+
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), b"abc");
+    let _ = tokio::fs::remove_dir_all(&cfg.cache_dir).await;
 }
 
 #[tokio::test]

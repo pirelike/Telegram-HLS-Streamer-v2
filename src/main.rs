@@ -43,9 +43,11 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&processing_dir)
         .await
         .context("creating processing directory")?;
-    prepare_cache_dir(&cache_dir, &uploads_dir, &processing_dir)
-        .await
-        .context("preparing cache directory")?;
+    if cfg.disk_cache_enabled {
+        prepare_cache_dir(&cache_dir, &uploads_dir, &processing_dir)
+            .await
+            .context("preparing cache directory")?;
+    }
 
     tracing::info!(
         bots = cfg.bots.len(),
@@ -228,6 +230,9 @@ fn log_startup_warnings(cfg: &config::Config) {
     }
     if cfg.segment_cache_size_mb == 0 {
         tracing::warn!("SEGMENT_CACHE_SIZE_MB=0; segment cache is effectively unbounded/disabled");
+    }
+    if !cfg.disk_cache_enabled {
+        tracing::info!("DISK_CACHE_ENABLED=false; segment cache is memory-only");
     }
     if cfg.db_auto_merge_interval_minutes == 0 {
         tracing::warn!("DB_AUTO_MERGE_INTERVAL_MINUTES=0; DB auto-merge is disabled");

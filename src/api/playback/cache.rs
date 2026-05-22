@@ -151,6 +151,21 @@ impl SegmentCache {
             }
         }
     }
+
+    pub async fn drop_disk_files(&self) {
+        let mut paths = Vec::new();
+        {
+            let mut g = self.inner.lock().await;
+            for entry in g.map.values_mut() {
+                if let Some(path) = entry.file_path.take() {
+                    paths.push(path);
+                }
+            }
+        }
+        for path in paths {
+            remove_cache_file(Some(path));
+        }
+    }
 }
 
 fn remove_cache_file(path: Option<PathBuf>) {

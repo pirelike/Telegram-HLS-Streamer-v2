@@ -54,6 +54,7 @@ pub const SETTINGS: &[SettingSpec] = &[
     setting!("UPLOAD_CHUNK_SIZE", "UPLOAD_CHUNK_SIZE", "file_handling", SettingType::Int, "10485760", "Server-advertised upload chunk size.", Some(1), None),
     setting!("SEGMENT_TARGET_SIZE", "SEGMENT_TARGET_SIZE", "file_handling", SettingType::Int, "15728640", "Preferred HLS segment size.", Some(1), None),
     setting!("CACHE_DIR", "CACHE_DIR", "file_handling", SettingType::Str, "./cache/", "Ephemeral cache directory wiped on startup.", None, None),
+    setting!("DISK_CACHE_ENABLED", "DISK_CACHE_ENABLED", "file_handling", SettingType::Bool, "false", "Store cached segment payloads on disk instead of memory-only cache.", None, None),
     setting!("CACHE_WARMUP_ENABLED", "CACHE_WARMUP_ENABLED", "file_handling", SettingType::Bool, "false", "Enable cache warm-up behavior.", None, None),
     setting!("SEGMENT_CACHE_SIZE_MB", "SEGMENT_CACHE_SIZE_MB", "file_handling", SettingType::Int, "200", "Segment cache budget in MB.", Some(0), None),
     setting!("SEGMENT_PREFETCH_COUNT", "SEGMENT_PREFETCH_COUNT", "file_handling", SettingType::Int, "3", "Segments to prefetch ahead.", Some(0), None),
@@ -439,6 +440,10 @@ mod tests {
     fn validation_covers_special_setting_types() {
         assert_eq!(
             normalize_str_for_key("ABR_ENABLED", "TRUE").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            normalize_str_for_key("DISK_CACHE_ENABLED", "TRUE").unwrap(),
             "true"
         );
         assert!(normalize_str_for_key("PORT", "70000").is_err());
