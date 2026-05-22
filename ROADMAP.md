@@ -9,34 +9,31 @@ Priorities: bug > guard > perf > feature.
 
 ## P0 — Critical Bugs
 
-- [ ] **Chunk uploads can buffer unbounded request bodies**
+- [x] **Chunk uploads can buffer unbounded request bodies**
   `src/api/mod.rs:166` disables Axum's default body limit globally while `src/api/uploads.rs:202-206` extracts the chunk as `Bytes` before handler validation. A malformed or oversized `POST /api/upload/chunk` can be fully buffered in memory before `UPLOAD_CHUNK_SIZE` checks run, risking process OOM. Add a route/body-size limit that rejects oversized chunks before buffering.
 
-- [ ] **Concurrent duplicate chunks can corrupt uploaded files**
+- [x] **Concurrent duplicate chunks can corrupt uploaded files**
   `src/api/uploads.rs:227-274` checks `received_chunks` under `pending_uploads`, then drops the lock before writing to the target offset. Two same-index chunk requests can both pass the check and race-write different bytes; finalization can still see a complete upload. Serialize writes per upload/chunk or reserve the chunk while holding state.
 
-- [ ] **Concurrent finalize can enqueue duplicate jobs for one upload**
+- [x] **Concurrent finalize can enqueue duplicate jobs for one upload**
   `src/api/uploads.rs:343-402` validates completion, releases the pending-upload lock, enqueues, then removes the upload. Two finalize requests can both enqueue jobs pointing at the same source file. Atomically remove/mark the pending upload as finalizing before enqueue, and make duplicate finalize return a clear 404/409.
 
-- [ ] **Database load can run while active jobs are still writing**
+- [x] **Database load can run while active jobs are still writing**
   `src/api/db_transfer.rs:396-418` waits for SQLite pool drain but does not reject queued/downloading/processing/uploading jobs in `state.jobs`. A job can finish after DB replacement and save old work into the newly loaded database. Block live DB replacement while non-terminal jobs exist.
 
-- [ ] **Live DB replacement can leave no active database after cross-device rename failure**
+- [x] **Live DB replacement can leave no active database after cross-device rename failure**
   `src/api/db_transfer.rs:232-234` writes uploaded replacement DBs under `std::env::temp_dir()`, while `src/db/transfer.rs:163-168` renames the active DB to backup before renaming the temp source into place. If the temp path and active DB are on different filesystems, `rename(source, active)` can fail after the active DB was moved aside. Copy or stage the replacement on the active DB filesystem before swapping, and roll back on failure.
 
-- [ ] **DB backups can miss committed WAL data**
+- [x] **DB backups can miss committed WAL data**
   `src/db/transfer.rs:190-198` runs `PRAGMA wal_checkpoint(TRUNCATE)` best-effort, ignores checkpoint result rows/errors, then copies only the main `.db` file. If WAL frames remain busy, the backup can be stale or incomplete. Treat failed/busy checkpoint as backup failure or use SQLite's backup API.
 
-- [ ] **`TELEGRAM_MAX_FILE_SIZE` can be raised above the real Bot API ceiling**
-  `src/settings_registry.rs:52` has no max bound and `src/config.rs:326` applies the value directly. Values above `20971520` let local splitting/upload preflight accept files Telegram will reject, violating the project invariant. Hard-cap validation and config loading at `20971520`.
-
-- [ ] **Virtual ABR distorts non-16:9 sources**
+- [x] **Virtual ABR distorts non-16:9 sources**
   `src/api/playback/virtual_.rs:346` hardcodes `scale='trunc({target_height}*16/9/2)*2':{target_height}` and the playlist advertises the same assumed ratio. 4:3, vertical, and ultrawide sources are transcoded and advertised incorrectly. Use the source track's actual aspect ratio for playlist resolution and FFmpeg scale.
 
-- [ ] **Oversized `.m4s` segments detected but never repaired; repair count incorrectly reports success**
+- [x] **Oversized `.m4s` segments detected but never repaired; repair count incorrectly reports success**
   `src/media/process.rs:300-342` — After fMP4 remux, oversized `.m4s` segments are collected into `oversized_m4s`, but the repair loop (lines 324-342) only emits a warning. No re-encode or keyframe-split is performed. `m4s_repair_count` is then set to `oversized_m4s.len()` and returned as the "repaired" count, falsely reporting success. Jobs with large `.m4s` segments will fail at Telegram upload with no actionable error; callers have no signal that repair was skipped. The `.ts` repair path works correctly; the `.m4s` path is an unimplemented stub. Either implement re-encode to a lower bitrate (same resolution, per the Telegram invariant) or set `m4s_repair_count = 0` and document that the upload-time byte-splitting path handles these.
 
-- [ ] **`replace_live_database` installs an empty pool before the file rename completes**
+- [x] **`replace_live_database` installs an empty pool before the file rename completes**
   `src/api/db_transfer.rs:409-411` — `std::mem::replace` at line 409 swaps the live pool with a freshly-initialised lazy pool pointing at the original DB path. `replace_database_file` (line 411) then renames the original to a backup and moves the uploaded file into place. Any request that acquires a connection between line 409 and the completion of the rename can either connect to the already-moved backup file or receive a file-not-found error, both surfacing as unexpected 500s. Move the file rename entirely before installing the new pool, or hold the `state.db` write-lock across both operations.
 
 ---
@@ -112,9 +109,6 @@ Priorities: bug > guard > perf > feature.
 
 - [ ] **`selected_encoder` not refreshed when encoder-related settings change**
   `src/api/playback/virtual_.rs:37` — `serve_virtual_segment` reads `state.selected_encoder.read().await.clone()` at request time. The encoder was cached correctly per P1, but cache invalidation on settings change may not be wired: if the user changes `preferred_encoder` or GPU path via the settings API, virtual ABR transcodes silently continue using the stale selection (e.g. old VAAPI device path, or CPU encoder after enabling NVENC). Verify that `media::encoder::select_encoder` is called and written to `state.selected_encoder` on any encoder-relevant settings save, and confirm it ends up in the same code path as the initial probe in `main.rs`.
-
-- [ ] **Virtual playlists omit `#EXT-X-MAP` for fMP4 content when source segments are `.ts`**
-  `src/api/playlists.rs:450-456` — `emit_virtual_playlist` derives `init_present` from whether `video_0/init.mp4` exists in the DB. For TS-source jobs there is no `init.mp4` so `init_present = false`, and the virtual playlist is emitted without `#EXT-X-MAP`. Virtual segments are always fMP4 (produced with `-movflags frag_keyframe+empty_moov`), so an fMP4 stream without an initialization segment reference is invalid HLS and will fail to decode on all clients. Always emit `#EXT-X-MAP` for virtual playlists regardless of source format.
 
 - [ ] **Stale Telegram `file_id` recovery triggers full source re-encode for a single segment**
   `src/api/playback/real.rs:464-518` — `extract_recovery_segment_from_source` calls `media::process_media` on the full source file when recovering from a stale `file_id`. This produces all segments and tiers in `work_dir`; only the one needed segment is read back, and the rest are discarded with `remove_dir_all`. For a 2-hour film this triggers a multi-hour full re-encode consuming tens of GB of disk, just to recover one segment. Add a targeted extraction path (e.g., seek-based single-segment encode, or byte-range extraction from the original `.ts`/`.m4s`) or cap this recovery path to init segments only.

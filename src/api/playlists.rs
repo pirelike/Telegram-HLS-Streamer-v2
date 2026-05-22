@@ -320,7 +320,11 @@ fn build_master_playlist(cfg: &Config, job: &JobRow, tracks: &[TrackRow]) -> Str
             let bw = parse_bitrate_str(&bitrate)
                 .unwrap_or(2_000_000)
                 .clamp(32_000, 50_000_000);
-            let width = (height as f64 * 16.0 / 9.0 / 2.0).floor() as i64 * 2;
+            let width = if job.video_width > 0 && job.video_height > 0 {
+                media::scaled_width(job.video_width, job.video_height, height)
+            } else {
+                (height as f64 * 16.0 / 9.0 / 2.0).floor() as i64 * 2
+            };
             let codecs = format!(
                 "{},{}",
                 video_codec_string("h264", height),
