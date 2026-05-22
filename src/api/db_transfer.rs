@@ -114,6 +114,7 @@ pub(super) async fn handle_db_export(
         0,
         &path,
         "db/export.json".into(),
+        // User-configurable; raise if Telegram increases Bot API limits.
         cfg.telegram_max_file_size,
     )
     .await;

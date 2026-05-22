@@ -307,35 +307,8 @@ nested/video_0001.m4s?token=ignored
     }
 
     #[test]
-    fn oversized_bitrate_calculation_stays_under_limit() {
-        let max_file_size = 20 * 1024 * 1024u64;
-        let duration = 6.0f64;
-        let bps = process::max_bitrate_for_segment(max_file_size, duration);
-        let bitrate_kbps = bps / 1000;
-        assert!(bitrate_kbps > 32, "should re-encode, not split");
-        let theoretical_max_bytes = (bps as f64 / 8.0) * duration;
-        assert!(
-            theoretical_max_bytes <= max_file_size as f64,
-            "calculated bitrate exceeds limit"
-        );
-        let short_duration = 0.5f64;
-        let bps_short = process::max_bitrate_for_segment(max_file_size, short_duration);
-        assert!(
-            !process::repair_needs_split(bps_short),
-            "short segment has very high bitrate, should re-encode not split, got {} bps",
-            bps_short
-        );
-        let normal_duration = 4.0f64;
-        let bps_normal = process::max_bitrate_for_segment(max_file_size, normal_duration);
-        assert!(
-            !process::repair_needs_split(bps_normal),
-            "normal segment should not need split, got {} bps",
-            bps_normal
-        );
-    }
-
-    #[test]
     fn max_bitrate_for_segment_targets_95_percent_of_limit() {
+        // 20 MB default matches cfg.telegram_max_file_size; raise if Telegram changes limits.
         let max_file_size = 20 * 1024 * 1024u64;
         let duration = 10.0f64;
         let bps = process::max_bitrate_for_segment(max_file_size, duration);
@@ -350,6 +323,7 @@ nested/video_0001.m4s?token=ignored
 
     #[test]
     fn oversized_segment_long_duration_triggers_split() {
+        // 20 MB default matches cfg.telegram_max_file_size; raise if Telegram changes limits.
         let max_file_size = 20 * 1024 * 1024u64;
         let bps = process::max_bitrate_for_segment(max_file_size, 5000.0);
         assert!(

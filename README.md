@@ -52,7 +52,8 @@ Common `.env` values:
 | `LOCAL_PORT` | `5050` | Server bind port. |
 | `TELEGRAM_BOT_TOKEN_1` | unset | First Telegram bot token. |
 | `TELEGRAM_CHANNEL_ID_1` | unset | Channel used by the first bot. |
-| `TELEGRAM_MAX_FILE_SIZE` | `20971520` | Per-file Telegram upload ceiling. |
+| `TELEGRAM_MAX_FILE_SIZE` | `20971520` | Per-file Telegram upload ceiling. Raise if Telegram increases Bot API limits. |
+| `SEGMENT_TARGET_SIZE` | `15728640` | Preferred HLS segment target. User-configurable; adjust if upload ceiling changes. |
 | `MAX_UPLOAD_SIZE` | `107374182400` | Max accepted client upload size. |
 | `UPLOAD_CHUNK_SIZE` | `10485760` | Browser/client upload chunk size. |
 | `MAX_CONCURRENT_JOBS` | `1` | Number of queue workers. |

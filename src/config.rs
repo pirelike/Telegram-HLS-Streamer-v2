@@ -35,9 +35,11 @@ pub struct Config {
     pub cloudflared_enabled: bool,
     pub cloudflared_config: String,
 
+    // User-configurable; raise if Telegram increases Bot API file size limits.
     pub telegram_max_file_size: u64,
     pub max_upload_size: u64,
     pub upload_chunk_size: u64,
+    // User-configurable HLS segment target; adjust if upload ceiling changes.
     pub segment_target_size: u64,
     pub cache_dir: String,
     pub disk_cache_enabled: bool,
@@ -97,10 +99,10 @@ impl Default for Config {
             cors_allowed_origins: Vec::new(),
             cloudflared_enabled: false,
             cloudflared_config: String::new(),
-            telegram_max_file_size: 20 * 1024 * 1024,
+            telegram_max_file_size: 20 * 1024 * 1024, // default matches current Bot API limit; raise if Telegram changes it
             max_upload_size: 100 * 1024 * 1024 * 1024,
             upload_chunk_size: 10 * 1024 * 1024,
-            segment_target_size: 15 * 1024 * 1024,
+            segment_target_size: 15 * 1024 * 1024, // user-configurable; adjust if upload ceiling changes
             cache_dir: "./cache/".into(),
             disk_cache_enabled: false,
             cache_warmup_enabled: false,
