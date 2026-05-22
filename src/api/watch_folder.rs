@@ -373,7 +373,8 @@ async fn claim_and_enqueue(
     if let Err(e) = enqueue_result {
         let source_clone = source.clone();
         let target_clone = target.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::rename(&target_clone, &source_clone)).await;
+        let _ = tokio::task::spawn_blocking(move || std::fs::rename(&target_clone, &source_clone))
+            .await;
         return Err(e);
     }
     Ok(())
@@ -471,6 +472,7 @@ mod tests {
             ffprobe_available: true,
             selected_encoder: RwLock::new(crate::media::cpu_encoder()),
             last_bot_index: std::sync::atomic::AtomicI64::new(0),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         })
     }
 

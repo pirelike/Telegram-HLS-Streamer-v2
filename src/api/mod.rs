@@ -24,6 +24,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
 use bots_settings::{
@@ -78,6 +79,7 @@ pub struct AppState {
     pub ffprobe_available: bool,
     pub selected_encoder: RwLock<media::SelectedEncoder>,
     pub last_bot_index: std::sync::atomic::AtomicI64,
+    pub shutdown_token: CancellationToken,
 }
 
 impl AppState {

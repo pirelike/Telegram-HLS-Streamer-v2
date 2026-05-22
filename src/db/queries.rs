@@ -738,7 +738,9 @@ pub fn insert_job_marker(
 }
 
 pub fn get_stuck_processing_jobs(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT job_id FROM jobs WHERE status = 'processing'")?;
+    let mut stmt = conn.prepare(
+        "SELECT job_id FROM jobs WHERE status IN ('queued','downloading','analyzing','processing','uploading')",
+    )?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     rows.map(|r| r.map_err(Into::into)).collect()
 }
@@ -755,6 +757,13 @@ pub fn mark_job_as_cancelled(conn: &Connection, job_id: &str) -> Result<bool> {
         "UPDATE jobs SET status = 'cancelled', error = NULL WHERE job_id = ?1",
         rusqlite::params![job_id],
     )? > 0)
+}
+
+pub fn mark_non_terminal_jobs_failed(conn: &Connection, error: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE jobs SET status = 'error', error = ?1 WHERE status IN ('queued','downloading','analyzing','processing','uploading')",
+        rusqlite::params![error],
+    )?)
 }
 
 pub fn update_segment_file_id(

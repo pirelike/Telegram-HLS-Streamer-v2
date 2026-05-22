@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use super::download;
 use super::json::{self, job_json, season_group_json, series_group_json};
-use super::processing::{cleanup_job_paths, enqueue_job, send_job_webhook};
+use super::processing::{enqueue_job, send_job_webhook};
 use super::types::*;
 
 use super::super::{api_error, db_unavailable, valid_job_id as valid_slug_id, AppState};
@@ -423,7 +423,7 @@ pub async fn handle_cancel_job(
     if !valid_slug_id(&job_id) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_job_id", "invalid job id");
     }
-    let cleanup = {
+    let cancelled = {
         let mut jobs = state.jobs.lock().await;
         let Some(job) = jobs.get_mut(&job_id) else {
             return api_error(StatusCode::NOT_FOUND, "not_found", "job not found");
@@ -442,13 +442,9 @@ pub async fn handle_cancel_job(
         job.progress = 100.0;
         job.description = "cancelled".into();
         job.finished_at = Some(Instant::now());
-        Some((
-            job.source_path.clone(),
-            job.processing_path.clone(),
-            job.delete_source_on_finish,
-        ))
+        true
     };
-    if let Some((source_path, processing_path, delete_source)) = cleanup {
+    if cancelled {
         if let Ok(conn) = state.db_conn().await {
             let job_id_clone = job_id.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -458,7 +454,6 @@ pub async fn handle_cancel_job(
             })
             .await;
         }
-        cleanup_job_paths(&source_path, &processing_path, delete_source).await;
     }
     send_job_webhook(&state, &job_id, JobStatus::Cancelled, None).await;
     Json(json!({ "job_id": job_id, "status": "cancelled", "message": "cancelled" })).into_response()

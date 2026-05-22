@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 
 [profile.release]
 lto = "thin"

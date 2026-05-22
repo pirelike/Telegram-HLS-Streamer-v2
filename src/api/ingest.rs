@@ -235,6 +235,14 @@ async fn download_and_enqueue(
                 if job_cancelled(&state, &job_id).await {
                     break;
                 }
+                {
+                    let jobs = state.jobs.lock().await;
+                    if let Some(job) = jobs.get(&job_id) {
+                        if job.status == JobStatus::Error {
+                            break;
+                        }
+                    }
+                }
                 let metadata = JobMetadata {
                     title: Some(filename.clone()),
                     ..Default::default()
@@ -351,7 +359,10 @@ async fn stream_to_file(
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         let mut jobs = state.jobs.lock().await;
         if let Some(job) = jobs.get_mut(job_id) {
-            if job.cancel_requested || job.status == JobStatus::Cancelled {
+            if job.cancel_requested
+                || job.status == JobStatus::Cancelled
+                || job.status == JobStatus::Error
+            {
                 return Err("cancelled".into());
             }
             job.progress = total

@@ -1,61 +1,3 @@
-
-# AGENTS.md
-
-> This file is auto-loaded by OpenCode for both the `planner` and
-> `investigator` agents. Keep it concise — it goes into every context window.
-> For verbose domain rules, use files in `.opencode/rules/*.md` (already
-> referenced via the `instructions` field in `opencode.json`).
-
-## Project overview
-
-[Replace with 2–4 sentences describing what this project does, its
-language/runtime, and the deployment target.]
-
-## Build, test, and lint commands
-
-- **Install:** `[command]`
-- **Build:** `[command]`
-- **Test (canonical):** `[command]`
-- **Test (single file):** `[command]`
-- **Lint:** `[command]`
-- **Type-check:** `[command]`
-- **Format:** `[command]`
-
-These are the canonical verification commands. The investigator should cite
-this section when reporting verification commands to the planner.
-
-## Conventions
-
-- **Style:** [e.g., "We use 2-space indentation; semicolons required."]
-- **Imports:** [e.g., "Absolute imports via `@/` alias; no deep relative paths."]
-- **File naming:** [e.g., "kebab-case for files, PascalCase for components."]
-- **Test naming:** [e.g., "Co-located `*.test.ts` files; no top-level `__tests__/`."]
-- **Error handling:** [e.g., "Throw typed errors from `lib/errors.ts`; never bare `throw new Error(...)`."]
-
-## Architecture invariants
-
-- [Anything that should never change without explicit discussion.
-  Examples: "All public API calls go through `src/api/client.ts`."
-  "Database access only via the repository layer in `src/db/`."]
-
-## Do-not-touch zones
-
-- [Paths where edits require special caution. Examples:
-  `src/migrations/` — never modify existing migration files.
-  `config/secrets/` — read-only; values are populated at deploy time.]
-
-## Agent guidance
-
-- The default agent is `planner`. Tab to `build` for implementation.
-- For non-trivial work (3+ files, API/schema changes, >30 min effort, or
-  cross-cutting concerns), use `planner` first to produce a reviewable plan.
-- For trivial work (single-file edits, typo fixes, adding a log line),
-  switch directly to `build`.
-- The planner delegates codebase exploration to the `investigator` subagent
-  — do not bypass this by reading dozens of files yourself.
-- Never invoke the investigator for questions about user intent — that is
-  the planner's job via the `question` tool.
-
 ## ⚠️ ALAPELV — OLVASD EL MINDEN FELADAT ELŐTT
 
 **A legegyszerűbb működő megoldást írd meg. Mindig.**
@@ -103,21 +45,14 @@ Az AI agentek krónikusan túlkomplikálnak mindent — absztrakciós rétegeket
 - Kódmódosítás után futtass célzott ellenőrzést. Általános változtatásnál `cargo test`; formázásnál `cargo fmt --check`; lintnél `cargo clippy --all-targets --all-features`.
 - Médiafolyamot érintő változtatásnál, ha Telegram credential be van állítva, a kézi end-to-end ellenőrzés: `python3 scripts/upload_and_wait.py TEST_FILE.mkv --timeout 7200 --start-timeout 180 --request-timeout 180`.
 - Ha dokumentációt frissítesz, tartsd szinkronban az agent fájlokat: `AGENTS.md`, `CODEX.md`, `CLAUDE.md`.
-- **Telegram feltöltési limit**: A Telegram Bot API maximális fájlmérete jelenleg 20 MB (`TELEGRAM_MAX_FILE_SIZE=20971520`). Minden feltöltött fájlnak (`.m4s`, `.ts`, `.vtt`, `.jpg`) ez alatt kell lennie. A `telegram_max_file_size` config értéket ne emeld a Bot API aktuális limitje fölé — de ha a Telegram megemeli a limitet, frissítsd ennek megfelelően.
-- **Szegmens méret limit**: A `SEGMENT_TARGET_SIZE` (alapértelmezett: `15728640`) szintén felhasználó által konfigurálható. A feltöltési ceiling változása esetén igazítsd hozzá.
-- **Minőségmegőrzés**: SOHA ne növeld a kódolási sebességet a videó minőségének rovására. Tilos `-preset ultrafast`-ot vagy más speed-over-quality FFmpeg beállítást használni teljesítményoptimalizálás céljából.
-- **Túlméretes szegmens kezelése**: Ha egy szegmens meghaladja a `telegram_max_file_size` által meghatározott limitet, számold ki a legmagasabb bitrate-et ami még belefér, és azzal kódold újra. A felbontást NE csökkentsd — ugyanaz a felbontás, maximális bitrate. Ha a minimális értelmes bitrate (32k) mellett is túl nagy, keyframe határoknál vágd szét (`-c copy`, nincs újrakódolás).
-- **SEASON END — automatikus Pull Request**: Ha a felhasználó "SEASON END"-et ír, automatikusan commit-old és push-old az összes módosított követett fájlt, majd nyiss Pull Request-et a GitHub-on a `.env` fájlban lévő `GITHUB_TOKEN`, `GITHUB_REPO_OWNER`, `GITHUB_REPO_NAME` és `GITHUB_BASE_BRANCH` változók alapján (`gh auth login --with-token`, `git add`, `git commit`, `git push`, `gh pr create`). A munkamenet végén mindig ellenőrizd a `git diff --name-only` kimenetét: ha vannak módosított követett fájlok és a felhasználó elfelejtette beírni a "SEASON END"-et, akkor is automatikusan commit-old, push-old és nyiss PR-t — ugyanezzel a módszerrel. Soha ne veszíts el munkát amiatt mert a felhasználó elfelejtett parancsot kiadni.
 
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
 
-When the user types `/graphify`, invoke the `skill` tool with `skill: "graphify"` before doing anything else.
-
 Rules:
 - For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
-- Dirty graphify-out/ files are expected after hooks or incremental updates; dirty graph files are not a reason to skip graphify. Only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- **NEVER include `static/shaka-player.ui.js` in any graphify run.** It is a vendored third-party library (Shaka Player UI), not our code. Including it pollutes the graph with ~690 minified-symbol nodes (`js()`, `t()`, `g()`, etc.) that dominate every god-node and centrality metric and bury the actual THLS structure. When running `/graphify`, `graphify extract`, or `graphify update`, explicitly exclude this file from the file list before dispatching extraction (filter out any path containing `shaka-player` or `shaka_player`). If the file slips in, remove its nodes/edges before writing `graph.json`. The same rule applies to any other vendored bundle we add in the future.

@@ -40,29 +40,29 @@ Priorities: bug > guard > perf > feature.
 
 ## P1 — Performance (High Impact)
 
-- [ ] **Browser upload is strictly serial even though chunk retries are resumable**
+- [x] **Browser upload is strictly serial even though chunk retries are resumable**
   `static/upload.js:418-456` sends chunks one at a time. After the upload race fixes in P0, add small bounded parallelism (for example 2-4 chunks) so large local uploads use available bandwidth without overwhelming disk writes or request limits. Keep retries per chunk and stop all in-flight work on cancel.
 
-- [ ] **Upload resume assumes contiguous chunks**
+- [x] **Upload resume assumes contiguous chunks**
   `static/upload.js:396-404` resumes from `received_chunks`, but `src/api/uploads.rs:456-468` can return explicit `received_indices`. If chunks are uploaded out of order or a future parallel upload leaves gaps, the browser can skip missing chunks. Resume from `received_indices` and send only missing indices.
 
-- [ ] **No lightweight playback/cache benchmark exists**
+- [x] **No lightweight playback/cache benchmark exists**
   The repo has `/api/metrics`, cache counters, Telegram metrics, and an ignored manual cache smoke test, but no repeatable command that reports first-segment latency, cache-hit latency, Telegram fetch latency, and virtual ABR transcode latency. Add a small script or ignored test that exercises one completed job and prints these timings.
 
-- [ ] **Cache warm-up is too coarse for home-server bandwidth**
+- [x] **Cache warm-up is too coarse for home-server bandwidth**
   `CACHE_WARMUP_ENABLED` exists and `spawn_cache_warmup` is called after job completion, but warm-up should stay conservative: first playable video segment, first audio segment, and thumbnail only, gated by cache budget and `SEGMENT_PREFETCH_MIN_FREE_BYTES`. Avoid warming whole jobs or all tiers.
 
 ---
 
 ## P2 — Reliability
 
-- [ ] **No graceful shutdown for in-flight jobs and uploads**
+- [x] **No graceful shutdown for in-flight jobs and uploads**
   `src/main.rs:107-114` only awaits Ctrl-C; Axum's `with_graceful_shutdown` drains HTTP connections but the spawned `job_dispatcher`, `process_job` tasks, FFmpeg children, Telegram uploads, and chunked uploads are abruptly killed. Jobs left in `processing`/`uploading` accumulate as stuck rows in the DB. Add a shared `CancellationToken`/broadcast, signal all worker tasks, and wait for them (with a deadline) before the process exits.
 
-- [ ] **Background workers die silently with no supervisor**
+- [x] **Background workers die silently with no supervisor**
   `src/api/jobs/processing.rs:132-145` breaks the dispatcher loop on `acquire_owned` error with no log or restart; `upload_sweeper`, `watch_folder_poller`, and `job_timeout_watcher` are all `tokio::spawn`ed and never monitored. A panic in `process_job` also loses one semaphore permit permanently. Wrap each worker in a supervisor that logs the exit cause, catches panics (`JoinHandle::is_panicked`), and respawns with backoff; track semaphore permits explicitly so they cannot leak.
 
-- [ ] **Crash recovery only catches `processing` state, not `queued`/`uploading`/`analyzing`**
+- [x] **Crash recovery only catches `processing` state, not `queued`/`uploading`/`analyzing`**
   `recover_stuck_processing_jobs` at `src/api/jobs/processing.rs:935-956` and `src/db/queries.rs:686-697` queries `status='processing'`. Jobs that crashed before the processing marker was written (see `src/api/jobs/processing.rs:172-177`) stay as `queued`/`uploading`/`analyzing` in the DB with no in-memory state and no heartbeat. Add a `jobs.lease_expires_at` column, treat any non-terminal row whose lease lapsed as stuck, and either re-enqueue from `source_path` or mark as failed.
 
 - [ ] **Telegram retries have no jitter, no max-sleep cap, and no per-bot circuit breaker**
@@ -92,16 +92,16 @@ Priorities: bug > guard > perf > feature.
 - [ ] **Remote download has no explicit wall-clock or idle timeout**
   `src/api/ingest.rs:72-282` builds a fresh reqwest client and streams chunks until completion, but there is no per-download deadline or per-read idle timeout. A slow or stalled origin can keep a job in `downloading` indefinitely until broader job timeout logic notices. Add bounded timeout behavior and surface `download_timed_out` as a clear job error.
 
-- [ ] **Ingest download task ignores `job_timeout_watcher` cancellation**
+- [x] **Ingest download task ignores `job_timeout_watcher` cancellation**
   `src/api/ingest.rs:354-356` — `stream_to_file` exits early when `cancel_requested || status == Cancelled`. The `job_timeout_watcher` sets `job.status = Error` (not `Cancelled`), so the per-chunk cancel check never fires on timeout. The spawned download task runs to completion after the job has already been marked `error` in memory, then calls `enqueue_existing_job` on a job whose in-memory state is `Error`, which passes the `!cancel_requested && status != Cancelled` guard and re-queues a job that was intentionally timed out. Add `status == Error` (or check the `cancel_flag` atomic) to the `stream_to_file` early-exit condition.
 
-- [ ] **`single_flight` inflight entry permanently unresolvable if streaming leader panics**
+- [x] **`single_flight` inflight entry permanently unresolvable if streaming leader panics**
   `src/api/playback/real.rs:190-249` — The `tokio::spawn`'d leader accumulates bytes and calls `finish_inflight` on success and known-error paths. If the task panics (e.g. OOM in `extend_from_slice`), `finish_inflight` is never called: `outcome` stays `None` and `notify_waiters()` is never called. All subsequent requests for the same `cache_key` call `wait_for_outcome`, loop forever on a notify that never fires, and are permanently hung. Add a `Drop`-guard or `catch_unwind` wrapper that calls `finish_inflight` with an error on any early exit.
 
-- [ ] **`finish_inflight` removes key from inflight map before calling `notify_waiters`**
+- [x] **`finish_inflight` removes key from inflight map before calling `notify_waiters`**
   `src/api/playback/cache.rs:193-194` — The key is removed from `state.cache.inflight` before `inflight.notify.notify_waiters()` fires. A new request arriving in that window calls `claim_inflight`, finds no entry, becomes a spurious leader, and starts a duplicate Telegram fetch for a segment that is already in the cache or being written. Swap the order: notify while the entry still exists in the map, then remove.
 
-- [ ] **`handle_cancel_job` deletes processing directory while FFmpeg may still be writing to it**
+- [x] **`handle_cancel_job` deletes processing directory while FFmpeg may still be writing to it**
   `src/api/jobs/handlers.rs:461` — The cancel handler sets `cancel_flag`, then immediately calls `cleanup_job_paths` (which deletes source + processing dir). `process_job` polls `cancel_flag` asynchronously at specific checkpoints; between flag set and FFmpeg noticing the cancellation, the processing directory is deleted from under the encoder. Intermediate files are corrupted and FFmpeg emits confusing errors. Restrict `cleanup_job_paths` to the `process_job` task; the cancel handler should only set the flag and update in-memory status.
 
 - [ ] **Missing `spawn_blocking` for blocking rusqlite calls in DB transfer and frontend handlers**
@@ -116,10 +116,10 @@ Priorities: bug > guard > perf > feature.
 - [ ] **`transcode_segment` leaks FFmpeg output file when `tokio::fs::read` fails after encode**
   `src/api/playback/virtual_.rs:401` — The output file `out_path` is only removed via `let _ = remove_file(&out_path).await` on the success path. If `tokio::fs::read(&out_path).await?` returns an error (disk full, I/O error), the `?` propagates and the `out_path` removal is never reached. The encoded `.mp4` sits in `temp_dir()` permanently. Clean up `out_path` unconditionally (e.g. via defer pattern or an explicit `remove_file` in the error arm).
 
-- [ ] **`env_writer` `Mutex` not poison-safe; subsequent writes panic after any rewrite failure**
+- [x] **`env_writer` `Mutex` not poison-safe; subsequent writes panic after any rewrite failure**
   `src/env_writer.rs:11` — `WRITE_MUTEX.lock().unwrap()` — if a thread panics while holding the mutex (e.g., from an `unwrap` inside `write_env_values`), the `Mutex` is poisoned. Every subsequent `.env` write panics at this `unwrap`, bubbling out of `spawn_blocking` as a `JoinError`. All future settings persisted to `.env` silently fail. Use `.unwrap_or_else(|e| e.into_inner())` to recover from poisoning or return a typed error.
 
-- [ ] **`env_writer` missing `fsync` before rename; power loss can corrupt `.env`**
+- [x] **`env_writer` missing `fsync` before rename; power loss can corrupt `.env`**
   `src/env_writer.rs:58-62` — `std::fs::write(&tmp, &content)` followed by `std::fs::rename(&tmp, env_path)`. On Linux, `rename(2)` is atomic at the directory-entry level but does not flush the file's data to disk. A power loss after rename but before the OS flushes dirty pages produces a zero-byte or partial `.env`. Add `File::open`+ `write`+ `sync_all` + `rename` so the data is durable before the directory entry changes.
 
 - [ ] **`handle_post_settings` has a TOCTOU race under concurrent modification**
@@ -140,7 +140,7 @@ Priorities: bug > guard > perf > feature.
 - [ ] **`probe_duration` uses FFprobe with `concat:` URL which FFprobe does not support as a bare filename**
   `src/media/process.rs:989` — `fmp4_input_arg(path)` formats `concat:/path/init.mp4|/path/video_N.m4s` and passes it as a filename argument to FFprobe. FFmpeg's `concat:` demuxer works via a bare filename; FFprobe does not honour it the same way and will fail to probe `.m4s` segments, silently falling back to `cfg.hls_segment_duration as f64`. This produces inaccurate per-segment duration data used for Telegram split-size calculations. Probe `.m4s` segments directly without the `concat:` wrapper, or derive durations from the HLS playlist instead.
 
-- [ ] **Settings persistence returns success when `.env` write fails, causing config to diverge on restart**
+- [x] **Settings persistence returns success when `.env` write fails, causing config to diverge on restart**
   `src/api/bots_settings.rs:68-86` — `write_settings_to_env` failure is logged as a warning but the handler continues to update `state.config` in memory and returns HTTP 200. On the next restart, the `.env` file dominates (per loading order), so the in-memory update is silently reverted. The user receives no indication that their settings will not survive a restart. Return an HTTP error (or at minimum a partial-persistence response) when the `.env` write fails, so callers know the update is non-durable.
 
 ---

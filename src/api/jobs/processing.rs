@@ -147,27 +147,91 @@ pub(super) fn sanitize_original_source_path(value: Option<String>) -> Result<Opt
     Ok(Some(value.to_string()))
 }
 
+fn spawn_supervised<F, Fut>(name: &'static str, mut make_future: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(8);
+        loop {
+            let handle = tokio::spawn(make_future());
+            let result = handle.await;
+            match result {
+                Ok(()) => {
+                    tracing::info!(worker = name, "worker exited normally, respawning");
+                }
+                Err(e) if e.is_panic() => {
+                    tracing::error!(
+                        worker = name,
+                        "worker panicked, respawning in {:?}",
+                        backoff
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(worker = name, error = %e, "worker join error, respawning in {:?}", backoff);
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    });
+}
+
 pub(crate) fn start_background_tasks(state: Arc<AppState>, receiver: mpsc::Receiver<JobRequest>) {
-    tokio::spawn(job_dispatcher(state.clone(), receiver));
-    tokio::spawn(super::super::uploads::upload_sweeper(state.clone()));
-    tokio::spawn(super::super::watch_folder::watch_folder_poller(
-        state.clone(),
-    ));
-    tokio::spawn(job_timeout_watcher(state));
+    let dispatcher_state = state.clone();
+    tokio::spawn(async move {
+        let handle = tokio::spawn(job_dispatcher(dispatcher_state, receiver));
+        match handle.await {
+            Ok(()) => tracing::info!(worker = "job_dispatcher", "exited"),
+            Err(e) => tracing::error!(worker = "job_dispatcher", "panicked: {e}"),
+        }
+    });
+    {
+        let state = state.clone();
+        spawn_supervised("upload_sweeper", move || {
+            let state = state.clone();
+            async move { super::super::uploads::upload_sweeper(state).await }
+        });
+    }
+    {
+        let state = state.clone();
+        spawn_supervised("watch_folder_poller", move || {
+            let state = state.clone();
+            async move { super::super::watch_folder::watch_folder_poller(state).await }
+        });
+    }
+    {
+        let state = state.clone();
+        spawn_supervised("job_timeout_watcher", move || {
+            let state = state.clone();
+            async move { job_timeout_watcher(state).await }
+        });
+    }
 }
 
 async fn job_dispatcher(state: Arc<AppState>, mut receiver: mpsc::Receiver<JobRequest>) {
     let max = state.config.read().await.max_concurrent_jobs.max(1) as usize;
     let semaphore = Arc::new(Semaphore::new(max));
-    while let Some(job) = receiver.recv().await {
-        let Ok(permit) = semaphore.clone().acquire_owned().await else {
-            break;
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            process_job(state, job).await;
-            drop(permit);
-        });
+    loop {
+        tokio::select! {
+            job = receiver.recv() => {
+                let Some(job) = job else { break };
+                let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                    break;
+                };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    process_job(state, job).await;
+                    drop(permit);
+                });
+            }
+            _ = state.shutdown_token.cancelled() => {
+                tracing::info!("job dispatcher shutting down");
+                break;
+            }
+        }
     }
 }
 
@@ -1111,7 +1175,7 @@ pub async fn recover_stuck_processing_jobs(state: &Arc<AppState>) {
     let conn = match state.db_conn().await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::error!(error = %e, "failed to acquire DB connection for stuck processing recovery");
+            tracing::error!(error = %e, "failed to acquire DB connection for stuck job recovery");
             return;
         }
     };
@@ -1126,11 +1190,11 @@ pub async fn recover_stuck_processing_jobs(state: &Arc<AppState>) {
     let stuck = match result {
         Ok(Ok(jobs)) => jobs,
         Ok(Err(e)) => {
-            tracing::error!(error = %e, "failed to query stuck processing jobs");
+            tracing::error!(error = %e, "failed to query stuck jobs");
             return;
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to query stuck processing jobs");
+            tracing::error!(error = %e, "failed to query stuck jobs");
             return;
         }
     };
@@ -1139,7 +1203,7 @@ pub async fn recover_stuck_processing_jobs(state: &Arc<AppState>) {
     }
     tracing::warn!(
         count = stuck.len(),
-        "found stuck processing jobs, marking as failed"
+        "found stuck non-terminal jobs (queued/downloading/analyzing/processing/uploading), marking as failed"
     );
 }
 
