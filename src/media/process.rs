@@ -306,6 +306,7 @@ async fn encode_video_tier(
                 continue;
             }
             let size = entry.metadata().await?.len();
+            // telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
             if size <= cfg.telegram_max_file_size {
                 continue;
             }
@@ -503,6 +504,9 @@ pub(crate) async fn copied_segments_need_reencode(dir: &Path, cfg: &Config) -> R
     Ok(durations.values().any(|d| *d <= 0.0 || *d > limit))
 }
 
+/// Computes the highest bitrate (bps) that keeps a segment within max_file_size.
+/// max_file_size is typically cfg.telegram_max_file_size — user-configurable;
+/// raise if Telegram increases Bot API limits.
 pub(crate) fn max_bitrate_for_segment(max_file_size: u64, duration_secs: f64) -> u64 {
     let max_size = (max_file_size as f64 * 0.95) as u64;
     let seconds = duration_secs.max(0.1);
@@ -522,6 +526,7 @@ async fn repair_oversized_segment_max_bitrate(
     let duration = probe_duration(path)
         .await
         .unwrap_or(cfg.hls_segment_duration as f64);
+    // telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
     let max_size = (cfg.telegram_max_file_size as f64 * 0.95) as u64;
     let seconds = duration.max(0.1);
     let bps = ((max_size as f64 * 8.0) / seconds) as u64;
@@ -603,6 +608,7 @@ async fn repair_oversized_segment_max_bitrate(
     tokio::fs::rename(&tmp, path).await?;
 
     let repaired = tokio::fs::metadata(path).await?.len();
+    // telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
     if repaired > cfg.telegram_max_file_size {
         bail!(
             "re-encoded segment {} is still too large after highest-bitrate repair: {} > {}",

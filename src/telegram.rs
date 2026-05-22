@@ -168,6 +168,8 @@ pub async fn upload_document(
     bot_index: i64,
     path: &Path,
     segment_key: String,
+    // max_file_size is typically cfg.telegram_max_file_size — user-configurable;
+    // raise if Telegram increases Bot API limits.
     max_file_size: u64,
 ) -> Result<UploadedFile> {
     let file_size = tokio::fs::metadata(path)

@@ -723,6 +723,7 @@ async fn try_re_upload_and_retry(
             *bot_idx,
             &tmp_path,
             segment_key_for_upload.to_string(),
+            // User-configurable; raise if Telegram increases Bot API limits.
             cfg.telegram_max_file_size,
         )
         .await;

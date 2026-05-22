@@ -449,6 +449,7 @@ async fn upload_outputs(
     result: &media::ProcessingResult,
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<(Vec<telegram::UploadedFile>, Option<i64>)> {
+    // cfg.telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
     let files = prepare_upload_files(&result.output_dir, cfg.telegram_max_file_size).await?;
     if files.is_empty() {
         bail!("no uploadable HLS output files found");
@@ -629,6 +630,7 @@ pub(super) async fn collect_upload_files(output_dir: &FsPath) -> Result<Vec<(Str
 
 async fn prepare_upload_files(
     output_dir: &FsPath,
+    // User-configurable; matches cfg.telegram_max_file_size. Raise if Telegram changes limits.
     max_file_size: u64,
 ) -> Result<Vec<(String, PathBuf)>> {
     let files = collect_upload_files(output_dir).await?;
