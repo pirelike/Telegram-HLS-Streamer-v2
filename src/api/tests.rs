@@ -609,6 +609,25 @@ async fn settings_get_post_and_reset_update_runtime_config() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(state.config.read().await.max_concurrent_jobs, 2);
 
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"DISK_CACHE_ENABLED":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_response(response).await;
+    assert_eq!(state.config.read().await.disk_cache_enabled, true);
+    let file_settings = body["categories"]["file_handling"]["settings"]
+        .as_array()
+        .unwrap();
+    assert!(file_settings
+        .iter()
+        .any(|s| s["key"] == "DISK_CACHE_ENABLED" && s["value"] == true));
+
     let app = router(state.clone());
     let response = app
         .oneshot(

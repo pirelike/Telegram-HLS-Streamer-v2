@@ -84,6 +84,12 @@ pub(super) async fn handle_post_settings(
     config::apply_normalized_settings(&mut new_cfg, &normalized);
     let response = settings_response(&new_cfg);
     store_config(&state, new_cfg, updates_encoder_settings(&normalized)).await;
+    if matches!(
+        normalized.get("DISK_CACHE_ENABLED").map(String::as_str),
+        Some("false")
+    ) {
+        state.cache.drop_disk_files().await;
+    }
     Json(response).into_response()
 }
 
@@ -143,6 +149,12 @@ pub(super) async fn handle_reset_settings(
     config::apply_normalized_settings(&mut new_cfg, &restored);
     let response = settings_response(&new_cfg);
     store_config(&state, new_cfg, resets_encoder_settings(&keys)).await;
+    if matches!(
+        restored.get("DISK_CACHE_ENABLED").map(String::as_str),
+        Some("false")
+    ) {
+        state.cache.drop_disk_files().await;
+    }
     Json(response).into_response()
 }
 

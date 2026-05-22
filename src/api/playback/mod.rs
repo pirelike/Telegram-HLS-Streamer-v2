@@ -28,10 +28,14 @@ async fn cache_entry_for_bytes(
     bytes: Vec<u8>,
 ) -> anyhow::Result<CacheEntry> {
     let bytes = bytes_for_key(response_key, bytes);
-    let path = write_cache_file(&cfg.cache_dir, cache_key, &bytes).await?;
+    let path = if cfg.disk_cache_enabled {
+        Some(write_cache_file(&cfg.cache_dir, cache_key, &bytes).await?)
+    } else {
+        None
+    };
     Ok(CacheEntry {
         bytes: Arc::new(bytes),
-        file_path: Some(path),
+        file_path: path,
         content_type: content_type_for(response_key),
     })
 }
