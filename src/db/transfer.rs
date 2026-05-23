@@ -7,9 +7,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection};
 
 use super::models::{
-    bool_to_i64, job_from_row, normalize_job_metadata, segment_from_row,
-    segment_part_export_from_row, track_from_row, DatabaseBackupResult, DbExport, MergeResult,
-    NewJob, ReplaceDatabaseResult, JOB_SELECT_SQL, SEGMENT_PART_SELECT_SQL, SEGMENT_SELECT_SQL,
+    bool_to_i64, external_metadata_from_row, job_from_row, job_metadata_link_from_row,
+    media_fingerprint_from_row, media_marker_from_row, normalize_job_metadata,
+    playback_progress_from_row, segment_from_row, segment_part_export_from_row,
+    series_metadata_link_from_row, track_from_row, DatabaseBackupResult, DbExport,
+    ExternalMetadataRow, JobMetadataLinkRow, MediaFingerprintRow, MediaMarkerRow, MergeResult,
+    NewJob, PlaybackProgressRow, ReplaceDatabaseResult, SeriesMetadataLinkRow,
+    EXTERNAL_METADATA_SELECT_SQL, JOB_SELECT_SQL, SEGMENT_PART_SELECT_SQL, SEGMENT_SELECT_SQL,
     TRACK_SELECT_SQL,
 };
 use super::{current_schema_revision, init_db, validate_sqlite_header};
@@ -49,7 +53,59 @@ pub fn export_to_dict(conn: &Connection) -> Result<DbExport> {
         tracks,
         segments,
         segment_parts,
+        external_metadata: export_external_metadata(conn)?,
+        job_metadata_links: export_job_metadata_links(conn)?,
+        series_metadata_links: export_series_metadata_links(conn)?,
+        playback_progress: export_playback_progress(conn)?,
+        media_markers: export_media_markers(conn)?,
+        media_fingerprints: export_media_fingerprints(conn)?,
     })
+}
+
+fn export_external_metadata(conn: &Connection) -> Result<Vec<ExternalMetadataRow>> {
+    let mut stmt = conn.prepare(&(EXTERNAL_METADATA_SELECT_SQL.to_owned() + " ORDER BY id ASC"))?;
+    let rows = stmt.query_map([], external_metadata_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+fn export_job_metadata_links(conn: &Connection) -> Result<Vec<JobMetadataLinkRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_id, metadata_id, role, created_at FROM job_metadata_links ORDER BY job_id ASC",
+    )?;
+    let rows = stmt.query_map([], job_metadata_link_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+fn export_series_metadata_links(conn: &Connection) -> Result<Vec<SeriesMetadataLinkRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT media_type, series_name, metadata_id, created_at FROM series_metadata_links ORDER BY media_type ASC, series_name ASC",
+    )?;
+    let rows = stmt.query_map([], series_metadata_link_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+fn export_playback_progress(conn: &Connection) -> Result<Vec<PlaybackProgressRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at FROM playback_progress ORDER BY client_id ASC, job_id ASC",
+    )?;
+    let rows = stmt.query_map([], playback_progress_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+fn export_media_markers(conn: &Connection) -> Result<Vec<MediaMarkerRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at FROM media_markers ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], media_marker_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+fn export_media_fingerprints(conn: &Connection) -> Result<Vec<MediaFingerprintRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at FROM media_fingerprints ORDER BY job_id ASC",
+    )?;
+    let rows = stmt.query_map([], media_fingerprint_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
 }
 
 pub fn merge_from_export(
@@ -163,6 +219,48 @@ pub fn merge_from_export(
                 prefix,
                 name
             ],
+        )?;
+    }
+    for progress in &export.playback_progress {
+        tx.execute(
+            "INSERT OR REPLACE INTO playback_progress(client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![progress.client_id, progress.job_id, progress.position_seconds, progress.duration_seconds, progress.progress_pct, bool_to_i64(progress.completed) as i64, progress.updated_at],
+        )?;
+    }
+    for meta in &export.external_metadata {
+        tx.execute(
+            "INSERT OR IGNORE INTO external_metadata(id, provider, provider_id, media_kind, title, original_title, overview, poster_url, backdrop_url, release_date, year, rating, raw_json, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![meta.id, meta.provider, meta.provider_id, meta.media_kind, meta.title, meta.original_title, meta.overview, meta.poster_url, meta.backdrop_url, meta.release_date, meta.year, meta.rating, meta.raw_json, meta.fetched_at],
+        )?;
+    }
+    for link in &export.job_metadata_links {
+        tx.execute(
+            "INSERT OR IGNORE INTO job_metadata_links(job_id, metadata_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![link.job_id, link.metadata_id, link.role, link.created_at],
+        )?;
+    }
+    for link in &export.series_metadata_links {
+        tx.execute(
+            "INSERT OR IGNORE INTO series_metadata_links(media_type, series_name, metadata_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![link.media_type, link.series_name, link.metadata_id, link.created_at],
+        )?;
+    }
+    for marker in &export.media_markers {
+        tx.execute(
+            "INSERT OR IGNORE INTO media_markers(id, job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![marker.id, marker.job_id, marker.marker_type, marker.start_seconds, marker.end_seconds, marker.source, marker.confidence, bool_to_i64(marker.enabled) as i64, marker.created_at, marker.updated_at],
+        )?;
+    }
+    for fp in &export.media_fingerprints {
+        tx.execute(
+            "INSERT OR IGNORE INTO media_fingerprints(job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![fp.job_id, fp.media_type, fp.series_name, fp.season_number, fp.duration_seconds, fp.fingerprint, fp.fingerprint_source, fp.created_at],
         )?;
     }
     tx.commit()?;

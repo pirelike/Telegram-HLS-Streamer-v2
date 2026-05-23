@@ -92,6 +92,12 @@ pub const SETTINGS: &[SettingSpec] = &[
     setting!("DB_AUTO_MERGE_FILE_ID", "DB_AUTO_MERGE_FILE_ID", "telegram", SettingType::Str, "", "Telegram file_id for DB auto-merge.", None, None),
     setting!("DB_AUTO_MERGE_BOT_INDEX", "DB_AUTO_MERGE_BOT_INDEX", "telegram", SettingType::Int, "0", "Bot index used for DB auto-merge.", Some(0), None),
     setting!("WEBHOOK_URL", "WEBHOOK_URL", "telegram", SettingType::Str, "", "POST terminal job events to this URL.", None, None),
+    setting!("TMDB_API_KEY", "TMDB_API_KEY", "metadata", SettingType::Str, "", "TMDB API key for movie/TV metadata fetching.", None, None),
+    setting!("METADATA_AUTO_FETCH_ENABLED", "METADATA_AUTO_FETCH_ENABLED", "metadata", SettingType::Bool, "false", "Automatically fetch metadata from providers after upload.", None, None),
+    setting!("METADATA_REFRESH_DAYS", "METADATA_REFRESH_DAYS", "metadata", SettingType::Int, "30", "Days before cached metadata is eligible for refresh.", Some(1), None),
+    setting!("INTRO_DETECTION_ENABLED", "INTRO_DETECTION_ENABLED", "metadata", SettingType::Bool, "true", "Enable automatic intro/outro marker detection.", None, None),
+    setting!("INTRO_CHROMAPRINT_ENABLED", "INTRO_CHROMAPRINT_ENABLED", "metadata", SettingType::Bool, "true", "Enable Chromaprint-based audio fingerprint detection for markers.", None, None),
+    setting!("TAC_COMMENTS_ENABLED", "TAC_COMMENTS_ENABLED", "metadata", SettingType::Bool, "true", "Enable Anime Community comment sections on watch pages.", None, None),
 ];
 
 pub fn is_public_setting_key(key: &str) -> bool {

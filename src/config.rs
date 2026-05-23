@@ -89,6 +89,13 @@ pub struct Config {
     pub db_auto_merge_bot_index: u32,
     pub webhook_url: String,
 
+    pub tmdb_api_key: String,
+    pub metadata_auto_fetch_enabled: bool,
+    pub metadata_refresh_days: u32,
+    pub intro_detection_enabled: bool,
+    pub intro_chromaprint_enabled: bool,
+    pub tac_comments_enabled: bool,
+
     pub abr_enabled: bool,
     pub enable_copy_mode: bool,
     pub virtual_abr_tiers: bool,
@@ -133,7 +140,7 @@ impl Default for Config {
             job_retention_days: 0,
             max_concurrent_jobs: 1,
             upload_rate_limit_window: 60,
-            upload_rate_limit_max_requests: 100,
+            upload_rate_limit_max_requests: 500,
             max_pending_uploads_per_ip: 5,
             watch_poll_seconds: 5,
             watch_stable_seconds: 30,
@@ -161,6 +168,12 @@ impl Default for Config {
             db_auto_merge_file_id: String::new(),
             db_auto_merge_bot_index: 0,
             webhook_url: String::new(),
+            tmdb_api_key: String::new(),
+            metadata_auto_fetch_enabled: false,
+            metadata_refresh_days: 30,
+            intro_detection_enabled: true,
+            intro_chromaprint_enabled: true,
+            tac_comments_enabled: true,
             abr_enabled: true,
             enable_copy_mode: true,
             virtual_abr_tiers: false,
@@ -247,6 +260,25 @@ impl Config {
             "DB_AUTO_MERGE_FILE_ID" => self.db_auto_merge_file_id.clone(),
             "DB_AUTO_MERGE_BOT_INDEX" => self.db_auto_merge_bot_index.to_string(),
             "WEBHOOK_URL" => self.webhook_url.clone(),
+            "TMDB_API_KEY" => {
+                let masked = if self.tmdb_api_key.len() > 4 {
+                    format!(
+                        "{}...{}",
+                        &self.tmdb_api_key[..2],
+                        &self.tmdb_api_key[self.tmdb_api_key.len() - 2..]
+                    )
+                } else if self.tmdb_api_key.is_empty() {
+                    String::new()
+                } else {
+                    "***".to_string()
+                };
+                masked
+            }
+            "METADATA_AUTO_FETCH_ENABLED" => self.metadata_auto_fetch_enabled.to_string(),
+            "METADATA_REFRESH_DAYS" => self.metadata_refresh_days.to_string(),
+            "INTRO_DETECTION_ENABLED" => self.intro_detection_enabled.to_string(),
+            "INTRO_CHROMAPRINT_ENABLED" => self.intro_chromaprint_enabled.to_string(),
+            "TAC_COMMENTS_ENABLED" => self.tac_comments_enabled.to_string(),
             "ABR_ENABLED" => self.abr_enabled.to_string(),
             "ENABLE_COPY_MODE" => self.enable_copy_mode.to_string(),
             "VIRTUAL_ABR_TIERS" => self.virtual_abr_tiers.to_string(),
@@ -389,6 +421,12 @@ fn apply_setting(cfg: &mut Config, key: &str, value: &str, source: &str) {
             "DB_AUTO_MERGE_FILE_ID" => cfg.db_auto_merge_file_id = value.to_string(),
             "DB_AUTO_MERGE_BOT_INDEX" => cfg.db_auto_merge_bot_index = parse_int(value)?,
             "WEBHOOK_URL" => cfg.webhook_url = value.to_string(),
+            "TMDB_API_KEY" => cfg.tmdb_api_key = value.to_string(),
+            "METADATA_AUTO_FETCH_ENABLED" => cfg.metadata_auto_fetch_enabled = parse_bool(value)?,
+            "METADATA_REFRESH_DAYS" => cfg.metadata_refresh_days = parse_int(value)?,
+            "INTRO_DETECTION_ENABLED" => cfg.intro_detection_enabled = parse_bool(value)?,
+            "INTRO_CHROMAPRINT_ENABLED" => cfg.intro_chromaprint_enabled = parse_bool(value)?,
+            "TAC_COMMENTS_ENABLED" => cfg.tac_comments_enabled = parse_bool(value)?,
             "ABR_ENABLED" => cfg.abr_enabled = parse_bool(value)?,
             "ENABLE_COPY_MODE" => cfg.enable_copy_mode = parse_bool(value)?,
             "VIRTUAL_ABR_TIERS" => cfg.virtual_abr_tiers = parse_bool(value)?,

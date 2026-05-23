@@ -219,6 +219,24 @@ Priorities: bug > guard > perf > feature.
 
 ## P6 — New Features
 
+- [x] **Continue watching (server-side)**
+  Playback progress is saved to the database per browser client via `/api/playback/progress`. The home page fetches in-progress items from the server and shows a "Continue Watching" section. Server progress takes precedence over localStorage fallback.
+
+- [x] **External metadata cache (TMDB, AniList)**
+  `/api/metadata/search` supports TMDB and AniList. Metadata can be linked to individual jobs or series. Poster images, backdrops, overviews, and external IDs are cached in `external_metadata`. Requires `TMDB_API_KEY` for TMDB; AniList is keyless. See `src/api/metadata.rs`.
+
+- [x] **Intro/outro marker detection**
+  Chapter-based detection parses FFprobe chapters for intro/opening/ending/credits markers. Chromaprint-based fingerprint comparison detects recurring audio across episodes in the same series/season. Markers stored in `media_markers`, fingerprints in `media_fingerprints`. Detection runs after job completion, non-fatal on failure. API at `/api/jobs/:job_id/markers`.
+
+- [x] **Anime Community comment embed**
+  Watch pages for `Anime TV` and `Anime Film` embed the official `https://theanimecommunity.com/embed.js` widget when an AniList or MAL ID is linked. Timestamp clicks seek the Shaka player. Controlled by `TAC_COMMENTS_ENABLED`. Film episodes use `episodeChapterNumber=0` for overview comments.
+
+- [ ] **Skip intro/outro button in Shaka player**
+  The markers API is ready. Add a "Skip intro" overlay button in `static/watch.js` when `currentTime` falls within an enabled intro marker. Seek to `marker.end_seconds` on click. Same pattern for outro/credits markers.
+
+- [ ] **Metadata search/link UI on upload/edit**
+  Backend metadata search/link APIs are ready. Add a search field in the upload metadata table and edit modal that lets the user pick a TMDB/AniList result and link it to the job.
+
 - [ ] **Remote URL ingest UI**
   `POST /api/ingest/url` exists, but `/upload` has no form for it. Add a small URL input on the upload page that submits a remote URL, shows the existing `downloading` job progress through `/api/status/:job_id`, and then reuses the normal processing/result UI.
 
@@ -246,13 +264,13 @@ Priorities: bug > guard > perf > feature.
 - [ ] **`cargo clippy --all-targets --all-features` emits warnings**
   Clippy exits successfully, but reports warnings for needless conversions/borrows, simple style issues, and a few too-many-arguments functions. Fix the mechanical warnings first; only refactor argument-heavy functions when it clearly reduces current complexity.
 
-- [ ] **Agent docs still contain placeholders and are out of sync**
-  `AGENTS.md:16-22` still has `[command]` placeholders despite canonical commands being documented later and in `README.md`. New Telegram limit / FFmpeg quality / oversized segment rules exist in `AGENTS.md` but not in `CODEX.md` and `CLAUDE.md`, despite the sync rule. Fill the command section and synchronize agent docs.
+- [x] **Agent docs still contain placeholders and are out of sync**
+  `AGENTS.md` now has canonical commands and project overview. New Telegram limit / FFmpeg quality / oversized segment rules exist in `AGENTS.md`. Agent docs are synced.
 
 ### Current Verification Baseline
-- `cargo test` passes: 127 passed, 1 ignored.
-- `cargo fmt --check` fails with formatting drift.
-- `cargo clippy --all-targets --all-features` completes with warnings.
+- `cargo test` passes: 129 passed, 1 ignored.
+- `cargo fmt --check` passes.
+- `cargo clippy --all-targets --all-features` completes with warnings (no errors).
 
 ---
 

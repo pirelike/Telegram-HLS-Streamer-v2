@@ -1,11 +1,13 @@
 mod analysis;
 mod encoder;
+mod markers;
 mod models;
 mod process;
 mod tiers;
 
 pub use analysis::*;
 pub use encoder::*;
+pub use markers::*;
 pub use models::*;
 pub use process::*;
 pub use tiers::*;

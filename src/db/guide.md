@@ -38,6 +38,7 @@ db/ ──► {rusqlite, settings_registry}
 - Reusable DB query functions used by API/config code.
 - DB row/input/result structs that represent persisted data.
 - Import/export/backup/replacement logic for SQLite files.
+- External metadata cache, playback progress, media markers, and fingerprint persistence.
 
 ## What does not belong here
 

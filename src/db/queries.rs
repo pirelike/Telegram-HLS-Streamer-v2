@@ -4,10 +4,15 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::models::{
-    bool_to_i64, job_filter_sql, job_from_row, normalize_job_metadata, segment_from_row,
-    track_from_row, BotWorkload, DbBotRow, JobListFilter, JobRow, NewJob, NewSegment,
-    NewSegmentPart, NewTrack, SeasonGroupRow, SegmentLookup, SegmentPartLookup, SegmentRow,
-    SeriesGroupRow, TrackRow, JOB_SELECT_SQL, SEGMENT_SELECT_SQL, TRACK_SELECT_SQL,
+    bool_to_i64, external_metadata_from_row, job_filter_sql, job_from_row,
+    job_metadata_link_from_row, media_fingerprint_from_row, media_marker_from_row,
+    normalize_job_metadata, playback_progress_from_row, segment_from_row,
+    series_metadata_link_from_row, track_from_row, BotWorkload, DbBotRow, ExternalMetadataRow,
+    JobListFilter, JobMetadataLinkRow, JobRow, MediaFingerprintRow, MediaMarkerRow,
+    NewExternalMetadata, NewJob, NewMediaFingerprint, NewMediaMarker, NewPlaybackProgress,
+    NewSegment, NewSegmentPart, NewTrack, PlaybackProgressRow, SeasonGroupRow, SegmentLookup,
+    SegmentPartLookup, SegmentRow, SeriesGroupRow, SeriesMetadataLinkRow, TrackRow,
+    EXTERNAL_METADATA_SELECT_SQL, JOB_SELECT_SQL, SEGMENT_SELECT_SQL, TRACK_SELECT_SQL,
 };
 
 fn setting_value_type(key: &str) -> Result<&'static str> {
@@ -840,4 +845,347 @@ pub fn record_db_sync_upload(
         params![snapshot_id, bot_index, part_index, file_id, file_size as i64],
     )?;
     Ok(())
+}
+
+// --- External metadata ---
+
+pub fn save_external_metadata(conn: &Connection, meta: &NewExternalMetadata) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO external_metadata(provider, provider_id, media_kind, title, original_title, overview, poster_url, backdrop_url, release_date, year, rating, raw_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(provider, provider_id, media_kind) DO UPDATE SET
+            title=excluded.title,
+            original_title=excluded.original_title,
+            overview=excluded.overview,
+            poster_url=excluded.poster_url,
+            backdrop_url=excluded.backdrop_url,
+            release_date=excluded.release_date,
+            year=excluded.year,
+            rating=excluded.rating,
+            raw_json=excluded.raw_json,
+            fetched_at=CURRENT_TIMESTAMP",
+        params![
+            meta.provider,
+            meta.provider_id,
+            meta.media_kind,
+            meta.title,
+            meta.original_title,
+            meta.overview,
+            meta.poster_url,
+            meta.backdrop_url,
+            meta.release_date,
+            meta.year,
+            meta.rating,
+            meta.raw_json,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_external_metadata(
+    conn: &Connection,
+    provider: &str,
+    provider_id: &str,
+    media_kind: &str,
+) -> Result<Option<ExternalMetadataRow>> {
+    let sql = format!(
+        "{} WHERE provider = ?1 AND provider_id = ?2 AND media_kind = ?3",
+        EXTERNAL_METADATA_SELECT_SQL
+    );
+    conn.query_row(
+        &sql,
+        params![provider, provider_id, media_kind],
+        external_metadata_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_external_metadata_by_id(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<ExternalMetadataRow>> {
+    let sql = format!("{} WHERE id = ?1", EXTERNAL_METADATA_SELECT_SQL);
+    conn.query_row(&sql, params![id], external_metadata_from_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+pub fn list_external_metadata(conn: &Connection) -> Result<Vec<ExternalMetadataRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "{} ORDER BY fetched_at DESC",
+        EXTERNAL_METADATA_SELECT_SQL
+    ))?;
+    let rows = stmt.query_map([], external_metadata_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+pub fn link_job_metadata(
+    conn: &Connection,
+    job_id: &str,
+    metadata_id: i64,
+    role: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO job_metadata_links(job_id, metadata_id, role)
+         VALUES (?1, ?2, ?3)",
+        params![job_id, metadata_id, role],
+    )?;
+    Ok(())
+}
+
+pub fn get_job_metadata_links(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Vec<(JobMetadataLinkRow, ExternalMetadataRow)>> {
+    let mut stmt = conn.prepare(
+        "SELECT jml.job_id, jml.metadata_id, jml.role, jml.created_at,
+                em.id, em.provider, em.provider_id, em.media_kind, em.title, em.original_title,
+                em.overview, em.poster_url, em.backdrop_url, em.release_date, em.year, em.rating,
+                em.raw_json, em.fetched_at
+         FROM job_metadata_links jml
+         JOIN external_metadata em ON em.id = jml.metadata_id
+         WHERE jml.job_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![job_id], |r| {
+        Ok((
+            job_metadata_link_from_row(r)?,
+            external_metadata_from_row_aligned(r, 4)?,
+        ))
+    })?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+fn external_metadata_from_row_aligned(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<ExternalMetadataRow> {
+    Ok(ExternalMetadataRow {
+        id: row.get(offset)?,
+        provider: row.get(offset + 1)?,
+        provider_id: row.get(offset + 2)?,
+        media_kind: row.get(offset + 3)?,
+        title: row.get(offset + 4)?,
+        original_title: row.get(offset + 5)?,
+        overview: row.get(offset + 6)?,
+        poster_url: row.get(offset + 7)?,
+        backdrop_url: row.get(offset + 8)?,
+        release_date: row.get(offset + 9)?,
+        year: row.get(offset + 10)?,
+        rating: row.get(offset + 11)?,
+        raw_json: row.get(offset + 12)?,
+        fetched_at: row.get(offset + 13)?,
+    })
+}
+
+pub fn link_series_metadata(
+    conn: &Connection,
+    media_type: &str,
+    series_name: &str,
+    metadata_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO series_metadata_links(media_type, series_name, metadata_id)
+         VALUES (?1, ?2, ?3)",
+        params![media_type, series_name, metadata_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_series_metadata_link(
+    conn: &Connection,
+    media_type: &str,
+    series_name: &str,
+) -> Result<Option<(SeriesMetadataLinkRow, ExternalMetadataRow)>> {
+    conn.query_row(
+        "SELECT sml.media_type, sml.series_name, sml.metadata_id, sml.created_at,
+                em.id, em.provider, em.provider_id, em.media_kind, em.title, em.original_title,
+                em.overview, em.poster_url, em.backdrop_url, em.release_date, em.year, em.rating,
+                em.raw_json, em.fetched_at
+         FROM series_metadata_links sml
+         JOIN external_metadata em ON em.id = sml.metadata_id
+         WHERE sml.media_type = ?1 AND sml.series_name = ?2",
+        params![media_type, series_name],
+        |r| {
+            Ok((
+                series_metadata_link_from_row(r)?,
+                external_metadata_from_row_aligned(r, 4)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+// --- Playback progress ---
+
+pub fn save_playback_progress(conn: &Connection, progress: &NewPlaybackProgress) -> Result<()> {
+    let pct = if progress.duration_seconds > 0.0 {
+        ((progress.position_seconds / progress.duration_seconds) * 100.0).round() as i64
+    } else {
+        0
+    };
+    let pct = pct.clamp(0, 100);
+    let completed = pct >= 95;
+    conn.execute(
+        "INSERT INTO playback_progress(client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+         ON CONFLICT(client_id, job_id) DO UPDATE SET
+            position_seconds=excluded.position_seconds,
+            duration_seconds=excluded.duration_seconds,
+            progress_pct=excluded.progress_pct,
+            completed=excluded.completed,
+            updated_at=CURRENT_TIMESTAMP",
+        params![
+            progress.client_id,
+            progress.job_id,
+            progress.position_seconds,
+            progress.duration_seconds,
+            pct,
+            bool_to_i64(completed) as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_playback_progress(
+    conn: &Connection,
+    client_id: &str,
+    job_id: &str,
+) -> Result<Option<PlaybackProgressRow>> {
+    conn.query_row(
+        "SELECT client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
+         FROM playback_progress WHERE client_id = ?1 AND job_id = ?2",
+        params![client_id, job_id],
+        playback_progress_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn list_playback_progress(
+    conn: &Connection,
+    client_id: &str,
+) -> Result<Vec<PlaybackProgressRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
+         FROM playback_progress WHERE client_id = ?1 AND completed = 0
+         ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map(params![client_id], playback_progress_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+pub fn delete_playback_progress(conn: &Connection, client_id: &str, job_id: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM playback_progress WHERE client_id = ?1 AND job_id = ?2",
+        params![client_id, job_id],
+    )? > 0)
+}
+
+// --- Media markers ---
+
+pub fn save_media_markers(
+    conn: &Connection,
+    job_id: &str,
+    markers: &[NewMediaMarker],
+) -> Result<()> {
+    for marker in markers {
+        conn.execute(
+            "INSERT INTO media_markers(job_id, marker_type, start_seconds, end_seconds, source, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                job_id,
+                marker.marker_type,
+                marker.start_seconds,
+                marker.end_seconds,
+                marker.source,
+                marker.confidence,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn get_media_markers(
+    conn: &Connection,
+    job_id: &str,
+    enabled_only: bool,
+) -> Result<Vec<MediaMarkerRow>> {
+    let sql = if enabled_only {
+        "SELECT id, job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at
+         FROM media_markers WHERE job_id = ?1 AND enabled = 1 ORDER BY start_seconds ASC"
+    } else {
+        "SELECT id, job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at
+         FROM media_markers WHERE job_id = ?1 ORDER BY start_seconds ASC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![job_id], media_marker_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+pub fn delete_media_markers(conn: &Connection, job_id: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM media_markers WHERE job_id = ?1",
+        params![job_id],
+    )?)
+}
+
+// --- Media fingerprints ---
+
+pub fn save_media_fingerprint(conn: &Connection, fp: &NewMediaFingerprint) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO media_fingerprints(job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)",
+        params![
+            fp.job_id,
+            fp.media_type,
+            fp.series_name,
+            fp.season_number,
+            fp.duration_seconds,
+            fp.fingerprint,
+            fp.fingerprint_source,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_media_fingerprint(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Option<MediaFingerprintRow>> {
+    conn.query_row(
+        "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at
+         FROM media_fingerprints WHERE job_id = ?1",
+        params![job_id],
+        media_fingerprint_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_media_fingerprints_for_series(
+    conn: &Connection,
+    media_type: &str,
+    series_name: &str,
+    season_number: Option<i64>,
+) -> Result<Vec<MediaFingerprintRow>> {
+    let mut stmt = match season_number {
+        Some(_) => conn.prepare(
+            "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at
+             FROM media_fingerprints WHERE media_type = ?1 AND series_name = ?2 AND season_number = ?3 ORDER BY created_at ASC",
+        )?,
+        None => conn.prepare(
+            "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at
+             FROM media_fingerprints WHERE media_type = ?1 AND series_name = ?2 AND season_number IS NULL ORDER BY created_at ASC",
+        )?,
+    };
+    let rows = match season_number {
+        Some(sn) => stmt.query_map(
+            params![media_type, series_name, sn],
+            media_fingerprint_from_row,
+        )?,
+        None => stmt.query_map(params![media_type, series_name], media_fingerprint_from_row)?,
+    };
+    rows.map(|r| r.map_err(Into::into)).collect()
 }

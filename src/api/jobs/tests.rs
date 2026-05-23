@@ -39,6 +39,7 @@ fn sample_analysis(source: PathBuf) -> media::MediaAnalysis {
             language: "eng".into(),
             title: "Signs".into(),
         }],
+        raw_ffprobe_json: None,
     }
 }
 

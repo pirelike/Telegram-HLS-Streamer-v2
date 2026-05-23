@@ -9,10 +9,13 @@ HTTP layer for THLS. This folder owns Axum routes, request/response shaping, bro
 | `mod.rs` | file | Router definition, `AppState`, health/metrics endpoints, shared API helpers. | 232 |
 | `bots_settings.rs` | file | Settings CRUD and bot-management endpoints. | 343 |
 | `db_transfer.rs` | file | DB export/import/backup/load endpoints. | 386 |
-| `frontend.rs` | file | Server-rendered HTML pages and small HTML helpers. | 630 |
+| `frontend.rs` | file | Server-rendered HTML pages and small HTML helpers. | 775 |
 | `jobs/` | dir | Job lifecycle and jobs REST API. Read `jobs/guide.md`. | ~1962 |
+| `markers.rs` | file | Media marker endpoint: intro/outro for Shaka skip UI. | 24 |
+| `metadata.rs` | file | External metadata cache/search/link API (TMDB, AniList). | 413 |
 | `playback/` | dir | Segment serving, cache, real/virtual segment fetches. Read `playback/guide.md`. | ~1151 |
 | `playlists.rs` | file | HLS master/media/subtitle/virtual playlist generation and thumbnail route. | 734 |
+| `progress.rs` | file | Browser-client playback progress persistence API. | 218 |
 | `tests.rs` | file | Cross-API integration tests and shared API test helpers. | 1038 |
 | `uploads.rs` | file | Chunked resumable upload protocol and pending-upload cleanup. | 528 |
 | `watch_folder.rs` | file | Watch-folder settings, scanning, and auto-enqueue flow. | 400 |
@@ -65,6 +68,9 @@ The API layer may orchestrate other modules. Lower-level modules (`db`, `media`,
 | Add/change HLS playlist output | `playlists.rs`, then route in `mod.rs` if a new endpoint is needed. |
 | Change job metadata fields | `jobs/types.rs`, `jobs/handlers.rs`, and the DB model/query layer. |
 | Change HTML layout or page markup | `frontend.rs` and static assets if needed. |
+| Add external metadata provider | `metadata.rs` and `src/db/`. |
+| Change playback progress persistence | `progress.rs` and `src/db/`. |
+| Add media markers (intro/outro) | `markers.rs`, `src/media/markers.rs`, `src/db/`. |
 
 ## Conventions
 

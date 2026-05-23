@@ -110,6 +110,21 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         name: "remove_public_hls_segment_duration",
         run: run_migration_20,
     },
+    Migration {
+        revision: 21,
+        name: "add_external_metadata_tables",
+        run: run_migration_21,
+    },
+    Migration {
+        revision: 22,
+        name: "add_playback_progress_table",
+        run: run_migration_22,
+    },
+    Migration {
+        revision: 23,
+        name: "add_media_markers_tables",
+        run: run_migration_23,
+    },
 ];
 
 // Public wrappers for test access
@@ -172,6 +187,15 @@ pub(crate) fn run_migration_19(conn: &Connection) -> Result<()> {
 }
 pub(crate) fn run_migration_20(conn: &Connection) -> Result<()> {
     migration_20_remove_public_hls_segment_duration(conn)
+}
+pub(crate) fn run_migration_21(conn: &Connection) -> Result<()> {
+    migration_21_add_external_metadata_tables(conn)
+}
+pub(crate) fn run_migration_22(conn: &Connection) -> Result<()> {
+    migration_22_add_playback_progress_table(conn)
+}
+pub(crate) fn run_migration_23(conn: &Connection) -> Result<()> {
+    migration_23_add_media_markers_tables(conn)
 }
 
 fn table_sql_contains(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
@@ -1039,6 +1063,95 @@ fn migration_20_remove_public_hls_segment_duration(conn: &Connection) -> Result<
     conn.execute(
         "DELETE FROM settings WHERE key = 'HLS_SEGMENT_DURATION'",
         [],
+    )?;
+    Ok(())
+}
+
+fn migration_21_add_external_metadata_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS external_metadata (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL CHECK (provider IN ('tmdb','anilist','mal')),
+            provider_id TEXT NOT NULL,
+            media_kind TEXT NOT NULL CHECK (media_kind IN ('movie','tv','anime','manga')),
+            title TEXT NOT NULL DEFAULT '',
+            original_title TEXT NOT NULL DEFAULT '',
+            overview TEXT NOT NULL DEFAULT '',
+            poster_url TEXT NOT NULL DEFAULT '',
+            backdrop_url TEXT NOT NULL DEFAULT '',
+            release_date TEXT NOT NULL DEFAULT '',
+            year INTEGER,
+            rating REAL,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(provider, provider_id, media_kind)
+        );
+        CREATE TABLE IF NOT EXISTS job_metadata_links (
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            metadata_id INTEGER NOT NULL REFERENCES external_metadata(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK (role IN ('primary','episode')),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(job_id, role)
+        );
+        CREATE TABLE IF NOT EXISTS series_metadata_links (
+            media_type TEXT NOT NULL,
+            series_name TEXT NOT NULL,
+            metadata_id INTEGER NOT NULL REFERENCES external_metadata(id) ON DELETE CASCADE,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(media_type, series_name)
+        );",
+    )?;
+    Ok(())
+}
+
+fn migration_22_add_playback_progress_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS playback_progress (
+            client_id TEXT NOT NULL,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            position_seconds REAL NOT NULL CHECK (position_seconds >= 0),
+            duration_seconds REAL NOT NULL CHECK (duration_seconds >= 0),
+            progress_pct INTEGER NOT NULL CHECK (progress_pct >= 0 AND progress_pct <= 100),
+            completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0,1)),
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(client_id, job_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_playback_progress_client_updated
+        ON playback_progress(client_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_playback_progress_job
+        ON playback_progress(job_id);",
+    )?;
+    Ok(())
+}
+
+fn migration_23_add_media_markers_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS media_markers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            marker_type TEXT NOT NULL CHECK (marker_type IN ('intro','outro','recap','preview','credits')),
+            start_seconds REAL NOT NULL CHECK (start_seconds >= 0),
+            end_seconds REAL NOT NULL CHECK (end_seconds > start_seconds),
+            source TEXT NOT NULL CHECK (source IN ('chapter','chromaprint','silence','manual')),
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK (confidence >= 0 AND confidence <= 1),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_markers_job_type
+        ON media_markers(job_id, marker_type);
+        CREATE TABLE IF NOT EXISTS media_fingerprints (
+            job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+            media_type TEXT NOT NULL,
+            series_name TEXT NOT NULL,
+            season_number INTEGER,
+            duration_seconds REAL NOT NULL,
+            fingerprint TEXT NOT NULL,
+            fingerprint_source TEXT NOT NULL DEFAULT 'chromaprint',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_fingerprints_series
+        ON media_fingerprints(media_type, series_name, season_number);",
     )?;
     Ok(())
 }

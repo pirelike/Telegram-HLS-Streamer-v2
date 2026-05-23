@@ -8,41 +8,39 @@
 
 ## Project overview
 
-[Replace with 2–4 sentences describing what this project does, its
-language/runtime, and the deployment target.]
+THLS is a single-process Telegram-backed HLS media streamer written in Rust (Axum/SQLite/FFmpeg). It accepts video uploads, processes them with FFmpeg into HLS segments, stores them in Telegram, keeps metadata in SQLite, and serves a web UI for browsing, playback, settings, bot management, watch-folder ingest, and database transfer. New features include server-side playback progress, external metadata (TMDB/AniList), intro/outro marker detection, and Anime Community comment embeds.
 
 ## Build, test, and lint commands
 
-- **Install:** `[command]`
-- **Build:** `[command]`
-- **Test (canonical):** `[command]`
-- **Test (single file):** `[command]`
-- **Lint:** `[command]`
-- **Type-check:** `[command]`
-- **Format:** `[command]`
+- **Build:** `cargo build`
+- **Test (canonical):** `cargo test`
+- **Test (single file):** `cargo test --test <name>` (integration) or `cargo test -- <module>::<test>` (unit)
+- **Lint:** `cargo clippy --all-targets --all-features`
+- **Format:** `cargo fmt --check` (apply with `cargo fmt`)
 
-These are the canonical verification commands. The investigator should cite
-this section when reporting verification commands to the planner.
+These are the canonical verification commands. The investigator should cite this section when reporting verification commands to the planner.
 
 ## Conventions
 
-- **Style:** [e.g., "We use 2-space indentation; semicolons required."]
-- **Imports:** [e.g., "Absolute imports via `@/` alias; no deep relative paths."]
-- **File naming:** [e.g., "kebab-case for files, PascalCase for components."]
-- **Test naming:** [e.g., "Co-located `*.test.ts` files; no top-level `__tests__/`."]
-- **Error handling:** [e.g., "Throw typed errors from `lib/errors.ts`; never bare `throw new Error(...)`."]
+- **Style:** Rust 2021 edition, `rustfmt` default config, no `#[allow]` unless justified.
+- **Imports:** `pub use` at module root for public API; `pub(super)` for sibling submodules; `use crate::` for cross-top-level-module access.
+- **File naming:** `snake_case` for Rust files, `kebab-case` for JS/CSS.
+- **Test naming:** Tests integrated into `mod.rs` tests or in `tests.rs` per module.
+- **Error handling:** `anyhow::Result` in lib/app code; typed errors with `api_error()` helper in API handlers.
 
 ## Architecture invariants
 
-- [Anything that should never change without explicit discussion.
-  Examples: "All public API calls go through `src/api/client.ts`."
-  "Database access only via the repository layer in `src/db/`."]
+- DB access only through `src/db/` query functions; no raw SQL in API handlers.
+- Media processing only in `src/media/`; no HTTP or DB logic there.
+- Telegram API calls only through `src/telegram.rs`.
+- API routes registered in `src/api/mod.rs`; handlers in dedicated modules.
+- Static assets in `static/` served via `tower_http::ServeDir`.
 
 ## Do-not-touch zones
 
-- [Paths where edits require special caution. Examples:
-  `src/migrations/` — never modify existing migration files.
-  `config/secrets/` — read-only; values are populated at deploy time.]
+- `src/db/migrations.rs` — never modify existing migration functions; only add new ones.
+- `streamer.db`, `streamer.db-*`, `uploads/`, `processing/`, `cache/`, `target/` — runtime data, not source code.
+- `TEST_FILE.mkv` — test artifact, not documentation.
 
 ## Agent guidance
 

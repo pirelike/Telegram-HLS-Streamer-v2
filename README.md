@@ -1,6 +1,6 @@
 # THLS
 
-THLS is a single-process Telegram-backed HLS media streamer written in Rust. It accepts video uploads, processes them with FFmpeg, stores HLS outputs in Telegram, keeps metadata in SQLite, and serves a small web UI plus HTTP APIs for browsing, playback, settings, bot management, watch-folder ingest, and database transfer.
+THLS is a single-process Telegram-backed HLS media streamer written in Rust. It accepts video uploads, processes them with FFmpeg, stores HLS outputs in Telegram, keeps metadata in SQLite, and serves a small web UI plus HTTP APIs for browsing, playback, settings, bot management, watch-folder ingest, external metadata enrichment, playback progress tracking, intro/outro detection, Anime Community comments, and database transfer.
 
 The project is intentionally simple operationally: one Rust server process, one SQLite database, local temporary working directories, and Telegram as durable segment storage.
 
@@ -62,6 +62,11 @@ Common `.env` values:
 | `ABR_ENABLED` | `true` | Produce eager ABR tiers. |
 | `ENABLE_COPY_MODE` | `true` | Use source passthrough tier when possible. |
 | `VIRTUAL_ABR_TIERS` | `false` | Transcode lower tiers on demand. |
+| `TMDB_API_KEY` | unset | TMDB API key for movie/TV metadata. |
+| `METADATA_AUTO_FETCH_ENABLED` | `false` | Auto-fetch metadata after upload. |
+| `INTRO_DETECTION_ENABLED` | `true` | Auto-detect intro/outro markers from chapters. |
+| `INTRO_CHROMAPRINT_ENABLED` | `true` | Use Chromaprint audio fingerprints for intro detection. |
+| `TAC_COMMENTS_ENABLED` | `true` | Show Anime Community comments on anime watch pages. |
 | `RUST_LOG` | `info` | Logging filter. |
 
 For the full live setting registry, see `src/settings_registry.rs`. For the full intended contract, see `REBUILD.md`.
@@ -104,6 +109,22 @@ Segments are served through `/segment/<job_id>/<segment_key>`. The server retrie
 The API uses SQLite `.db` files for database transfer. Normal import merges jobs, tracks, segments, and split segment parts into the active database without replacing local rows. The separate database-load flow replaces the live SQLite file and creates a backup first.
 
 When `DB_SYNC_ENABLED=true`, each completed job creates a dated SQLite snapshot and uploads it with every configured Telegram bot. The latest snapshot descriptor is written to `DB_SYNC_BOOTSTRAP` for bootstrap restore on another server.
+
+### Playback Progress
+
+The watch page saves playback position to the server and resumes on next visit. Progress is tracked per-browser via a random client ID stored in localStorage. The home page shows a "Continue Watching" section for videos that have been partially watched.
+
+### External Metadata
+
+Set `TMDB_API_KEY` to enable TMDB search and metadata enrichment for movies and TV shows. Anime metadata uses the free AniList GraphQL API. Once linked, poster images, backdrops, descriptions, and external IDs are cached in SQLite and shown on browse and watch pages.
+
+### Intro/Outro Markers
+
+When enabled, the server extracts chapter markers from source files and can detect recurring intro/outro audio patterns across episodes using Chromaprint fingerprinting. Markers are stored in the database and available via the markers API for player skip UI.
+
+### Anime Community Comments
+
+Anime TV and Anime Film watch pages embed the official Anime Community comment section when an AniList or MAL ID is linked to the job. Clicking a timestamp in the comments seeks the player to that time.
 
 ### Bot Management
 
@@ -159,6 +180,13 @@ Core API routes:
 | `POST /api/db/import` | Merge an uploaded SQLite `.db` file. |
 | `POST /api/database/load` | Replace the live SQLite DB from an uploaded DB file. |
 | `GET /api/metrics` | Queue, cache, and Telegram metrics. |
+| `GET /api/metadata/search?provider=tmdb&q=...` | Search TMDB or AniList for metadata. |
+| `POST /api/jobs/:job_id/metadata/link` | Link a job to cached external metadata. |
+| `POST /api/series/metadata/link` | Link a series to cached external metadata. |
+| `POST /api/metadata/:metadata_id/refresh` | Refresh cached metadata from provider. |
+| `GET/POST /api/playback/progress/:job_id` | Read or save playback progress for a browser client. |
+| `GET /api/playback/progress` | List all in-progress items for a client. |
+| `GET /api/jobs/:job_id/markers` | Read intro/outro skip markers for a job. |
 
 HLS and media routes:
 
@@ -182,7 +210,7 @@ Source layout:
 | `src/db/` | SQLite schema, migrations, queries, and DB transfer helpers. |
 | `src/media/` | ffprobe analysis, ABR tier selection, encoder probing, and FFmpeg processing. |
 | `src/telegram.rs` | Telegram upload/download runtime. |
-| `src/api/` | Axum router, page handlers, APIs, playback, playlists, uploads, jobs, watch-folder, DB transfer. See nested `guide.md` files for split modules. |
+| `src/api/` | Axum router, page handlers, APIs, playback, playlists, uploads, jobs, watch-folder, DB transfer, metadata, progress, markers. See nested `guide.md` files for split modules. |
 | `static/` | Browser UI CSS and JavaScript. |
 | `scripts/upload_and_wait.py` | Manual upload/process/playback smoke test helper. |
 

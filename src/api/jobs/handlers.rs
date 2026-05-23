@@ -459,6 +459,24 @@ pub async fn handle_cancel_job(
     Json(json!({ "job_id": job_id, "status": "cancelled", "message": "cancelled" })).into_response()
 }
 
+pub async fn handle_active_jobs(State(state): State<Arc<AppState>>) -> Response {
+    let jobs = state.jobs.lock().await;
+    let active: Vec<Value> = jobs
+        .values()
+        .filter(|j| !j.status.is_terminal())
+        .map(|j| {
+            json!({
+                "job_id": j.job_id,
+                "status": j.status.as_str(),
+                "progress": j.progress,
+                "description": j.description,
+                "filename": j.filename,
+            })
+        })
+        .collect();
+    Json(json!({ "jobs": active })).into_response()
+}
+
 pub async fn queue_metrics(state: &AppState) -> Value {
     let cfg = state.config.read().await;
     let jobs = state.jobs.lock().await;

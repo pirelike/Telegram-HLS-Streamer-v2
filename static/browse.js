@@ -227,6 +227,10 @@ function renderCard(j, type) {
             ${thumbHtml}
             <div class="thumb-placeholder" style="${placeholderStyle}"><i class="material-icons-round">play_circle_filled</i></div>
             ${dur ? `<div class="thumb-duration">${dur}</div>` : ''}
+            ${j.progress_pct && j.progress_pct > 0 && j.progress_pct < 100 
+                ? `<div class="thumb-progress-bg"><div class="thumb-progress-fg" style="width:${j.progress_pct}%"></div></div>` 
+                : ''}
+        </div>
         </div>
         <div class="card-meta">
             <div class="card-title">${title}</div>

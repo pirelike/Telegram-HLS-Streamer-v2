@@ -3,8 +3,11 @@ pub(crate) mod db_transfer;
 mod frontend;
 mod ingest;
 pub(crate) mod jobs;
+mod markers;
+mod metadata;
 mod playback;
 mod playlists;
+mod progress;
 mod uploads;
 mod watch_folder;
 
@@ -119,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/watch/:job_id", get(frontend::handle_watch_page))
         .nest_service("/static", ServeDir::new("static"))
         .route("/api/jobs", get(handle_list_jobs))
+        .route("/api/jobs/active", get(jobs::handle_active_jobs))
         .route(
             "/api/jobs/:job_id",
             get(handle_get_job)
@@ -176,6 +180,33 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(handle_database_load).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/metrics", get(handle_metrics))
+        .route(
+            "/api/playback/progress",
+            get(progress::handle_list_progress),
+        )
+        .route(
+            "/api/playback/progress/:job_id",
+            get(progress::handle_get_progress)
+                .post(progress::handle_save_progress)
+                .delete(progress::handle_delete_progress),
+        )
+        .route("/api/metadata/search", get(metadata::handle_search))
+        .route(
+            "/api/metadata/:metadata_id/refresh",
+            post(metadata::handle_refresh),
+        )
+        .route(
+            "/api/jobs/:job_id/metadata/link",
+            post(metadata::handle_link_job),
+        )
+        .route(
+            "/api/series/metadata/link",
+            post(metadata::handle_link_series),
+        )
+        .route(
+            "/api/jobs/:job_id/markers",
+            get(markers::handle_get_markers),
+        )
         .route("/hls/:job_id/master.m3u8", get(playlists::handle_master))
         .route(
             "/hls/:job_id/video.m3u8",
