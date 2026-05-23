@@ -464,6 +464,7 @@ mod tests {
             watch_seen: Mutex::new(HashMap::new()),
             pending_uploads: Mutex::new(HashMap::new()),
             upload_rate_limits: Mutex::new(HashMap::new()),
+            db_sync_lock: Mutex::new(()),
             jobs: Mutex::new(HashMap::new()),
             played_segments: Mutex::new(HashMap::new()),
             job_queue,

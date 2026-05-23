@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, db_unavailable, AppState};
-use crate::{config::Config, db, telegram};
+use crate::{config::Config, db, env_writer, telegram};
 
 #[derive(Debug, Deserialize)]
 struct ExportRequest {
@@ -21,10 +21,24 @@ struct ExportRequest {
 
 #[derive(Debug, Deserialize)]
 struct ImportJsonRequest {
-    file_id: String,
-    bot_index: i64,
-    #[serde(default)]
-    bot_index_map: Option<HashMap<i64, i64>>,
+    file_id: Option<String>,
+    bot_index: Option<i64>,
+}
+
+struct DbSnapshot {
+    id: String,
+    filename: String,
+    path: PathBuf,
+    size_bytes: u64,
+    schema_revision: i64,
+}
+
+struct SnapshotUploadResult {
+    snapshot_id: String,
+    filename: String,
+    size_bytes: u64,
+    uploads: Vec<serde_json::Value>,
+    failed_bots: Vec<serde_json::Value>,
 }
 
 pub(super) async fn handle_db_export(
@@ -48,24 +62,8 @@ pub(super) async fn handle_db_export(
         true
     };
 
-    let export = {
-        let conn = match state.db_conn().await {
-            Ok(conn) => conn,
-            Err(e) => return db_unavailable(e),
-        };
-        match db::export_to_dict(&conn) {
-            Ok(export) => export,
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "db_export_failed",
-                    e.to_string(),
-                )
-            }
-        }
-    };
-    let bytes = match serde_json::to_vec_pretty(&export) {
-        Ok(bytes) => bytes,
+    let snapshot = match create_db_snapshot(state.clone(), "manual").await {
+        Ok(snapshot) => snapshot,
         Err(e) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -76,11 +74,23 @@ pub(super) async fn handle_db_export(
     };
 
     if !upload_to_telegram {
-        let filename = format!("streamer-export-{}.json", unix_ts());
+        let bytes = match tokio::fs::read(&snapshot.path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&snapshot.path).await;
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db_export_failed",
+                    e.to_string(),
+                );
+            }
+        };
+        let filename = snapshot.filename.clone();
+        let _ = tokio::fs::remove_file(&snapshot.path).await;
         let mut response = bytes.into_response();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
+            HeaderValue::from_static("application/vnd.sqlite3"),
         );
         response.headers_mut().insert(
             header::CONTENT_DISPOSITION,
@@ -90,40 +100,13 @@ pub(super) async fn handle_db_export(
         return response;
     }
 
-    let cfg = state.config.read().await.clone();
-    let Some(bot) = cfg.bots.first().cloned() else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "no_bot",
-            "no Telegram bot configured",
-        );
-    };
-    let path = std::env::temp_dir().join(format!("thls_export_{}.json", uuid::Uuid::new_v4()));
-    if let Err(e) = tokio::fs::write(&path, &bytes).await {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "db_export_failed",
-            e.to_string(),
-        );
-    }
-    let uploaded = telegram::upload_document(
-        &state.http,
-        &state.telegram,
-        &state.telegram_base_url,
-        bot,
-        0,
-        &path,
-        "db/export.json".into(),
-        // User-configurable; raise if Telegram increases Bot API limits.
-        cfg.telegram_max_file_size,
-    )
-    .await;
-    let _ = tokio::fs::remove_file(&path).await;
-    match uploaded {
-        Ok(uploaded) => Json(json!({
-            "file_id": uploaded.file_id,
-            "bot_index": uploaded.bot_index,
-            "size": uploaded.file_size,
+    match upload_snapshot_to_all_bots(state.clone(), snapshot).await {
+        Ok(result) => Json(json!({
+            "snapshot_id": result.snapshot_id,
+            "filename": result.filename,
+            "size": result.size_bytes,
+            "uploads": result.uploads,
+            "failed_bots": result.failed_bots,
         }))
         .into_response(),
         Err(e) => api_error(
@@ -162,15 +145,15 @@ pub(super) async fn handle_db_import(
     headers: HeaderMap,
     request: Request,
 ) -> Response {
-    let (bytes, bot_index_map) = if is_multipart(&headers) {
-        let (bytes, opt_map) = match import_from_multipart(state.clone(), request).await {
+    if is_multipart(&headers) {
+        let source = match import_db_from_multipart(state.clone(), request).await {
             Ok(v) => v,
             Err(response) => return response,
         };
-        let map = auto_fill_or_keep(opt_map, &bytes, 0);
-        (bytes, map)
+        let response = merge_database_path(&state, source.clone()).await;
+        let _ = tokio::fs::remove_file(source).await;
+        response
     } else {
-        // Enforce 1 MB limit on the import JSON request body
         let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
             Ok(bytes) => bytes,
             Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_payload", e.to_string()),
@@ -179,14 +162,22 @@ pub(super) async fn handle_db_import(
             Ok(req) => req,
             Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_payload", e.to_string()),
         };
+        let Some(file_id) = req.file_id else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+                "file_id is required for Telegram import",
+            );
+        };
+        let bot_index = req.bot_index.unwrap_or(0);
         let cfg = state.config.read().await.clone();
         let downloaded_bytes = match telegram::get_file_bytes(
             &state.http,
             &state.telegram,
             &state.telegram_base_url,
             &cfg.bots,
-            &req.file_id,
-            req.bot_index,
+            &file_id,
+            bot_index,
         )
         .await
         {
@@ -199,10 +190,20 @@ pub(super) async fn handle_db_import(
                 )
             }
         };
-        let map = auto_fill_or_keep(req.bot_index_map, &downloaded_bytes, req.bot_index);
-        (downloaded_bytes, map)
-    };
-    import_export_bytes(&state, &bytes, bot_index_map).await
+        let source = stage_import_database(&state, downloaded_bytes).await;
+        match source {
+            Ok(source) => {
+                let response = merge_database_path(&state, source.clone()).await;
+                let _ = tokio::fs::remove_file(source).await;
+                response
+            }
+            Err(e) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_import_failed",
+                e.to_string(),
+            ),
+        }
+    }
 }
 
 pub(super) async fn handle_database_load(
@@ -264,132 +265,425 @@ pub(super) async fn handle_database_load(
     }
 }
 
-fn auto_bot_index_map(export: &db::DbExport, default_target: i64) -> HashMap<i64, i64> {
-    export
-        .segments
-        .iter()
-        .map(|s| s.bot_index)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|src| (src, default_target))
-        .collect()
-}
-
-fn auto_fill_or_keep(
-    map: Option<HashMap<i64, i64>>,
-    export_bytes: &[u8],
-    default_target: i64,
-) -> HashMap<i64, i64> {
-    match map {
-        Some(ref m) if !m.is_empty() => m.clone(),
-        _ => match serde_json::from_slice::<db::DbExport>(export_bytes) {
-            Ok(export) => auto_bot_index_map(&export, default_target),
-            Err(_) => HashMap::new(),
-        },
-    }
-}
-
-async fn import_from_multipart(
+async fn import_db_from_multipart(
     state: Arc<AppState>,
     request: Request,
-) -> Result<(Vec<u8>, Option<HashMap<i64, i64>>), Response> {
+) -> Result<PathBuf, Response> {
     let mut multipart = Multipart::from_request(request, &state)
         .await
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, "invalid_multipart", e.to_string()))?;
     let mut file = None;
-    let mut map = None;
     while let Ok(Some(field)) = multipart.next_field().await {
-        match field.name() {
-            Some("file") => {
-                // Limit import export JSON to 50 MB
-                let bytes = read_field_bytes_limit(field, 50 * 1024 * 1024).await?;
-                file = Some(bytes);
-            }
-            Some("bot_index_map") => {
-                // Limit bot_index_map text to 64 KB
-                let text = read_field_text_limit(field, 64 * 1024).await?;
-                map = Some(
-                    serde_json::from_str::<HashMap<i64, i64>>(&text).map_err(|e| {
-                        api_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_bot_index_map",
-                            e.to_string(),
-                        )
-                    })?,
-                );
-            }
-            _ => {}
+        if matches!(field.name(), Some("database") | Some("file")) {
+            let bytes = read_field_bytes_limit(field, 100 * 1024 * 1024).await?;
+            file = Some(bytes);
         }
     }
     let Some(file) = file else {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_payload",
-            "file field is required",
+            "database field is required",
         ));
     };
-    Ok((file, map))
+    stage_import_database(&state, file).await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "db_import_failed",
+            e.to_string(),
+        )
+    })
 }
 
-async fn import_export_bytes(
-    state: &Arc<AppState>,
-    bytes: &[u8],
-    bot_index_map: HashMap<i64, i64>,
-) -> Response {
-    let export = match serde_json::from_slice::<db::DbExport>(bytes) {
-        Ok(export) => export,
-        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_export", e.to_string()),
-    };
-    if export.version != 1 {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_export",
-            "export version must be 1",
-        );
-    }
-    let mut missing_bot_indices = Vec::new();
-    for segment in &export.segments {
-        if !bot_index_map.contains_key(&segment.bot_index)
-            && !missing_bot_indices.contains(&segment.bot_index)
-        {
-            missing_bot_indices.push(segment.bot_index);
-        }
-    }
-    if !missing_bot_indices.is_empty() {
-        missing_bot_indices.sort_unstable();
-        let missing = missing_bot_indices
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_bot_index_map",
-            format!(
-                "missing bot_index_map entries for [{missing}]. Telegram import bot_index is only used to download the export JSON; bot_index_map must include every source segment bot index from the export."
-            ),
-        );
-    }
+async fn merge_database_path(state: &Arc<AppState>, source: PathBuf) -> Response {
+    let _sync_guard = state.db_sync_lock.lock().await;
     let result = {
         let mut conn = match state.db_conn().await {
             Ok(conn) => conn,
             Err(e) => return db_unavailable(e),
         };
-        db::merge_from_export(&mut conn, &export, &bot_index_map)
+        tokio::task::spawn_blocking(move || db::merge_from_database_file(&mut conn, &source)).await
     };
-    match result {
-        Ok(result) => Json(json!({
-            "merged_jobs": result.merged_jobs,
-            "merged_segments": result.merged_segments,
-            "message": "import complete",
-        }))
-        .into_response(),
+    match result.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
+        Ok(result) => {
+            if let Err(e) = reload_runtime_config(state).await {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db_import_failed",
+                    e.to_string(),
+                );
+            }
+            Json(json!({
+                "merged_jobs": result.merged_jobs,
+                "merged_segments": result.merged_segments,
+                "merged_segment_parts": result.merged_segment_parts,
+                "message": "import complete",
+            }))
+            .into_response()
+        }
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "db_import_failed",
             e.to_string(),
         ),
     }
+}
+
+async fn reload_runtime_config(state: &AppState) -> anyhow::Result<()> {
+    let conn = state.db_conn().await?;
+    let cfg = tokio::task::spawn_blocking(move || Config::load(&conn)).await??;
+    *state.config.write().await = Arc::new(cfg);
+    Ok(())
+}
+
+async fn stage_import_database(state: &AppState, bytes: Vec<u8>) -> anyhow::Result<PathBuf> {
+    let source = state
+        .db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!(".thls_db_import_{}.db", uuid::Uuid::new_v4()));
+    tokio::fs::write(&source, bytes).await?;
+    Ok(source)
+}
+
+pub(crate) fn trigger_automatic_db_sync(state: Arc<AppState>, reason: String) {
+    tokio::spawn(async move {
+        let cfg = state.config.read().await.clone();
+        if !cfg.db_sync_enabled {
+            return;
+        }
+        drop(cfg);
+        match create_db_snapshot(state.clone(), &reason).await {
+            Ok(snapshot) => {
+                if let Err(e) = upload_snapshot_to_all_bots(state, snapshot).await {
+                    tracing::warn!(error = %e, "automatic db sync upload failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "automatic db sync snapshot failed"),
+        }
+    });
+}
+
+pub(crate) async fn bootstrap_db_sync_if_configured(state: Arc<AppState>) {
+    let cfg = state.config.read().await.clone();
+    if !cfg.db_sync_enabled || cfg.db_sync_bootstrap.trim().is_empty() {
+        return;
+    }
+    let descriptor: serde_json::Value = match serde_json::from_str(&cfg.db_sync_bootstrap) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(error = %e, "DB_SYNC_BOOTSTRAP is not valid JSON");
+            return;
+        }
+    };
+    let snapshot_id = descriptor
+        .get("snapshot_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if snapshot_id.is_empty() {
+        tracing::warn!("DB_SYNC_BOOTSTRAP has no snapshot_id");
+        return;
+    }
+    if let Ok(conn) = state.db_conn().await {
+        if db::get_internal_value(&conn, "db_sync_bootstrap_merged")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(snapshot_id)
+        {
+            return;
+        }
+    }
+
+    let Some(upload_values) = descriptor
+        .get("uploads")
+        .and_then(serde_json::Value::as_array)
+    else {
+        tracing::warn!("DB_SYNC_BOOTSTRAP has no uploads array");
+        return;
+    };
+    let mut by_bot: BTreeMap<i64, Vec<(i64, String)>> = BTreeMap::new();
+    for upload in upload_values {
+        let Some(bot_index) = upload.get("bot_index").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        let part_index = upload
+            .get("part_index")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let Some(file_id) = upload
+            .get("file_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        by_bot
+            .entry(bot_index)
+            .or_default()
+            .push((part_index, file_id.to_string()));
+    }
+    for (bot_index, mut parts) in by_bot {
+        parts.sort_by_key(|(part_index, _)| *part_index);
+        match download_bootstrap_parts(&state, &cfg, bot_index, &parts).await {
+            Ok(bytes) => match stage_import_database(&state, bytes).await {
+                Ok(path) => {
+                    let response = merge_database_path(&state, path.clone()).await;
+                    let _ = tokio::fs::remove_file(path).await;
+                    if response.status().is_success() {
+                        if let Ok(conn) = state.db_conn().await {
+                            let _ = db::set_internal_value(
+                                &conn,
+                                "db_sync_bootstrap_merged",
+                                snapshot_id,
+                            );
+                        }
+                        tracing::info!(snapshot_id, bot_index, "DB bootstrap merge complete");
+                        return;
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to stage DB bootstrap snapshot"),
+            },
+            Err(e) => tracing::warn!(
+                snapshot_id,
+                bot_index,
+                error = %e,
+                "DB bootstrap download failed for bot"
+            ),
+        }
+    }
+}
+
+async fn download_bootstrap_parts(
+    state: &AppState,
+    cfg: &Config,
+    bot_index: i64,
+    parts: &[(i64, String)],
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (_, file_id) in parts {
+        let bytes = telegram::get_file_bytes(
+            &state.http,
+            &state.telegram,
+            &state.telegram_base_url,
+            &cfg.bots,
+            file_id,
+            bot_index,
+        )
+        .await?;
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+async fn create_db_snapshot(state: Arc<AppState>, reason: &str) -> anyhow::Result<DbSnapshot> {
+    let _sync_guard = state.db_sync_lock.lock().await;
+    let stamp = unix_ts();
+    let id = format!("{stamp}-{}", uuid::Uuid::new_v4());
+    let filename = format!("streamer-{}-{stamp}.db", sanitize_reason(reason));
+    let path = state
+        .db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!(".thls_{id}_{filename}"));
+    let conn = state.db_conn().await?;
+    let path_for_export = path.clone();
+    let result =
+        tokio::task::spawn_blocking(move || db::export_database_file(&conn, &path_for_export))
+            .await??;
+    {
+        let conn = state.db_conn().await?;
+        db::record_db_sync_snapshot(
+            &conn,
+            &id,
+            result.schema_revision,
+            result.size_bytes,
+            "pending",
+            None,
+        )?;
+    }
+    Ok(DbSnapshot {
+        id,
+        filename,
+        path,
+        size_bytes: result.size_bytes,
+        schema_revision: result.schema_revision,
+    })
+}
+
+async fn upload_snapshot_to_all_bots(
+    state: Arc<AppState>,
+    snapshot: DbSnapshot,
+) -> anyhow::Result<SnapshotUploadResult> {
+    let cfg = state.config.read().await.clone();
+    if cfg.bots.is_empty() {
+        let _ = tokio::fs::remove_file(&snapshot.path).await;
+        anyhow::bail!("no Telegram bot configured");
+    }
+
+    let mut uploads = Vec::new();
+    let mut failed_bots = Vec::new();
+    let upload_paths = snapshot_upload_paths(&snapshot, cfg.telegram_max_file_size).await?;
+
+    for (bot_index, bot) in cfg.bots.iter().cloned().enumerate() {
+        for (part_index, path) in upload_paths.iter().enumerate() {
+            let name = if upload_paths.len() == 1 {
+                snapshot.filename.clone()
+            } else {
+                format!("{}.part{:03}", snapshot.filename, part_index)
+            };
+            let uploaded = telegram::upload_document(
+                &state.http,
+                &state.telegram,
+                &state.telegram_base_url,
+                bot.clone(),
+                bot_index as i64,
+                path,
+                format!("db-sync/{name}"),
+                cfg.telegram_max_file_size,
+            )
+            .await;
+            match uploaded {
+                Ok(uploaded) => {
+                    let conn = state.db_conn().await?;
+                    db::record_db_sync_upload(
+                        &conn,
+                        &snapshot.id,
+                        bot_index as i64,
+                        part_index as i64,
+                        &uploaded.file_id,
+                        uploaded.file_size,
+                    )?;
+                    uploads.push(json!({
+                        "bot_index": bot_index,
+                        "part_index": part_index,
+                        "file_id": uploaded.file_id,
+                        "size": uploaded.file_size,
+                    }));
+                }
+                Err(e) => {
+                    failed_bots.push(json!({
+                        "bot_index": bot_index,
+                        "part_index": part_index,
+                        "error": e.to_string(),
+                    }));
+                    tracing::warn!(
+                        snapshot_id = %snapshot.id,
+                        bot_index,
+                        part_index,
+                        error = %e,
+                        "db sync upload failed for bot"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    for path in &upload_paths {
+        if path != &snapshot.path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+    let _ = tokio::fs::remove_file(&snapshot.path).await;
+
+    let status = if uploads.is_empty() {
+        "failed"
+    } else if failed_bots.is_empty() {
+        "complete"
+    } else {
+        "partial"
+    };
+    let error_text = if failed_bots.is_empty() {
+        None
+    } else {
+        Some(format!("{} bot upload(s) failed", failed_bots.len()))
+    };
+    {
+        let conn = state.db_conn().await?;
+        db::record_db_sync_snapshot(
+            &conn,
+            &snapshot.id,
+            snapshot.schema_revision,
+            snapshot.size_bytes,
+            status,
+            error_text.as_deref(),
+        )?;
+    }
+    if !uploads.is_empty() {
+        persist_bootstrap_descriptor(&state, &snapshot, &uploads).await?;
+    }
+
+    Ok(SnapshotUploadResult {
+        snapshot_id: snapshot.id,
+        filename: snapshot.filename,
+        size_bytes: snapshot.size_bytes,
+        uploads,
+        failed_bots,
+    })
+}
+
+async fn snapshot_upload_paths(
+    snapshot: &DbSnapshot,
+    max_size: u64,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if max_size == 0 {
+        anyhow::bail!("telegram_max_file_size must be greater than zero");
+    }
+    if snapshot.size_bytes <= max_size {
+        return Ok(vec![snapshot.path.clone()]);
+    }
+    let bytes = tokio::fs::read(&snapshot.path).await?;
+    let chunk_size = max_size as usize;
+    let mut paths = Vec::new();
+    for (i, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let path = snapshot.path.with_extension(format!("db.part{i:03}"));
+        tokio::fs::write(&path, chunk).await?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+async fn persist_bootstrap_descriptor(
+    state: &AppState,
+    snapshot: &DbSnapshot,
+    uploads: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let descriptor = json!({
+        "version": 1,
+        "snapshot_id": snapshot.id,
+        "filename": snapshot.filename,
+        "created_at": unix_ts(),
+        "schema_revision": snapshot.schema_revision,
+        "size_bytes": snapshot.size_bytes,
+        "uploads": uploads,
+    })
+    .to_string();
+
+    {
+        let conn = state.db_conn().await?;
+        db::set_setting(&conn, "DB_SYNC_BOOTSTRAP", &descriptor)?;
+    }
+    let mut env_map = HashMap::new();
+    env_map.insert("DB_SYNC_BOOTSTRAP", descriptor);
+    let env_path = state.env_path.clone();
+    tokio::task::spawn_blocking(move || env_writer::write_env_values(&env_path, &env_map))
+        .await??;
+    Ok(())
+}
+
+fn sanitize_reason(reason: &str) -> String {
+    let cleaned: String = reason
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    cleaned.trim_matches('-').chars().take(48).collect()
 }
 
 async fn replace_live_database(
@@ -505,18 +799,4 @@ async fn read_field_bytes_limit(
         }
     } {}
     Ok(buf)
-}
-
-async fn read_field_text_limit(
-    field: axum::extract::multipart::Field<'_>,
-    limit: usize,
-) -> Result<String, Response> {
-    let bytes = read_field_bytes_limit(field, limit).await?;
-    String::from_utf8(bytes).map_err(|e| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_utf8",
-            format!("field is not valid UTF-8: {e}"),
-        )
-    })
 }

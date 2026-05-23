@@ -45,6 +45,7 @@ Az AI agentek krónikusan túlkomplikálnak mindent — absztrakciós rétegeket
 - Kódmódosítás után futtass célzott ellenőrzést. Általános változtatásnál `cargo test`; formázásnál `cargo fmt --check`; lintnél `cargo clippy --all-targets --all-features`.
 - Médiafolyamot érintő változtatásnál, ha Telegram credential be van állítva, a kézi end-to-end ellenőrzés: `python3 scripts/upload_and_wait.py TEST_FILE.mkv --timeout 7200 --start-timeout 180 --request-timeout 180`.
 - Ha dokumentációt frissítesz, tartsd szinkronban az agent fájlokat: `AGENTS.md`, `CODEX.md`, `CLAUDE.md`.
+- **DB sync**: Az automatikus adatbázis-szinkron SQLite `.db` snapshotot készít és minden konfigurált botra feltölti. A normál import merge-el, a teljes csere külön `/api/database/load` útvonal.
 
 ## graphify
 

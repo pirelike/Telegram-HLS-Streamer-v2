@@ -268,7 +268,8 @@ fn base_shell(
         <a class="logo" href="/"><span>TG</span></a>
         <div class="t-tabs">{tabs}</div>
     </div>
-    <div class="navbar-center">
+    <div class="navbar-center"></div>
+    <div class="navbar-right">
         <input type="hidden" id="searchInput">
         <button class="search-trigger" id="searchTriggerBtn" type="button"
                 onclick="window.__thls_palette_open&&window.__thls_palette_open()" title="Search (⌘K)">
@@ -279,8 +280,6 @@ fn base_shell(
             <span class="search-trigger-text">Search library</span>
             <kbd class="thls-kbd">⌘K</kbd>
         </button>
-    </div>
-    <div class="navbar-right">
         <span class="t-livepill" id="thls-status-pill" style="display:none">
             <span class="t-livepill__dot"></span>
             <span id="thls-status-text"></span>
@@ -498,6 +497,7 @@ fn settings_body() -> &'static str {
           <div class="settings-group-sub">Bots from .env cannot be deleted via the UI. Changes take effect immediately.</div>
         </div>
         <div class="t-pane settings-pane">
+          <div class="settings-subhead">Active Telegram Bots</div>
           <div id="botListContainer" style="padding:8px 0">
             <div class="bot-empty" style="color:var(--t-ink-3);font-size:13px;padding:14px 18px">Loading bots…</div>
           </div>
@@ -519,6 +519,13 @@ fn settings_body() -> &'static str {
           <div class="settings-group-sub">Scan a directory for new media files and auto-ingest them.</div>
         </div>
         <div class="t-pane settings-pane">
+          <div class="settings-subhead">
+            <span>Watcher Configuration</span>
+            <div class="subhead-actions">
+              <span class="settings-status subhead-status" id="watchSettingsStatus"></span>
+              <button class="subhead-save-btn" id="saveWatchSettingsBtn" onclick="saveWatchSettings()">Save</button>
+            </div>
+          </div>
           <div class="t-settings-row">
             <div>
               <div class="t-settings-row-label">Enable watcher</div>
@@ -542,98 +549,61 @@ fn settings_body() -> &'static str {
             <div><input class="t-input" id="watchDoneDir" placeholder="/path/to/incoming/done" style="width:100%;max-width:420px"></div>
           </div>
         </div>
-        <div class="settings-actions">
-          <button class="action-btn primary" id="saveWatchSettingsBtn" onclick="saveWatchSettings()">Save</button>
-          <span class="settings-status" id="watchSettingsStatus"></span>
-        </div>
       </div>
     </section>
 
     <section class="settings-section" id="settings-db" hidden>
       <div class="settings-group">
         <div class="settings-group-head">
-          <h2>Backup & restore</h2>
+          <h2>Database management</h2>
           <div class="settings-group-sub">
-            Two ways to sync libraries between servers: export the database as JSON
-            (re-uses Telegram media that's already uploaded) or replace the whole SQLite file.
+            Backup, export, import, and replace the SQLite database library.
           </div>
         </div>
+
         <div class="t-pane settings-pane">
+          <div class="settings-subhead">Backup and export</div>
           <div class="t-settings-row">
             <div>
-              <div class="t-settings-row-label">Export current database</div>
-              <div class="t-settings-row-hint">Snapshot the SQLite file or generate a JSON for another server to import.</div>
+              <div class="t-settings-row-label">Current database</div>
+              <div class="t-settings-row-hint">Download a dated <code>.db</code> snapshot or upload it to every configured Telegram bot.</div>
             </div>
-            <div class="settings-actions" style="margin:0;padding:0;border:0;gap:8px;flex-wrap:wrap;">
+            <div class="settings-field-control" style="flex-wrap:wrap;">
               <button class="action-btn" onclick="backupDatabase()">Backup on server</button>
-              <button class="action-btn" onclick="downloadDbExport()">Download JSON</button>
-              <button class="action-btn" onclick="telegramDbExport()">Push JSON via bot</button>
+              <button class="action-btn" onclick="downloadDbExport()">Download .db</button>
+              <button class="action-btn" onclick="telegramDbExport()">Upload .db to all bots</button>
               <span class="settings-status" id="dbExportStatus"></span>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="settings-group">
-        <div class="settings-group-head">
-          <h2>Import library JSON</h2>
-          <div class="settings-group-sub">
-            Pick the source: <b>upload</b> a JSON from disk, or have one of your bots <b>fetch</b> a JSON
-            previously pushed to Telegram. The optional bot map only matters if the source server's bot
-            line-up differs from this one — leave it empty for auto-mapping.
-          </div>
-        </div>
         <div class="t-pane settings-pane">
+          <div class="settings-subhead">Import library database</div>
           <div class="t-settings-row t-settings-row--stack">
             <div>
-              <div class="t-settings-row-label">From local file</div>
-              <div class="t-settings-row-hint">Upload a JSON file from your computer.</div>
+              <div class="t-settings-row-label">Merge from local file</div>
+              <div class="t-settings-row-hint">Upload a <code>.db</code>, <code>.sqlite</code>, or <code>.sqlite3</code> file. Existing local rows are kept.</div>
             </div>
-            <div class="form-group">
-              <input class="t-input" type="file" id="dbImportFileInput" accept="application/json,.json">
-              <label class="form-label" for="dbImportMap" style="margin-top:10px">Bot map (optional)</label>
-              <textarea class="t-input" id="dbImportMap" rows="2"
-                        placeholder='e.g. {"0": 1, "1": 2} — leave empty to auto-map all to bot 0'></textarea>
-              <div class="settings-actions" style="margin-top:10px;padding-top:0;border-top:none;">
+            <div class="form-group settings-db-file">
+              <input class="t-input" type="file" id="dbImportFileInput" accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3,application/octet-stream">
+              <div class="settings-actions">
                 <button class="action-btn primary" onclick="importDbExportFile()">Import file</button>
                 <span class="settings-status" id="dbImportStatus"></span>
               </div>
             </div>
           </div>
-          <div class="t-settings-row t-settings-row--stack">
-            <div>
-              <div class="t-settings-row-label">From Telegram</div>
-              <div class="t-settings-row-hint">Auto-filled after a successful "Push JSON via bot" above.</div>
-            </div>
-            <div class="form-group">
-              <label class="form-label" for="telegramImportFileId">Telegram <code>file_id</code></label>
-              <input class="t-input" id="telegramImportFileId" autocomplete="off">
-              <label class="form-label" for="telegramImportBotIndex" style="margin-top:10px">Downloader bot index</label>
-              <input class="t-input" id="telegramImportBotIndex" type="number" value="0" min="0" style="width:140px">
-              <div class="settings-actions" style="margin-top:10px;padding-top:0;border-top:none;">
-                <button class="action-btn" onclick="importDbExportTelegram()">Import from Telegram</button>
-              </div>
-            </div>
-          </div>
         </div>
-      </div>
 
-      <div class="settings-group">
-        <div class="settings-group-head">
-          <h2>Replace SQLite file</h2>
-          <div class="settings-group-sub">
-            Wipes everything and loads a different <code>streamer.db</code>. A backup is created automatically before replacement.
-          </div>
-        </div>
         <div class="t-pane settings-pane">
+          <div class="settings-subhead">Replace SQLite file</div>
           <div class="t-settings-row t-settings-row--stack">
             <div>
-              <div class="t-settings-row-label">Database file</div>
-              <div class="t-settings-row-hint">A <code>.db</code>, <code>.sqlite</code>, or <code>.sqlite3</code> file. Service auto-restarts.</div>
+              <div class="t-settings-row-label">Replacement file</div>
+              <div class="t-settings-row-hint">Destructive: wipes the active library, creates a backup, then loads this file. Service auto-restarts.</div>
             </div>
-            <div class="form-group">
+            <div class="form-group settings-db-file">
               <input class="t-input" type="file" id="databaseFileInput" accept=".db,.sqlite,.sqlite3,application/octet-stream">
-              <div class="settings-actions" style="margin-top:10px;padding-top:0;border-top:none;">
+              <div class="settings-actions">
                 <button class="action-btn danger" id="databaseLoadBtn" onclick="loadDatabaseFromFile()">Load database</button>
                 <span class="settings-status" id="databaseLoadStatus"></span>
               </div>
@@ -651,6 +621,31 @@ fn settings_body() -> &'static str {
   </main>
 </div>
 </main>
+<div class="modal-overlay" id="tierModal" onclick="handleTierModalOverlayClick(event)">
+    <div class="modal">
+        <div class="modal-header">
+            <span class="modal-title" id="tierModalTitle">Add ABR tier</span>
+            <button class="modal-close" onclick="closeTierModal()">
+                <span class="material-icons-round">close</span>
+            </button>
+        </div>
+        <div class="form-group">
+            <label class="form-label" for="tierHeightInput">Height</label>
+            <input class="form-input" type="number" id="tierHeightInput" min="1" placeholder="720">
+            <div class="field-description">Video height in pixels.</div>
+        </div>
+        <div class="form-group">
+            <label class="form-label" for="tierBitrateInput">Bitrate</label>
+            <input class="form-input" type="text" id="tierBitrateInput" placeholder="5M">
+            <div class="field-description">Use FFmpeg-style values like <code>800k</code>, <code>5M</code>, or <code>60M</code>.</div>
+        </div>
+        <div class="settings-actions">
+            <button class="action-btn" onclick="closeTierModal()">Cancel</button>
+            <button class="action-btn primary" onclick="saveTierModal()">Save tier</button>
+            <span class="settings-status" id="tierModalStatus"></span>
+        </div>
+    </div>
+</div>
 <div class="modal-overlay" id="addBotModal" onclick="handleModalOverlayClick(event)">
     <div class="modal">
         <div class="modal-header">

@@ -792,3 +792,52 @@ pub fn update_segment_part_file_id(
         params![new_file_id, new_bot_index, job_id, segment_key, part_index],
     )? > 0)
 }
+
+pub fn record_db_sync_snapshot(
+    conn: &Connection,
+    snapshot_id: &str,
+    schema_revision: i64,
+    size_bytes: u64,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO db_sync_snapshots(id, schema_revision, size_bytes, status, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+            schema_revision=excluded.schema_revision,
+            size_bytes=excluded.size_bytes,
+            status=excluded.status,
+            last_error=excluded.last_error",
+        params![
+            snapshot_id,
+            schema_revision,
+            size_bytes as i64,
+            status,
+            error
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn record_db_sync_upload(
+    conn: &Connection,
+    snapshot_id: &str,
+    bot_index: i64,
+    part_index: i64,
+    file_id: &str,
+    file_size: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO db_sync_uploads(snapshot_id, bot_index, part_index, file_id, file_size, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'complete')
+         ON CONFLICT(snapshot_id, bot_index, part_index) DO UPDATE SET
+            file_id=excluded.file_id,
+            file_size=excluded.file_size,
+            uploaded_at=CURRENT_TIMESTAMP,
+            status='complete',
+            error=NULL",
+        params![snapshot_id, bot_index, part_index, file_id, file_size as i64],
+    )?;
+    Ok(())
+}

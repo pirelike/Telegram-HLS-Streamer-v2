@@ -16,7 +16,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
-pub const LATEST_SCHEMA_REVISION: i64 = 18;
+pub const LATEST_SCHEMA_REVISION: i64 = 20;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 pub type DbConn = r2d2::PooledConnection<SqliteConnectionManager>;
@@ -250,11 +250,24 @@ mod tests {
         migrations::run_migration_8(&conn).unwrap();
         migrations::run_migration_9(&conn).unwrap();
         migrations::run_migration_10(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('HLS_SEGMENT_DURATION', '4')",
+            [],
+        )
+        .unwrap();
         conn.execute("INSERT INTO schema_migrations(revision, name) VALUES (1, 'initial schema (rebuild spec rev 9 shape)')", []).unwrap();
         drop(conn);
 
         let conn = init_db(&path).unwrap();
         assert_schema_rev(&conn, LATEST_SCHEMA_REVISION);
+        let stale_setting_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = 'HLS_SEGMENT_DURATION'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_setting_count, 0);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();

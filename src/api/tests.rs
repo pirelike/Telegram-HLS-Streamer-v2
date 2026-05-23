@@ -54,6 +54,7 @@ fn app_state_with_telegram_base(telegram_base_url: String) -> Arc<AppState> {
         watch_seen: Mutex::new(HashMap::new()),
         pending_uploads: Mutex::new(HashMap::new()),
         upload_rate_limits: Mutex::new(HashMap::new()),
+        db_sync_lock: Mutex::new(()),
         jobs: Mutex::new(HashMap::new()),
         played_segments: Mutex::new(HashMap::new()),
         job_queue,
@@ -595,6 +596,15 @@ async fn settings_get_post_and_reset_update_runtime_config() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_response(response).await;
     assert!(body["categories"]["reliability"]["settings"].is_array());
+    let all_settings: Vec<&serde_json::Value> = body["categories"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|category| category["settings"].as_array().unwrap())
+        .collect();
+    assert!(!all_settings
+        .iter()
+        .any(|setting| setting["key"] == "HLS_SEGMENT_DURATION"));
 
     let response = app
         .oneshot(
@@ -628,6 +638,9 @@ async fn settings_get_post_and_reset_update_runtime_config() {
     assert!(file_settings
         .iter()
         .any(|s| s["key"] == "DISK_CACHE_ENABLED" && s["value"] == true));
+    assert!(file_settings
+        .iter()
+        .any(|s| s["key"] == "AUDIO_SEGMENT_DURATION"));
 
     let app = router(state.clone());
     let response = app
@@ -764,7 +777,7 @@ async fn watch_settings_validate_paths_and_persist() {
 }
 
 #[tokio::test]
-async fn db_export_import_reports_missing_source_bot_map_entries_and_allows_explicit_remap() {
+async fn db_export_import_downloads_sqlite_and_merges_file() {
     let source = app_state();
     save_complete_job(&source, "job1", "Movie", "Film", "", None, None).await;
     let response = router(source)
@@ -778,16 +791,11 @@ async fn db_export_import_reports_missing_source_bot_map_entries_and_allows_expl
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let export_bytes = response_bytes(response).await;
-    let mut export: db::DbExport = serde_json::from_slice(&export_bytes).unwrap();
-    assert_eq!(export.version, 1);
-    assert_eq!(export.jobs.len(), 1);
-    export.segments[0].bot_index = 1;
-    let export_bytes = serde_json::to_vec(&export).unwrap();
+    assert_eq!(&export_bytes[..16], b"SQLite format 3\0");
 
     let target = app_state();
-    // Without bot_index_map — auto-fills to 0
     let (content_type, body) =
-        multipart_body(&[("file", Some("export.json"), export_bytes.clone())]);
+        multipart_body(&[("database", Some("export.db"), export_bytes.clone())]);
     let response = router(target.clone())
         .oneshot(
             Request::post("/api/db/import")
@@ -801,8 +809,8 @@ async fn db_export_import_reports_missing_source_bot_map_entries_and_allows_expl
     let body = json_response(response).await;
     assert_eq!(body["merged_jobs"], 1);
     assert_eq!(body["merged_segments"], 1);
+    assert_eq!(body["merged_segment_parts"], 0);
     let conn = target.db_conn().await.unwrap();
-    // Segment was auto-mapped from bot_index=1 to 0
     assert_eq!(
         db::get_segment(&conn, "job1", "video_0/video_0001.m4s")
             .unwrap()
@@ -812,35 +820,7 @@ async fn db_export_import_reports_missing_source_bot_map_entries_and_allows_expl
     );
     drop(conn);
 
-    let (content_type, body) = multipart_body(&[
-        ("file", Some("export.json"), export_bytes),
-        ("bot_index_map", None, br#"{"0":0}"#.to_vec()),
-    ]);
-    let response = router(target.clone())
-        .oneshot(
-            Request::post("/api/db/import")
-                .header("content-type", content_type)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = json_response(response).await;
-    assert_eq!(body["error"], "invalid_bot_index_map");
-    assert!(body["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("missing bot_index_map entries for [1]"));
-
-    let (content_type, body) = multipart_body(&[
-        (
-            "file",
-            Some("export.json"),
-            serde_json::to_vec(&export).unwrap(),
-        ),
-        ("bot_index_map", None, br#"{"1":0}"#.to_vec()),
-    ]);
+    let (content_type, body) = multipart_body(&[("database", Some("export.db"), export_bytes)]);
     let response = router(target.clone())
         .oneshot(
             Request::post("/api/db/import")
@@ -852,9 +832,9 @@ async fn db_export_import_reports_missing_source_bot_map_entries_and_allows_expl
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_response(response).await;
-    // Data was already merged by auto-fill above (INSERT OR IGNORE)
     assert_eq!(body["merged_jobs"], 0);
     assert_eq!(body["merged_segments"], 0);
+    assert_eq!(body["merged_segment_parts"], 0);
     let conn = target.db_conn().await.unwrap();
     assert!(db::get_job(&conn, "job1").unwrap().is_some());
     assert_eq!(

@@ -161,6 +161,17 @@ pub struct SegmentPartLookup {
     pub file_size: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SegmentPartExportRow {
+    pub id: i64,
+    pub job_id: String,
+    pub segment_key: String,
+    pub part_index: i64,
+    pub file_id: String,
+    pub bot_index: i64,
+    pub file_size: i64,
+}
+
 fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
@@ -250,12 +261,15 @@ pub struct DbExport {
     pub jobs: Vec<JobRow>,
     pub tracks: Vec<TrackRow>,
     pub segments: Vec<SegmentRow>,
+    #[serde(default)]
+    pub segment_parts: Vec<SegmentPartExportRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MergeResult {
     pub merged_jobs: usize,
     pub merged_segments: usize,
+    pub merged_segment_parts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -269,6 +283,16 @@ pub struct DatabaseBackupResult {
     pub backup_path: PathBuf,
     pub size_bytes: u64,
     pub schema_revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DbSyncSnapshotRow {
+    pub id: String,
+    pub created_at: String,
+    pub schema_revision: i64,
+    pub size_bytes: i64,
+    pub status: String,
+    pub last_error: Option<String>,
 }
 
 // --- SQL constants ---
@@ -332,6 +356,20 @@ pub(super) fn segment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Segm
         file_size: row.get(5)?,
         duration: row.get(6)?,
         is_split: row.get::<_, i64>(7)? == 1,
+    })
+}
+
+pub(super) fn segment_part_export_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SegmentPartExportRow> {
+    Ok(SegmentPartExportRow {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        segment_key: row.get(2)?,
+        part_index: row.get(3)?,
+        file_id: row.get(4)?,
+        bot_index: row.get(5)?,
+        file_size: row.get(6)?,
     })
 }
 
