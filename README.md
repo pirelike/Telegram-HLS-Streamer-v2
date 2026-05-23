@@ -57,6 +57,8 @@ Common `.env` values:
 | `MAX_UPLOAD_SIZE` | `107374182400` | Max accepted client upload size. |
 | `UPLOAD_CHUNK_SIZE` | `10485760` | Browser/client upload chunk size. |
 | `MAX_CONCURRENT_JOBS` | `1` | Number of queue workers. |
+| `DB_SYNC_ENABLED` | `true` | Create and upload a dated `.db` snapshot after each completed job. |
+| `DB_SYNC_BOOTSTRAP` | unset | Latest auto-written DB sync descriptor for fresh-server restore. |
 | `ABR_ENABLED` | `true` | Produce eager ABR tiers. |
 | `ENABLE_COPY_MODE` | `true` | Use source passthrough tier when possible. |
 | `VIRTUAL_ABR_TIERS` | `false` | Transcode lower tiers on demand. |
@@ -99,7 +101,9 @@ Segments are served through `/segment/<job_id>/<segment_key>`. The server retrie
 
 ### Database Transfer
 
-The API supports JSON export/import plus direct SQLite database load. Use these flows for backup, restore, and moving a library between instances.
+The API uses SQLite `.db` files for database transfer. Normal import merges jobs, tracks, segments, and split segment parts into the active database without replacing local rows. The separate database-load flow replaces the live SQLite file and creates a backup first.
+
+When `DB_SYNC_ENABLED=true`, each completed job creates a dated SQLite snapshot and uploads it with every configured Telegram bot. The latest snapshot descriptor is written to `DB_SYNC_BOOTSTRAP` for bootstrap restore on another server.
 
 ### Bot Management
 
@@ -150,9 +154,9 @@ Core API routes:
 | `POST /api/bots/add` | Add a DB-backed bot. |
 | `DELETE /api/bots/:bot_id` | Delete a DB-backed bot. |
 | `GET/POST /api/watch-settings` | Read or update watch-folder settings. |
-| `POST /api/db/export` | Export DB content as portable JSON. |
+| `POST /api/db/export` | Export a dated SQLite `.db` snapshot; optionally upload it to all bots. |
 | `POST /api/db/backup` | Create a DB backup. |
-| `POST /api/db/import` | Import portable DB JSON. |
+| `POST /api/db/import` | Merge an uploaded SQLite `.db` file. |
 | `POST /api/database/load` | Replace the live SQLite DB from an uploaded DB file. |
 | `GET /api/metrics` | Queue, cache, and Telegram metrics. |
 

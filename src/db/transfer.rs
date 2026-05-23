@@ -7,9 +7,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection};
 
 use super::models::{
-    bool_to_i64, job_from_row, normalize_job_metadata, segment_from_row, track_from_row,
-    DatabaseBackupResult, DbExport, MergeResult, NewJob, ReplaceDatabaseResult, JOB_SELECT_SQL,
-    SEGMENT_SELECT_SQL, TRACK_SELECT_SQL,
+    bool_to_i64, job_from_row, normalize_job_metadata, segment_from_row,
+    segment_part_export_from_row, track_from_row, DatabaseBackupResult, DbExport, MergeResult,
+    NewJob, ReplaceDatabaseResult, JOB_SELECT_SQL, SEGMENT_PART_SELECT_SQL, SEGMENT_SELECT_SQL,
+    TRACK_SELECT_SQL,
 };
 use super::{current_schema_revision, init_db, validate_sqlite_header};
 
@@ -33,12 +34,21 @@ pub fn export_to_dict(conn: &Connection) -> Result<DbExport> {
         .query_map([], segment_from_row)?
         .map(|r| r.map_err(Into::into))
         .collect::<Result<Vec<_>>>()?;
+    let mut parts_stmt = conn.prepare(
+        &(SEGMENT_PART_SELECT_SQL.to_owned()
+            + " ORDER BY job_id ASC, segment_key ASC, part_index ASC"),
+    )?;
+    let segment_parts = parts_stmt
+        .query_map([], segment_part_export_from_row)?
+        .map(|r| r.map_err(Into::into))
+        .collect::<Result<Vec<_>>>()?;
     Ok(DbExport {
         version: 1,
         schema_revision: current_schema_revision(conn)?,
         jobs,
         tracks,
         segments,
+        segment_parts,
     })
 }
 
@@ -50,6 +60,7 @@ pub fn merge_from_export(
     let tx = conn.transaction()?;
     let mut merged_jobs = 0;
     let mut merged_segments = 0;
+    let mut merged_segment_parts = 0;
     for job in &export.jobs {
         let mut new_job = NewJob {
             job_id: job.job_id.clone(),
@@ -133,11 +144,90 @@ pub fn merge_from_export(
             params![segment.job_id, segment.segment_key, segment.file_id, *bot_index, segment.file_size, segment.duration, bool_to_i64(segment.is_split), prefix, name],
         )?;
     }
+    for part in &export.segment_parts {
+        let Some(bot_index) = bot_index_map.get(&part.bot_index) else {
+            bail!("missing bot_index_map entry for {}", part.bot_index);
+        };
+        let (prefix, name) = split_segment_key(&part.segment_key);
+        merged_segment_parts += tx.execute(
+            "INSERT OR IGNORE INTO segment_parts(
+                job_id, segment_key, part_index, file_id, bot_index, file_size, prefix, name
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                part.job_id,
+                part.segment_key,
+                part.part_index,
+                part.file_id,
+                *bot_index,
+                part.file_size,
+                prefix,
+                name
+            ],
+        )?;
+    }
     tx.commit()?;
     Ok(MergeResult {
         merged_jobs,
         merged_segments,
+        merged_segment_parts,
     })
+}
+
+pub fn export_database_file(conn: &Connection, output_path: &Path) -> Result<DatabaseBackupResult> {
+    if output_path.exists() {
+        fs::remove_file(output_path).context("removing existing snapshot file")?;
+    }
+    let schema_revision = current_schema_revision(conn)?;
+    let out = output_path.to_str().ok_or_else(|| {
+        anyhow!(
+            "snapshot path is not valid UTF-8: {}",
+            output_path.display()
+        )
+    })?;
+    conn.execute("VACUUM main INTO ?1", params![out])
+        .context("creating sqlite snapshot")?;
+    validate_sqlite_snapshot(output_path)?;
+    let size_bytes = fs::metadata(output_path)
+        .context("stat sqlite snapshot")?
+        .len();
+    Ok(DatabaseBackupResult {
+        backup_path: output_path.to_path_buf(),
+        size_bytes,
+        schema_revision,
+    })
+}
+
+pub fn merge_from_database_file(conn: &mut Connection, source_path: &Path) -> Result<MergeResult> {
+    validate_sqlite_snapshot(source_path)?;
+    let source = init_db(source_path).context("opening import database")?;
+    let export = export_to_dict(&source)?;
+    let map = auto_same_bot_index_map(&export);
+    merge_from_export(conn, &export, &map)
+}
+
+fn auto_same_bot_index_map(export: &DbExport) -> HashMap<i64, i64> {
+    let mut map = HashMap::new();
+    for index in export
+        .segments
+        .iter()
+        .map(|s| s.bot_index)
+        .chain(export.segment_parts.iter().map(|p| p.bot_index))
+    {
+        map.insert(index, index);
+    }
+    map
+}
+
+pub fn validate_sqlite_snapshot(path: &Path) -> Result<()> {
+    validate_sqlite_header(path)?;
+    let conn = Connection::open(path).context("opening sqlite snapshot")?;
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .context("running sqlite integrity_check")?;
+    if check != "ok" {
+        bail!("sqlite integrity_check failed: {check}");
+    }
+    Ok(())
 }
 
 fn split_segment_key(segment_key: &str) -> (&str, &str) {

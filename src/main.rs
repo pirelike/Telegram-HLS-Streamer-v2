@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
         watch_seen: Mutex::new(std::collections::HashMap::new()),
         pending_uploads: Mutex::new(std::collections::HashMap::new()),
         upload_rate_limits: Mutex::new(std::collections::HashMap::new()),
+        db_sync_lock: Mutex::new(()),
         jobs: Mutex::new(std::collections::HashMap::new()),
         played_segments: Mutex::new(std::collections::HashMap::new()),
         job_queue,
@@ -100,6 +101,7 @@ async fn main() -> Result<()> {
         last_bot_index: std::sync::atomic::AtomicI64::new(last_bot_index),
         shutdown_token: shutdown_token.clone(),
     });
+    api::db_transfer::bootstrap_db_sync_if_configured(state.clone()).await;
     api::start_background_tasks(state.clone(), job_receiver);
     cloudflared::start_manager(state.clone());
 

@@ -1,5 +1,5 @@
 mod bots_settings;
-mod db_transfer;
+pub(crate) mod db_transfer;
 mod frontend;
 mod ingest;
 pub(crate) mod jobs;
@@ -71,6 +71,7 @@ pub struct AppState {
     pub watch_seen: Mutex<HashMap<PathBuf, WatchFileState>>,
     pub pending_uploads: Mutex<HashMap<String, PendingUpload>>,
     pub upload_rate_limits: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
+    pub db_sync_lock: Mutex<()>,
     pub jobs: Mutex<HashMap<String, JobState>>,
     pub played_segments: Mutex<HashMap<String, (HashSet<String>, Instant)>>,
     pub job_queue: mpsc::Sender<JobRequest>,

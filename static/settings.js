@@ -1,6 +1,7 @@
 // ─── Settings (dynamic, DB-backed) ────────────────────────────────────────────
 
 let _settingsData = null;
+let _tierModalState = null;
 
 function loadSettings() {
     fetch('/api/settings')
@@ -40,18 +41,23 @@ const CATEGORY_TO_SECTION = {
 };
 
 function renderAllSettings(data) {
-    // Wipe any per-section dynamic groups the previous run left behind.
+    const activeSection = document.querySelector('#settingsSide .t-side__item[aria-current]')?.dataset.section || 'settings-server';
     document.querySelectorAll('.settings-group[data-dyn]').forEach(s => s.remove());
     const cats = data.categories || {};
+    const sectionMap = {};
     for (const [catKey, category] of Object.entries(cats)) {
         const targetId = CATEGORY_TO_SECTION[catKey] || 'settings-server';
-        const target = document.getElementById(targetId);
+        if (!sectionMap[targetId]) sectionMap[targetId] = [];
+        sectionMap[targetId].push({ catKey, category });
+    }
+    for (const [sectionId, catEntries] of Object.entries(sectionMap)) {
+        const target = document.getElementById(sectionId);
         if (!target) continue;
-        const groupEl = renderCategoryGroup(catKey, category);
-        target.insertBefore(groupEl, target.firstChild);  // prepend dyn groups above any static markup
+        const groupEl = renderSectionGroup(sectionId, catEntries);
+        target.insertBefore(groupEl, target.firstChild);
     }
     wireSidebar();
-    activateSection('settings-server');
+    activateSection(activeSection);
 }
 
 function wireSidebar() {
@@ -70,7 +76,7 @@ function activateSection(sectionId) {
     const active = document.querySelector('#settingsSide .t-side__item[aria-current]');
     const heading = document.getElementById('settingsHeading');
     const sub = document.getElementById('settingsSubtitle');
-    if (active && heading) heading.textContent = active.textContent.trim();
+    if (active && heading) heading.innerHTML = active.innerHTML;
     if (sub) sub.textContent = sectionDescription(sectionId);
 }
 function sectionDescription(sectionId) {
@@ -86,36 +92,212 @@ function sectionDescription(sectionId) {
     return 'Configure server behaviour. Changes save per section.';
 }
 
-// ─── Category group (dynamic from /api/settings) ─────────────────────────────
-// Returns a `.settings-group` to be inserted into one of the static sections.
-function renderCategoryGroup(catKey, category) {
+function renderSectionGroup(sectionId, catEntries) {
     const group = document.createElement('div');
     group.className = 'settings-group';
-    group.dataset.category = catKey;
     group.dataset.dyn = '1';
+    const catKeys = catEntries.map(e => e.catKey);
 
-    const head = document.createElement('div');
-    head.className = 'settings-group-head';
-    head.innerHTML = `<h2>${escHtml(category.label)}</h2>`;
-    group.appendChild(head);
+    for (const { catKey, category } of catEntries) {
+        const pane = document.createElement('div');
+        pane.className = 't-pane settings-pane';
 
-    const pane = document.createElement('div');
-    pane.className = 't-pane settings-pane';
-    for (const setting of category.settings) pane.appendChild(renderFieldRow(setting));
-    group.appendChild(pane);
+        const subhead = document.createElement('div');
+        subhead.className = 'settings-subhead';
 
-    const actions = document.createElement('div');
-    actions.className = 'settings-actions';
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'action-btn primary';
-    saveBtn.textContent = 'Save';
-    const statusEl = document.createElement('span');
-    statusEl.className = 'settings-status';
-    saveBtn.onclick = () => saveCategory(catKey, saveBtn, statusEl);
-    actions.append(saveBtn, statusEl);
-    group.appendChild(actions);
+        const labelText = document.createElement('span');
+        labelText.textContent = category.label;
+        subhead.appendChild(labelText);
+
+        const subheadActions = document.createElement('div');
+        subheadActions.className = 'subhead-actions';
+
+        const statusEl = document.createElement('span');
+        statusEl.className = 'settings-status subhead-status';
+
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'subhead-save-btn';
+        saveBtn.textContent = 'Save';
+        saveBtn.onclick = () => saveSection([catKey], saveBtn, statusEl);
+
+        subheadActions.append(statusEl, saveBtn);
+        subhead.appendChild(subheadActions);
+        pane.appendChild(subhead);
+
+        for (const setting of category.settings) {
+            pane.appendChild(renderFieldRow(setting));
+        }
+        group.appendChild(pane);
+    }
 
     return group;
+}
+
+const SETTING_LABELS = {
+    HOST: 'Bind address',
+    PORT: 'Port',
+    FORCE_HTTPS: 'Force HTTPS',
+    BEHIND_PROXY: 'Behind proxy',
+    TRUSTED_PROXY_CIDRS: 'Trusted proxy ranges',
+    CORS_ALLOWED_ORIGINS: 'Allowed CORS origins',
+    TELEGRAM_MAX_FILE_SIZE: 'Telegram file limit',
+    MAX_UPLOAD_SIZE: 'Maximum upload size',
+    UPLOAD_CHUNK_SIZE: 'Upload chunk size',
+    SEGMENT_TARGET_SIZE: 'Target segment size',
+    SEGMENT_CACHE_SIZE_MB: 'Segment cache budget',
+    SEGMENT_PREFETCH_COUNT: 'Prefetch count',
+    SEGMENT_PREFETCH_MIN_FREE_BYTES: 'Minimum free cache space',
+    ENABLE_HW_ACCEL: 'Hardware acceleration',
+    PREFERRED_ENCODER: 'Preferred encoder',
+    VAAPI_DEVICE: 'VAAPI device',
+    MAX_PARALLEL_ENCODES: 'Parallel encodes',
+    VIDEO_BITRATE: 'Default video bitrate',
+    AUDIO_BITRATE: 'Default audio bitrate',
+    AUDIO_SEGMENT_DURATION: 'Audio segment duration',
+    ABR_ENABLED: 'Create ABR variants',
+    ENABLE_COPY_MODE: 'Keep source tier',
+    VIRTUAL_ABR_TIERS: 'On-demand ABR',
+    ABR_TIERS: 'Playback ABR tiers',
+    TIER0_BITRATES: 'Source tier bitrates',
+    TIER0_BITRATE_DEFAULT: 'Default source tier bitrate',
+    JOB_TIMEOUT_SECONDS: 'Job timeout',
+    QUEUE_TIMEOUT_SECONDS: 'Queue timeout',
+    PENDING_UPLOAD_TTL_SECONDS: 'Pending upload expiry',
+    PENDING_UPLOAD_CLEANUP_INTERVAL_SECONDS: 'Pending cleanup interval',
+    JOB_RETENTION_DAYS: 'Job retention',
+    MAX_CONCURRENT_JOBS: 'Concurrent jobs',
+    UPLOAD_RATE_LIMIT_WINDOW: 'Rate limit window',
+    UPLOAD_RATE_LIMIT_MAX_REQUESTS: 'Rate limit requests',
+    MAX_PENDING_UPLOADS_PER_IP: 'Pending uploads per IP',
+    WATCH_POLL_SECONDS: 'Watch scan interval',
+    WATCH_STABLE_SECONDS: 'File stability delay',
+    WATCH_VIDEO_EXTENSIONS: 'Video extensions',
+    WATCH_IGNORE_SUFFIXES: 'Ignored suffixes',
+    UPLOAD_PARALLELISM: 'Upload parallelism',
+    DB_SYNC_ENABLED: 'Sync database to bots',
+    DB_SYNC_BOOTSTRAP: 'DB sync bootstrap',
+    DB_AUTO_MERGE_INTERVAL_MINUTES: 'Auto-merge interval',
+    DB_AUTO_MERGE_FILE_ID: 'Auto-merge file ID',
+    DB_AUTO_MERGE_BOT_INDEX: 'Auto-merge bot index',
+    WEBHOOK_URL: 'Webhook URL',
+    CLOUDFLARED_ENABLED: 'Cloudflared enabled',
+    CLOUDFLARED_CONFIG: 'Cloudflared config path',
+};
+
+function humanizeKey(key) {
+    if (SETTING_LABELS[key]) return SETTING_LABELS[key];
+    return key.toLowerCase().split('_').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+}
+
+function unitKind(key) {
+    if (/_SIZE$|_BYTES$/.test(key)) return 'bytes';
+    if (/_SECONDS$/.test(key)) return 'seconds';
+    if (/_DAYS$/.test(key)) return 'days';
+    if (/_MINUTES$/.test(key)) return 'minutes';
+    if (/_MB$/.test(key)) return 'mb';
+    return null;
+}
+
+function humanizeUnit(kind, num) {
+    if (isNaN(num)) return '';
+    switch (kind) {
+        case 'bytes':
+            if (num >= 1073741824) return (num / 1073741824).toFixed(1) + ' GB';
+            if (num >= 1048576) return (num / 1048576).toFixed(1) + ' MB';
+            if (num >= 1024) return (num / 1024).toFixed(1) + ' KB';
+            return num + ' B';
+        case 'seconds':
+            if (num >= 86400 && num % 86400 === 0) return (num / 86400) + ' days';
+            if (num >= 86400) return (num / 86400).toFixed(1) + ' days';
+            if (num >= 3600 && num % 3600 === 0) return (num / 3600) + 'h';
+            if (num >= 3600) return (num / 3600).toFixed(1) + 'h';
+            if (num >= 60 && num % 60 === 0) return (num / 60) + ' min';
+            if (num >= 60) return (num / 60).toFixed(0) + ' min';
+            return num + 's';
+        case 'days':
+            if (num === 0) return 'forever';
+            return num + (num === 1 ? ' day' : ' days');
+        case 'minutes':
+            if (num === 0) return 'disabled';
+            return num + ' min';
+        case 'mb':
+            return num.toLocaleString() + ' MB';
+    }
+    return '';
+}
+
+function unitChoices(kind) {
+    if (kind === 'bytes') return [
+        ['1', 'B'], ['1024', 'KB'], ['1048576', 'MB'], ['1073741824', 'GB'],
+    ];
+    if (kind === 'seconds') return [
+        ['1', 'sec'], ['60', 'min'], ['3600', 'hr'], ['86400', 'day'],
+    ];
+    if (kind === 'minutes') return [
+        ['1', 'min'], ['60', 'hr'], ['1440', 'day'],
+    ];
+    if (kind === 'days') return [['1', 'day']];
+    if (kind === 'mb') return [['1', 'MB']];
+    return [['1', '']];
+}
+
+function bestUnit(kind, rawValue) {
+    const choices = unitChoices(kind);
+    const value = Math.abs(Number(rawValue) || 0);
+    let best = choices[0];
+    for (const choice of choices) {
+        const factor = Number(choice[0]);
+        if (value >= factor && value % factor === 0) best = choice;
+    }
+    return best;
+}
+
+function renderFriendlyInt(setting, container, kind) {
+    const hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.id = 'sf_' + setting.key;
+    hidden.dataset.settingKind = 'friendly-int';
+    hidden.dataset.unitKind = kind;
+
+    const current = Number(setting.value);
+    const [factor, label] = bestUnit(kind, current);
+    hidden.value = Number.isFinite(current) ? String(current) : '';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'settings-unit-input';
+
+    const number = document.createElement('input');
+    number.className = 't-input settings-unit-number';
+    number.type = 'number';
+    number.min = '0';
+    number.step = '1';
+    number.value = Number.isFinite(current) ? String(current / Number(factor)) : '';
+
+    const select = document.createElement('select');
+    select.className = 't-input settings-unit-select';
+    for (const [choiceFactor, choiceLabel] of unitChoices(kind)) {
+        const opt = document.createElement('option');
+        opt.value = choiceFactor;
+        opt.textContent = choiceLabel;
+        if (choiceFactor === factor && choiceLabel === label) opt.selected = true;
+        select.appendChild(opt);
+    }
+    const sync = () => {
+        const n = Number(number.value);
+        const f = Number(select.value);
+        if (!Number.isFinite(n)) {
+            hidden.value = '';
+            return;
+        }
+        const raw = Math.round(n * f);
+        hidden.value = String(raw);
+    };
+    number.addEventListener('input', sync);
+    select.addEventListener('change', sync);
+    sync();
+
+    wrap.append(number, select);
+    container.append(hidden, wrap);
 }
 
 function renderFieldRow(setting) {
@@ -124,26 +306,43 @@ function renderFieldRow(setting) {
     if (setting.type === 'tiers') row.classList.add('t-settings-row--stack');
     row.dataset.key = setting.key;
 
+    const kind = unitKind(setting.key);
     const left = document.createElement('div');
     const titleEl = document.createElement('div');
     titleEl.className = 't-settings-row-label';
-    titleEl.textContent = setting.key;
+    titleEl.textContent = humanizeKey(setting.key);
+    titleEl.title = setting.key;
     const hintEl = document.createElement('div');
     hintEl.className = 't-settings-row-hint';
     const desc = setting.description || '';
-    const formattedDefault = formatDisplay(setting.key, setting.default);
-    hintEl.textContent = desc + (desc ? ' · ' : '') +
-        'Default: ' + setting.default + (formattedDefault ? ' ' + formattedDefault : '');
+    if (kind) {
+        const humanDefault = humanizeUnit(kind, Number(setting.default));
+        hintEl.textContent = desc + (desc ? ' · ' : '') + 'Default: ' + humanDefault + ` (${setting.key})`;
+    } else {
+        const formattedDefault = formatDisplay(setting.key, setting.default);
+        hintEl.textContent = desc + (desc ? ' · ' : '') +
+            'Default: ' + setting.default + (formattedDefault ? ' ' + formattedDefault : '') + ` (${setting.key})`;
+    }
     left.append(titleEl, hintEl);
     row.appendChild(left);
 
     const right = document.createElement('div');
-    right.style.cssText = 'display:flex;align-items:center;gap:8px;justify-content:flex-end;';
+    right.className = 'settings-field-control';
+
+    const reset = document.createElement('button');
+    reset.type = 'button';
+    reset.className = 'action-btn';
+    reset.title = 'Reset to default: ' + setting.default;
+    reset.textContent = 'Reset';
+    reset.style.fontSize = '12px';
+    reset.style.padding = '4px 10px';
+    reset.onclick = () => resetSetting(setting.key);
+
     if (setting.type === 'bool') {
         const sw = document.createElement('button');
         sw.type = 'button';
         sw.className = 't-switch';
-        sw.id = `sf_${setting.key}`;
+        sw.id = 'sf_' + setting.key;
         sw.setAttribute('role', 'switch');
         sw.setAttribute('aria-checked', String(!!setting.value));
         sw.addEventListener('click', () => {
@@ -151,36 +350,177 @@ function renderFieldRow(setting) {
             sw.setAttribute('aria-checked', String(on));
         });
         right.appendChild(sw);
+        right.appendChild(reset);
     } else if (setting.type === 'tiers') {
-        const ta = document.createElement('textarea');
-        ta.id = `sf_${setting.key}`;
-        ta.className = 't-input';
-        ta.rows = 2;
-        ta.value = setting.value || '';
-        ta.style.minWidth = '0';
-        right.style.justifyContent = 'stretch';
-        right.appendChild(ta);
+        right.classList.add('settings-field-control--stack');
+        buildTiersEditor(setting, right);
     } else {
-        const inp = document.createElement('input');
-        inp.id = `sf_${setting.key}`;
-        inp.className = 't-input';
-        inp.type = setting.type === 'int' ? 'number' : 'text';
-        inp.value = setting.value !== null && setting.value !== undefined ? String(setting.value) : '';
-        if (setting.type === 'int') inp.style.width = '160px';
-        right.appendChild(inp);
+        if (kind && setting.type === 'int') {
+            renderFriendlyInt(setting, right, kind);
+        } else {
+            const inp = document.createElement('input');
+            inp.id = 'sf_' + setting.key;
+            inp.className = 't-input';
+            inp.type = setting.type === 'int' ? 'number' : 'text';
+            inp.value = Array.isArray(setting.value)
+                ? setting.value.join(',')
+                : (setting.value !== null && setting.value !== undefined ? String(setting.value) : '');
+            if (setting.type === 'int') inp.classList.add('settings-number-input');
+            right.appendChild(inp);
+        }
+        right.appendChild(reset);
     }
-    const reset = document.createElement('button');
-    reset.type = 'button';
-    reset.className = 'action-btn';
-    reset.title = `Reset to default: ${setting.default}`;
-    reset.textContent = 'Reset';
-    reset.style.fontSize = '12px';
-    reset.style.padding = '4px 10px';
-    reset.onclick = () => resetSetting(setting.key);
-    right.appendChild(reset);
 
     row.appendChild(right);
     return row;
+}
+
+function parseTiers(val) {
+    if (!val) return [];
+    return val.split(',').map(pair => {
+        const parts = pair.trim().split(':');
+        return { height: parts[0] ? parseInt(parts[0], 10) : 0, bitrate: (parts[1] || '').trim() };
+    }).filter(t => t.height > 0 || t.bitrate);
+}
+
+function serializeTiers(tiers) {
+    return tiers
+        .filter(t => Number(t.height) > 0 && String(t.bitrate || '').trim())
+        .map(t => `${parseInt(t.height, 10)}:${String(t.bitrate).trim()}`)
+        .join(',');
+}
+
+function buildTiersEditor(setting, container) {
+    const hiddenInput = document.createElement('input');
+    hiddenInput.type = 'hidden';
+    hiddenInput.id = 'sf_' + setting.key;
+    hiddenInput.value = setting.value || '';
+    hiddenInput.dataset.settingKind = 'tiers';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'tier-editor';
+    wrapper.dataset.key = setting.key;
+    wrapper.dataset.tiers = JSON.stringify(parseTiers(setting.value));
+
+    renderTierList(wrapper, hiddenInput);
+
+    // Create a row for ABR tier editor bottom actions (Add tier + Reset)
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display: flex; align-items: center; gap: 8px; margin-top: 10px;';
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'action-btn';
+    addBtn.innerHTML = '<span class="material-icons-round" style="font-size:16px">add</span> Add tier';
+    addBtn.onclick = () => openTierModal(wrapper, hiddenInput, null);
+
+    const resetBtn = document.createElement('button');
+    resetBtn.type = 'button';
+    resetBtn.className = 'action-btn';
+    resetBtn.title = 'Reset to default: ' + setting.default;
+    resetBtn.innerHTML = '<span class="material-icons-round" style="font-size:16px">restart_alt</span> Reset';
+    resetBtn.onclick = () => resetSetting(setting.key);
+
+    btnRow.append(addBtn, resetBtn);
+    wrapper.appendChild(btnRow);
+
+    container.appendChild(hiddenInput);
+    container.appendChild(wrapper);
+}
+
+function tierRole(key) {
+    return key === 'TIER0_BITRATES'
+        ? 'Source tier passthrough'
+        : 'Encoded playback tier';
+}
+
+function getTierData(wrapper) {
+    try { return JSON.parse(wrapper.dataset.tiers || '[]'); }
+    catch (_) { return []; }
+}
+
+function setTierData(wrapper, hiddenInput, tiers) {
+    wrapper.dataset.tiers = JSON.stringify(tiers);
+    hiddenInput.value = serializeTiers(tiers);
+    renderTierList(wrapper, hiddenInput);
+}
+
+function renderTierList(wrapper, hiddenInput) {
+    wrapper.querySelectorAll('.tier-editor-list, .tier-empty').forEach(el => el.remove());
+    const addBtn = wrapper.querySelector('.tier-editor-add');
+    const tiers = getTierData(wrapper);
+    if (!tiers.length) {
+        const empty = document.createElement('div');
+        empty.className = 'tier-empty';
+        empty.textContent = 'No tiers configured.';
+        wrapper.insertBefore(empty, addBtn || null);
+        return;
+    }
+    const list = document.createElement('div');
+    list.className = 'tier-editor-list';
+    tiers.forEach((tier, index) => {
+        const row = document.createElement('div');
+        row.className = 'tier-list-row';
+        row.innerHTML = `
+            <div class="tier-height-pill">${escHtml(tier.height)}p</div>
+            <div class="tier-list-main">
+                <div class="tier-list-title">${escHtml(tier.bitrate)}</div>
+                <div class="tier-list-meta">${tierRole(wrapper.dataset.key)}</div>
+            </div>
+            <div class="tier-list-actions">
+                <button class="action-btn" type="button">Edit</button>
+                <button class="action-btn danger" type="button">Delete</button>
+            </div>
+        `;
+        row.querySelector('.tier-list-actions button:first-child').onclick = () => openTierModal(wrapper, hiddenInput, index);
+        row.querySelector('.tier-list-actions button:last-child').onclick = () => {
+            const next = getTierData(wrapper);
+            next.splice(index, 1);
+            setTierData(wrapper, hiddenInput, next);
+        };
+        list.appendChild(row);
+    });
+    wrapper.insertBefore(list, addBtn || null);
+}
+
+function openTierModal(wrapper, hiddenInput, index) {
+    const tiers = getTierData(wrapper);
+    const tier = index === null ? { height: '', bitrate: '' } : tiers[index];
+    _tierModalState = { wrapper, hiddenInput, index };
+    document.getElementById('tierModalTitle').textContent = index === null ? 'Add ABR tier' : 'Edit ABR tier';
+    document.getElementById('tierHeightInput').value = tier?.height || '';
+    document.getElementById('tierBitrateInput').value = tier?.bitrate || '';
+    document.getElementById('tierModalStatus').textContent = '';
+    document.getElementById('tierModalStatus').className = 'settings-status';
+    document.getElementById('tierModal').classList.add('active');
+    document.getElementById('tierHeightInput').focus();
+}
+
+function closeTierModal() {
+    document.getElementById('tierModal').classList.remove('active');
+    _tierModalState = null;
+}
+
+function saveTierModal() {
+    const status = document.getElementById('tierModalStatus');
+    const height = parseInt(document.getElementById('tierHeightInput').value, 10);
+    const bitrate = document.getElementById('tierBitrateInput').value.trim();
+    if (!height || height < 1 || !bitrate) {
+        status.textContent = 'Height and bitrate are required.';
+        status.className = 'settings-status error';
+        return;
+    }
+    if (!_tierModalState) return;
+    const tiers = getTierData(_tierModalState.wrapper);
+    const nextTier = { height, bitrate };
+    if (_tierModalState.index === null) tiers.push(nextTier);
+    else tiers[_tierModalState.index] = nextTier;
+    setTierData(_tierModalState.wrapper, _tierModalState.hiddenInput, tiers);
+    closeTierModal();
+}
+
+function handleTierModalOverlayClick(e) {
+    if (e.target === document.getElementById('tierModal')) closeTierModal();
 }
 
 function collectCategoryValues(catKey) {
@@ -188,7 +528,7 @@ function collectCategoryValues(catKey) {
     const cat = _settingsData?.categories?.[catKey];
     if (!cat) return {};
     for (const setting of cat.settings) {
-        const el = document.getElementById(`sf_${setting.key}`);
+        const el = document.getElementById('sf_' + setting.key);
         if (!el) continue;
         if (setting.type === 'bool') {
             result[setting.key] = el.getAttribute('aria-checked') === 'true';
@@ -201,8 +541,9 @@ function collectCategoryValues(catKey) {
     return result;
 }
 
-function saveCategory(catKey, btn, statusEl) {
-    const values = collectCategoryValues(catKey);
+function saveSection(catKeys, btn, statusEl) {
+    const values = {};
+    for (const catKey of catKeys) Object.assign(values, collectCategoryValues(catKey));
     btn.disabled = true;
     statusEl.textContent = 'Saving…';
     statusEl.className = 'settings-status';
@@ -225,7 +566,7 @@ function saveCategory(catKey, btn, statusEl) {
 }
 
 function resetSetting(key) {
-    if (!confirm(`Reset "${key}" to its default value?`)) return;
+    if (!confirm('Reset "' + key + '" to its default value?')) return;
     fetch('/api/settings/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -235,7 +576,7 @@ function resetSetting(key) {
         if (!r.ok) throw new Error(d.error || 'Reset failed');
         _settingsData = d;
         renderAllSettings(d);
-    }).catch(e => alert(`Reset failed: ${e.message}`));
+    }).catch(e => alert('Reset failed: ' + e.message));
 }
 
 // ─── Bot Management ────────────────────────────────────────────────────────────
@@ -509,7 +850,7 @@ function downloadDbExport() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'streamer-export.json';
+        a.download = 'streamer-export.db';
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -538,78 +879,28 @@ function telegramDbExport() {
     }).then(async r => {
         const d = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(d.message || d.error || 'Export failed');
-        const fileIdInput = document.getElementById('telegramImportFileId');
-        const botIndexInput = document.getElementById('telegramImportBotIndex');
-        if (fileIdInput && typeof d.file_id === 'string') fileIdInput.value = d.file_id;
-        if (botIndexInput && Number.isFinite(Number(d.bot_index))) {
-            botIndexInput.value = String(d.bot_index);
-        }
-        setDbExportStatus(`Uploaded with bot ${d.bot_index}: ${d.file_id}`, 'ok');
+        const uploaded = Array.isArray(d.uploads) ? d.uploads.length : 0;
+        const failed = Array.isArray(d.failed_bots) ? d.failed_bots.length : 0;
+        setDbExportStatus(`Uploaded snapshot to ${uploaded} bot file(s)${failed ? `; ${failed} failed` : ''}.`, failed ? 'error' : 'ok');
     }).catch(e => setDbExportStatus(e.message, 'error'));
-}
-
-function readBotIndexMap() {
-    const raw = document.getElementById('dbImportMap').value.trim();
-    if (!raw) return {};
-    let parsed;
-    try {
-        parsed = JSON.parse(raw);
-    } catch {
-        throw new Error('Bot index map must be valid JSON object, e.g. {"0":0,"1":0}. Optional: leave empty for auto-mapping.');
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('Bot index map must be a JSON object like {"0":0,"1":0}.');
-    }
-    for (const [key, value] of Object.entries(parsed)) {
-        if (!/^[-]?\d+$/.test(key) || !Number.isInteger(value)) {
-            throw new Error(`Invalid bot_index_map entry: "${key}": ${JSON.stringify(value)}. Keys and values must be integers.`);
-        }
-    }
-    return parsed;
 }
 
 function importDbExportFile() {
     const file = document.getElementById('dbImportFileInput')?.files?.[0];
     if (!file) {
-        setDbImportStatus('Choose a local export JSON file first.', 'error');
+        setDbImportStatus('Choose a local database file first.', 'error');
         return;
     }
-    const map = readBotIndexMap();
     const formData = new FormData();
-    formData.append('file', file);
-    formData.append('bot_index_map', JSON.stringify(map));
+    formData.append('database', file);
     setDbImportStatus('Importing…');
     fetch('/api/db/import', { method: 'POST', body: formData })
         .then(async r => {
             const d = await r.json().catch(() => ({}));
             if (!r.ok) throw new Error(d.message || d.error || 'Import failed');
-            setDbImportStatus(`Imported ${d.merged_jobs} jobs and ${d.merged_segments} segments.`, 'ok');
+            setDbImportStatus(`Imported ${d.merged_jobs} jobs, ${d.merged_segments} segments, and ${d.merged_segment_parts || 0} segment parts.`, 'ok');
         })
         .catch(e => setDbImportStatus(e.message, 'error'));
-}
-
-function importDbExportTelegram() {
-    const map = readBotIndexMap();
-    const fileId = document.getElementById('telegramImportFileId').value.trim();
-    const botIndex = parseInt(document.getElementById('telegramImportBotIndex').value, 10);
-    if (!fileId) {
-        setDbImportStatus('Telegram file_id is required.', 'error');
-        return;
-    }
-    if (Number.isNaN(botIndex)) {
-        setDbImportStatus('Telegram downloader bot index must be a number.', 'error');
-        return;
-    }
-    setDbImportStatus('Downloading…');
-    fetch('/api/db/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file_id: fileId, bot_index: botIndex, bot_index_map: map }),
-    }).then(async r => {
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(d.message || d.error || 'Import failed');
-        setDbImportStatus(`Imported ${d.merged_jobs} jobs and ${d.merged_segments} segments.`, 'ok');
-    }).catch(e => setDbImportStatus(e.message, 'error'));
 }
 
 function loadDatabaseFromFile() {

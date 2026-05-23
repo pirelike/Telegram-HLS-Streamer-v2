@@ -82,6 +82,8 @@ pub struct Config {
 
     pub bots: Vec<BotConfig>,
     pub upload_parallelism: u32,
+    pub db_sync_enabled: bool,
+    pub db_sync_bootstrap: String,
     pub db_auto_merge_interval_minutes: u32,
     pub db_auto_merge_file_id: String,
     pub db_auto_merge_bot_index: u32,
@@ -153,6 +155,8 @@ impl Default for Config {
             ],
             bots: Vec::new(),
             upload_parallelism: 12,
+            db_sync_enabled: true,
+            db_sync_bootstrap: String::new(),
             db_auto_merge_interval_minutes: 0,
             db_auto_merge_file_id: String::new(),
             db_auto_merge_bot_index: 0,
@@ -220,7 +224,6 @@ impl Config {
             "MAX_PARALLEL_ENCODES" => self.max_parallel_encodes.to_string(),
             "VIDEO_BITRATE" => self.video_bitrate.clone(),
             "AUDIO_BITRATE" => self.audio_bitrate.clone(),
-            "HLS_SEGMENT_DURATION" => self.hls_segment_duration.to_string(),
             "AUDIO_SEGMENT_DURATION" => self.audio_segment_duration.to_string(),
             "JOB_TIMEOUT_SECONDS" => self.job_timeout_seconds.to_string(),
             "QUEUE_TIMEOUT_SECONDS" => self.queue_timeout_seconds.to_string(),
@@ -238,6 +241,8 @@ impl Config {
             "WATCH_VIDEO_EXTENSIONS" => self.watch_video_extensions.join(","),
             "WATCH_IGNORE_SUFFIXES" => self.watch_ignore_suffixes.join(","),
             "UPLOAD_PARALLELISM" => self.upload_parallelism.to_string(),
+            "DB_SYNC_ENABLED" => self.db_sync_enabled.to_string(),
+            "DB_SYNC_BOOTSTRAP" => self.db_sync_bootstrap.clone(),
             "DB_AUTO_MERGE_INTERVAL_MINUTES" => self.db_auto_merge_interval_minutes.to_string(),
             "DB_AUTO_MERGE_FILE_ID" => self.db_auto_merge_file_id.clone(),
             "DB_AUTO_MERGE_BOT_INDEX" => self.db_auto_merge_bot_index.to_string(),
@@ -353,7 +358,6 @@ fn apply_setting(cfg: &mut Config, key: &str, value: &str, source: &str) {
             "MAX_PARALLEL_ENCODES" => cfg.max_parallel_encodes = parse_int(value)?,
             "VIDEO_BITRATE" => cfg.video_bitrate = value.to_string(),
             "AUDIO_BITRATE" => cfg.audio_bitrate = value.to_string(),
-            "HLS_SEGMENT_DURATION" => cfg.hls_segment_duration = parse_int(value)?,
             "AUDIO_SEGMENT_DURATION" => cfg.audio_segment_duration = parse_int(value)?,
             "JOB_TIMEOUT_SECONDS" => cfg.job_timeout_seconds = parse_int(value)?,
             "QUEUE_TIMEOUT_SECONDS" => cfg.queue_timeout_seconds = parse_int(value)?,
@@ -377,6 +381,8 @@ fn apply_setting(cfg: &mut Config, key: &str, value: &str, source: &str) {
                 cfg.watch_ignore_suffixes = settings_registry::parse_list(value)
             }
             "UPLOAD_PARALLELISM" => cfg.upload_parallelism = parse_int(value)?,
+            "DB_SYNC_ENABLED" => cfg.db_sync_enabled = parse_bool(value)?,
+            "DB_SYNC_BOOTSTRAP" => cfg.db_sync_bootstrap = value.to_string(),
             "DB_AUTO_MERGE_INTERVAL_MINUTES" => {
                 cfg.db_auto_merge_interval_minutes = parse_int(value)?
             }

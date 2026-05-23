@@ -72,7 +72,7 @@ use crate::config::Config;
 //   `cfg.hls_segment_duration`.
 // - Audio is a separate concern. Audio bitrate is small and stable, so
 //   `AUDIO_SEGMENT_DURATION` is intentionally still a static user setting
-//   (see settings_registry.rs, adaptive_bitrate category). Don't merge it
+//   (see settings_registry.rs, file_handling category). Don't merge it
 //   into this formula.
 // - Tests in `src/media/mod.rs` drive the formula by setting
 //   `cfg.segment_target_size`, not by setting a segment-duration field.
@@ -580,9 +580,7 @@ async fn repair_oversized_video_segments(
         let cancel = cancel.clone();
         let encode_semaphore = encode_semaphore.clone();
 
-        let duration = probe_duration(&path)
-            .await
-            .unwrap_or(target_secs as f64);
+        let duration = probe_duration(&path).await.unwrap_or(target_secs as f64);
         let bps = max_bitrate_for_segment(cfg.telegram_max_file_size, duration);
         if repair_needs_split(bps) {
             tracing::warn!(
@@ -636,9 +634,7 @@ async fn repair_oversized_segment_max_bitrate(
     target_secs: u32,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let duration = probe_duration(path)
-        .await
-        .unwrap_or(target_secs as f64);
+    let duration = probe_duration(path).await.unwrap_or(target_secs as f64);
     // telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
     let max_size = (cfg.telegram_max_file_size as f64 * 0.95) as u64;
     let seconds = duration.max(0.1);

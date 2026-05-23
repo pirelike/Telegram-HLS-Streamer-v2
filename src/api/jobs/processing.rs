@@ -504,6 +504,10 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
     );
     finish_job_complete(&state, &request.job_id).await;
     super::super::playback::spawn_cache_warmup(state.clone(), request.job_id.clone());
+    super::super::db_transfer::trigger_automatic_db_sync(
+        state.clone(),
+        format!("job-{}", request.job_id),
+    );
     cleanup_request_paths(&request, &processing_path).await;
 }
 

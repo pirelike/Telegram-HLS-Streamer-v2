@@ -100,6 +100,16 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         name: "add_normalized_media_columns",
         run: run_migration_18,
     },
+    Migration {
+        revision: 19,
+        name: "add_db_sync_tables",
+        run: run_migration_19,
+    },
+    Migration {
+        revision: 20,
+        name: "remove_public_hls_segment_duration",
+        run: run_migration_20,
+    },
 ];
 
 // Public wrappers for test access
@@ -156,6 +166,12 @@ pub(crate) fn run_migration_17(conn: &Connection) -> Result<()> {
 }
 pub(crate) fn run_migration_18(conn: &Connection) -> Result<()> {
     migration_18_add_normalized_media_columns(conn)
+}
+pub(crate) fn run_migration_19(conn: &Connection) -> Result<()> {
+    migration_19_add_db_sync_tables(conn)
+}
+pub(crate) fn run_migration_20(conn: &Connection) -> Result<()> {
+    migration_20_remove_public_hls_segment_duration(conn)
 }
 
 fn table_sql_contains(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
@@ -987,6 +1003,42 @@ fn migration_18_add_normalized_media_columns(conn: &Connection) -> Result<()> {
             ON segment_parts(job_id, prefix, name, part_index);
          CREATE INDEX IF NOT EXISTS idx_segment_parts_job_prefix
             ON segment_parts(job_id, prefix);",
+    )?;
+    Ok(())
+}
+
+fn migration_19_add_db_sync_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS db_sync_snapshots (
+            id TEXT PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            schema_revision INTEGER NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            status TEXT NOT NULL CHECK (status IN ('pending','complete','partial','failed')),
+            last_error TEXT
+         );
+         CREATE TABLE IF NOT EXISTS db_sync_uploads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id TEXT NOT NULL REFERENCES db_sync_snapshots(id) ON DELETE CASCADE,
+            bot_index INTEGER NOT NULL CHECK (bot_index >= 0),
+            part_index INTEGER NOT NULL CHECK (part_index >= 0),
+            file_id TEXT NOT NULL,
+            file_size INTEGER NOT NULL CHECK (file_size >= 0),
+            uploaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL CHECK (status IN ('complete','failed')),
+            error TEXT,
+            UNIQUE(snapshot_id, bot_index, part_index)
+         );
+         CREATE INDEX IF NOT EXISTS idx_db_sync_uploads_snapshot ON db_sync_uploads(snapshot_id);
+         CREATE INDEX IF NOT EXISTS idx_db_sync_snapshots_created ON db_sync_snapshots(created_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn migration_20_remove_public_hls_segment_duration(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM settings WHERE key = 'HLS_SEGMENT_DURATION'",
+        [],
     )?;
     Ok(())
 }
