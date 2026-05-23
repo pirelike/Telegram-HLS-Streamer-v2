@@ -14,157 +14,176 @@ function loadSettings() {
             renderAllSettings(data);
         })
         .catch((err) => {
-            document.getElementById('settingsContainer').innerHTML =
-                `<div class="page-card"><p style="color:var(--danger)">Failed to load settings: ${escHtml(err.message || 'Unknown error')}.</p></div>`;
+            const host = document.getElementById('settings-server');
+            if (host) host.innerHTML =
+                `<div class="t-pane settings-pane"><div class="t-settings-row"><div style="color:var(--t-danger)">Failed to load settings: ${escHtml(err.message || 'Unknown error')}.</div></div></div>`;
         });
 }
 
+// ─── Sidebar / section navigation ────────────────────────────────────────────
+//
+// Each API settings category gets mapped to one of the static sections in
+// the sidebar so the page matches the prototype's curated labels (General,
+// Transcoding, ABR tiers, Cache, System, Cloudflared) rather than dumping
+// raw category keys (file_handling, adaptive_bitrate, …).
+const CATEGORY_TO_SECTION = {
+    server:            'settings-server',
+    file_handling:     'settings-cache',
+    hardware:          'settings-system',
+    hls:               'settings-media',
+    adaptive_bitrate:  'settings-abr',
+    reliability:       'settings-system',
+    rate_limiting:     'settings-system',
+    watch_folder:      'settings-watch',
+    telegram:          'settings-bots',
+    cloudflared:       'settings-cloudflared',
+};
+
 function renderAllSettings(data) {
-    const container = document.getElementById('settingsContainer');
-    container.innerHTML = '';
-    for (const [catKey, category] of Object.entries(data.categories)) {
-        container.appendChild(renderCategoryCard(catKey, category));
+    // Wipe any per-section dynamic groups the previous run left behind.
+    document.querySelectorAll('.settings-group[data-dyn]').forEach(s => s.remove());
+    const cats = data.categories || {};
+    for (const [catKey, category] of Object.entries(cats)) {
+        const targetId = CATEGORY_TO_SECTION[catKey] || 'settings-server';
+        const target = document.getElementById(targetId);
+        if (!target) continue;
+        const groupEl = renderCategoryGroup(catKey, category);
+        target.insertBefore(groupEl, target.firstChild);  // prepend dyn groups above any static markup
     }
+    wireSidebar();
+    activateSection('settings-server');
 }
 
-function renderCategoryCard(catKey, category) {
-    const card = document.createElement('div');
-    card.className = 'page-card';
-    card.dataset.category = catKey;
+function wireSidebar() {
+    document.querySelectorAll('#settingsSide .t-side__item').forEach(el => {
+        el.onclick = () => activateSection(el.dataset.section);
+    });
+}
+function activateSection(sectionId) {
+    document.querySelectorAll('#settingsSide .t-side__item').forEach(el => {
+        if (el.dataset.section === sectionId) el.setAttribute('aria-current', 'page');
+        else el.removeAttribute('aria-current');
+    });
+    document.querySelectorAll('.settings-section').forEach(sec => {
+        sec.hidden = sec.id !== sectionId;
+    });
+    const active = document.querySelector('#settingsSide .t-side__item[aria-current]');
+    const heading = document.getElementById('settingsHeading');
+    const sub = document.getElementById('settingsSubtitle');
+    if (active && heading) heading.textContent = active.textContent.trim();
+    if (sub) sub.textContent = sectionDescription(sectionId);
+}
+function sectionDescription(sectionId) {
+    if (sectionId === 'settings-server')      return 'Network bindings, public URL, and global server flags.';
+    if (sectionId === 'settings-bots')        return 'Add, remove, and probe Telegram storage bots.';
+    if (sectionId === 'settings-watch')       return 'Auto-ingest media dropped into a watched folder.';
+    if (sectionId === 'settings-db')          return 'Backup, export, import, and replace the SQLite database.';
+    if (sectionId === 'settings-media')       return 'Transcoding pipeline, HLS, and encoder settings.';
+    if (sectionId === 'settings-abr')         return 'Adaptive bitrate tier behaviour.';
+    if (sectionId === 'settings-cache')       return 'Segment cache and disk-backed cache.';
+    if (sectionId === 'settings-system')      return 'Reliability, rate limiting, and hardware acceleration.';
+    if (sectionId === 'settings-cloudflared') return 'Cloudflared tunnel configuration.';
+    return 'Configure server behaviour. Changes save per section.';
+}
 
-    const header = document.createElement('div');
-    header.className = 'page-card-header';
-    header.innerHTML = `<span class="page-card-title">${escHtml(category.label)}</span>`;
-    card.appendChild(header);
+// ─── Category group (dynamic from /api/settings) ─────────────────────────────
+// Returns a `.settings-group` to be inserted into one of the static sections.
+function renderCategoryGroup(catKey, category) {
+    const group = document.createElement('div');
+    group.className = 'settings-group';
+    group.dataset.category = catKey;
+    group.dataset.dyn = '1';
 
-    const grid = document.createElement('div');
-    grid.className = 'settings-grid';
+    const head = document.createElement('div');
+    head.className = 'settings-group-head';
+    head.innerHTML = `<h2>${escHtml(category.label)}</h2>`;
+    group.appendChild(head);
 
-    for (const setting of category.settings) {
-        grid.appendChild(renderField(setting));
-    }
-    card.appendChild(grid);
+    const pane = document.createElement('div');
+    pane.className = 't-pane settings-pane';
+    for (const setting of category.settings) pane.appendChild(renderFieldRow(setting));
+    group.appendChild(pane);
 
     const actions = document.createElement('div');
     actions.className = 'settings-actions';
     const saveBtn = document.createElement('button');
-    saveBtn.className = 'settings-btn';
+    saveBtn.className = 'action-btn primary';
     saveBtn.textContent = 'Save';
-    saveBtn.onclick = () => saveCategory(catKey, saveBtn, statusEl);
     const statusEl = document.createElement('span');
     statusEl.className = 'settings-status';
-    actions.appendChild(saveBtn);
-    actions.appendChild(statusEl);
-    card.appendChild(actions);
+    saveBtn.onclick = () => saveCategory(catKey, saveBtn, statusEl);
+    actions.append(saveBtn, statusEl);
+    group.appendChild(actions);
 
-    return card;
+    return group;
 }
 
-function renderField(setting) {
-    const wrap = document.createElement('div');
-    wrap.className = 'form-group';
-    wrap.dataset.key = setting.key;
+function renderFieldRow(setting) {
+    const row = document.createElement('div');
+    row.className = 't-settings-row';
+    if (setting.type === 'tiers') row.classList.add('t-settings-row--stack');
+    row.dataset.key = setting.key;
 
-    const labelRow = document.createElement('div');
-    labelRow.style.cssText = 'display:flex;align-items:center;gap:0.5rem;margin-bottom:0.6rem;';
-
-    const label = document.createElement('label');
-    label.className = 'form-label';
-    label.style.margin = '0';
-    label.htmlFor = `sf_${setting.key}`;
-    label.textContent = setting.key;
-    labelRow.appendChild(label);
-
-    const resetBtn = document.createElement('button');
-    resetBtn.className = 'field-reset-link';
-    resetBtn.textContent = 'reset';
-    resetBtn.title = `Reset to default: ${setting.default}`;
-    resetBtn.onclick = () => resetSetting(setting.key);
-    labelRow.appendChild(resetBtn);
-    wrap.appendChild(labelRow);
-
-    let input;
-    if (setting.type === 'bool') {
-        const inline = document.createElement('div');
-        inline.className = 'settings-inline';
-        input = document.createElement('input');
-        input.type = 'checkbox';
-        input.id = `sf_${setting.key}`;
-        input.checked = !!setting.value;
-        const lbl = document.createElement('label');
-        lbl.htmlFor = `sf_${setting.key}`;
-        lbl.style.cssText = 'font-size:0.9rem;font-weight:500;';
-        lbl.textContent = setting.description;
-        inline.appendChild(input);
-        inline.appendChild(lbl);
-        wrap.appendChild(inline);
-        wrap.appendChild(buildDefaultHint(setting.key, setting.default));
-    } else if (setting.type === 'tiers') {
-        input = document.createElement('textarea');
-        input.id = `sf_${setting.key}`;
-        input.className = 'form-input';
-        input.rows = 2;
-        input.style.resize = 'vertical';
-        input.value = setting.value || '';
-
-        const descEl = document.createElement('div');
-        descEl.className = 'field-description';
-        descEl.textContent = setting.description;
-        wrap.appendChild(input);
-        wrap.appendChild(descEl);
-        wrap.appendChild(buildDefaultHint(setting.key, setting.default));
-        return wrap;
-    } else {
-        input = document.createElement('input');
-        input.id = `sf_${setting.key}`;
-        input.className = 'form-input';
-        input.type = setting.type === 'int' ? 'number' : 'text';
-        input.value = setting.value !== null && setting.value !== undefined ? String(setting.value) : '';
-    }
-
-    if (setting.type !== 'bool') {
-        wrap.appendChild(input);
-    }
-
-    if (setting.type === 'int') {
-        const formatted = formatDisplay(setting.key, setting.value);
-        if (formatted) {
-            const spanEl = document.createElement('span');
-            spanEl.className = 'field-display-hint';
-            spanEl.style.cssText = 'margin-left:0.5rem;color:var(--text-muted);font-size:0.85rem;';
-            spanEl.id = 'sfh_' + setting.key;
-            spanEl.textContent = formatted;
-            input.addEventListener('input', function() {
-                const el = document.getElementById('sfh_' + setting.key);
-                if (el) { const f = formatDisplay(setting.key, this.value); el.textContent = f || ''; }
-            });
-            wrap.appendChild(spanEl);
-        }
-    }
-
-    if (setting.type !== 'bool') {
-        const descEl = document.createElement('div');
-        descEl.className = 'field-description';
-        descEl.textContent = setting.description;
-        wrap.appendChild(descEl);
-        wrap.appendChild(buildDefaultHint(setting.key, setting.default));
-    }
-
-    return wrap;
-}
-
-function buildDefaultHint(key, defaultValue) {
+    const left = document.createElement('div');
+    const titleEl = document.createElement('div');
+    titleEl.className = 't-settings-row-label';
+    titleEl.textContent = setting.key;
     const hintEl = document.createElement('div');
-    hintEl.className = 'field-description';
-    hintEl.style.color = 'var(--text-muted)';
-    const formatted = formatDisplay(key, defaultValue);
-    hintEl.textContent = 'Default: ' + defaultValue + (formatted ? ' ' + formatted : '');
-    return hintEl;
+    hintEl.className = 't-settings-row-hint';
+    const desc = setting.description || '';
+    const formattedDefault = formatDisplay(setting.key, setting.default);
+    hintEl.textContent = desc + (desc ? ' · ' : '') +
+        'Default: ' + setting.default + (formattedDefault ? ' ' + formattedDefault : '');
+    left.append(titleEl, hintEl);
+    row.appendChild(left);
+
+    const right = document.createElement('div');
+    right.style.cssText = 'display:flex;align-items:center;gap:8px;justify-content:flex-end;';
+    if (setting.type === 'bool') {
+        const sw = document.createElement('button');
+        sw.type = 'button';
+        sw.className = 't-switch';
+        sw.id = `sf_${setting.key}`;
+        sw.setAttribute('role', 'switch');
+        sw.setAttribute('aria-checked', String(!!setting.value));
+        sw.addEventListener('click', () => {
+            const on = sw.getAttribute('aria-checked') !== 'true';
+            sw.setAttribute('aria-checked', String(on));
+        });
+        right.appendChild(sw);
+    } else if (setting.type === 'tiers') {
+        const ta = document.createElement('textarea');
+        ta.id = `sf_${setting.key}`;
+        ta.className = 't-input';
+        ta.rows = 2;
+        ta.value = setting.value || '';
+        ta.style.minWidth = '0';
+        right.style.justifyContent = 'stretch';
+        right.appendChild(ta);
+    } else {
+        const inp = document.createElement('input');
+        inp.id = `sf_${setting.key}`;
+        inp.className = 't-input';
+        inp.type = setting.type === 'int' ? 'number' : 'text';
+        inp.value = setting.value !== null && setting.value !== undefined ? String(setting.value) : '';
+        if (setting.type === 'int') inp.style.width = '160px';
+        right.appendChild(inp);
+    }
+    const reset = document.createElement('button');
+    reset.type = 'button';
+    reset.className = 'action-btn';
+    reset.title = `Reset to default: ${setting.default}`;
+    reset.textContent = 'Reset';
+    reset.style.fontSize = '12px';
+    reset.style.padding = '4px 10px';
+    reset.onclick = () => resetSetting(setting.key);
+    right.appendChild(reset);
+
+    row.appendChild(right);
+    return row;
 }
 
 function collectCategoryValues(catKey) {
-    const card = document.querySelector(`.page-card[data-category="${catKey}"]`);
-    if (!card) return {};
     const result = {};
     const cat = _settingsData?.categories?.[catKey];
     if (!cat) return {};
@@ -172,7 +191,7 @@ function collectCategoryValues(catKey) {
         const el = document.getElementById(`sf_${setting.key}`);
         if (!el) continue;
         if (setting.type === 'bool') {
-            result[setting.key] = el.checked;
+            result[setting.key] = el.getAttribute('aria-checked') === 'true';
         } else if (setting.type === 'int') {
             result[setting.key] = parseInt(el.value, 10);
         } else {
@@ -233,60 +252,51 @@ function loadBots() {
 
 function renderBotList(bots) {
     const container = document.getElementById('botListContainer');
+    container.classList.add('bot-list-pane');
     if (!bots || bots.length === 0) {
-        container.innerHTML = '<div class="bot-empty">No bots configured. Add one below.</div>';
+        container.innerHTML = '<div class="bot-empty" style="color:var(--t-ink-3);font-size:13px;padding:18px;">No bots configured. Add one below.</div>';
         return;
     }
-
-    const table = document.createElement('table');
-    table.className = 'bot-table';
-    table.innerHTML = `<thead><tr>
-        <th>#</th>
-        <th>Token</th>
-        <th>Channel ID</th>
-        <th>Segments</th>
-        <th>Storage</th>
-        <th>Session</th>
-        <th>Status</th>
-        <th>Actions</th>
-    </tr></thead>`;
-
-    const tbody = document.createElement('tbody');
-    for (const bot of bots) {
-        tbody.appendChild(renderBotRow(bot));
-    }
-    table.appendChild(tbody);
     container.innerHTML = '';
-    container.appendChild(table);
+    for (const bot of bots) container.appendChild(renderBotRow(bot));
 }
 
 function renderBotRow(bot) {
-    const tr = document.createElement('tr');
-    tr.id = `bot-row-${bot.index}`;
+    const row = document.createElement('div');
+    row.className = 'bot-row';
+    row.id = `bot-row-${bot.index}`;
     const stats = bot.stats || {};
     const sessionLabel = stats.session_uploads > 0
-        ? `${stats.session_uploads}↑`
-        : '—';
-    const sessionTitle = stats.session_uploads > 0
-        ? `${stats.session_uploads} uploads (${formatBytes(stats.session_upload_bytes || 0)}), ${stats.session_downloads || 0} downloads, ${stats.session_errors || 0} errors`
+        ? `${stats.session_uploads} uploads · ${formatBytes(stats.session_upload_bytes || 0)}`
         : 'No uploads this session';
-    tr.innerHTML = `
-        <td>${bot.index}</td>
-        <td><code>${escHtml(bot.token_masked)}</code>${bot.source === 'env' ? ' <span style="font-size:0.75rem;color:var(--text-muted)">(env)</span>' : ''}</td>
-        <td><code>${bot.channel_id}</code></td>
-        <td style="font-size:0.85rem">${(stats.segment_count || 0).toLocaleString()}</td>
-        <td style="font-size:0.85rem">${formatBytes(stats.total_bytes || 0)}</td>
-        <td style="font-size:0.85rem" title="${escHtml(sessionTitle)}">${sessionLabel}${stats.session_errors > 0 ? ` <span style="color:var(--danger)">${stats.session_errors}✗</span>` : ''}</td>
-        <td><span class="bot-status-dot" id="bot-dot-${bot.index}"></span><span id="bot-status-${bot.index}" style="font-size:0.85rem;color:var(--text-muted)">—</span></td>
-        <td class="bot-actions">
+    const segments = (stats.segment_count || 0).toLocaleString();
+    const storage = formatBytes(stats.total_bytes || 0);
+    const meta = [
+        `<span>${escHtml(bot.channel_id)}</span>`,
+        `<span class="sep"></span><span>${segments} segments</span>`,
+        `<span class="sep"></span><span>${storage}</span>`,
+        `<span class="sep"></span><span title="${escHtml(sessionLabel)}">${stats.session_uploads > 0 ? sessionLabel : 'idle'}</span>`,
+    ].join('');
+    row.innerHTML = `
+        <div class="bot-index">${bot.index}</div>
+        <div style="min-width:0">
+            <div class="bot-token">${escHtml(bot.token_masked)}${bot.source === 'env' ? ' <span style="font-size:11px;color:var(--t-ink-3)">(env)</span>' : ''}${bot.label ? ` <span style="color:var(--t-ink-3)">— ${escHtml(bot.label)}</span>` : ''}</div>
+            <div class="bot-meta">${meta}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t-ink-2)">
+            <span class="bot-status-dot" id="bot-dot-${bot.index}"></span>
+            <span id="bot-status-${bot.index}">—</span>
+        </div>
+        <div class="bot-actions">
             <button class="action-btn" onclick="checkBotHealth(${bot.index})">Check</button>
             ${bot.source === 'db' && bot.db_id != null
-                ? `<button class="action-btn" style="color:var(--danger)" onclick="deleteBot(${bot.db_id})">Delete</button>`
+                ? `<button class="action-btn danger" onclick="deleteBot(${bot.db_id})">Delete</button>`
                 : `<button class="action-btn" disabled title="Remove from .env to delete">Delete</button>`
             }
-        </td>
+        </div>
+        <div></div>
     `;
-    return tr;
+    return row;
 }
 
 function updateBotStatusUI(index, result) {
@@ -425,11 +435,24 @@ function setWatchSettingsStatus(msg, kind='') {
 
 function applyWatchSettings(data) {
     document.getElementById('watchEnabled').checked = !!data.watch_enabled;
+    const sw = document.getElementById('watchEnabledSwitch');
+    if (sw) sw.setAttribute('aria-checked', String(!!data.watch_enabled));
     document.getElementById('watchRoot').value = data.watch_root || '';
     document.getElementById('watchDoneDir').value = data.watch_done_dir || '';
     if (data.watch_enabled) {
         setWatchSettingsStatus(`Saved. ${data.watch_running ? 'Watcher active.' : 'Watcher pending.'}`, 'ok');
     } else { setWatchSettingsStatus('Watcher disabled.'); }
+}
+
+function setupWatchSwitch() {
+    const sw = document.getElementById('watchEnabledSwitch');
+    const cb = document.getElementById('watchEnabled');
+    if (!sw || !cb) return;
+    sw.addEventListener('click', () => {
+        const on = sw.getAttribute('aria-checked') !== 'true';
+        sw.setAttribute('aria-checked', String(on));
+        cb.checked = on;
+    });
 }
 
 function loadWatchSettings() {
@@ -668,3 +691,4 @@ function escHtml(str) {
 loadSettings();
 loadBots();
 loadWatchSettings();
+setupWatchSwitch();

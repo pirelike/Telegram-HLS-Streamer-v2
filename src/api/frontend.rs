@@ -103,22 +103,20 @@ pub(super) async fn handle_anime_tv_path(
 pub(super) async fn handle_upload_page() -> Html<String> {
     base_shell(
         "Upload - Telegram HLS Streamer",
-        "",
         "upload",
         upload_body(),
         "",
-        r#"<script src="/static/upload.js"></script>"#,
+        r#"<script src="/static/upload.js?v=5"></script>"#,
     )
 }
 
 pub(super) async fn handle_settings_page() -> Html<String> {
     base_shell(
         "Settings - Telegram HLS Streamer",
-        "",
         "settings",
         settings_body(),
         "",
-        r#"<script src="/static/settings.js"></script>"#,
+        r#"<script src="/static/settings.js?v=5"></script>"#,
     )
 }
 
@@ -129,10 +127,9 @@ pub(super) async fn handle_watch_page(Path(job_id): Path<String>) -> Response {
     base_shell(
         "Watch - Telegram HLS Streamer",
         "",
-        "",
         watch_body(),
         r#"<link rel="stylesheet" href="/static/shaka-controls.css">"#,
-        r#"<script src="/static/shaka-player.ui.js"></script><script src="/static/watch.js"></script>"#,
+        r#"<script src="/static/shaka-player.ui.js"></script><script src="/static/watch.js?v=5"></script>"#,
     )
     .into_response()
 }
@@ -234,14 +231,13 @@ fn browse_page(title: &str, active_tab: &str, ctx: Value) -> Html<String> {
     );
     base_shell(
         &format!("{title} - Telegram HLS Streamer"),
-        search_bar(),
         active_tab,
         browse_body(),
         "",
         &format!(
             "{context}\
-             <script src=\"/static/browse-home.js\"></script>\
-             <script src=\"/static/browse.js\"></script>"
+             <script src=\"/static/browse-home.js?v=5\"></script>\
+             <script src=\"/static/browse.js?v=5\"></script>"
         ),
     )
 }
@@ -249,7 +245,6 @@ fn browse_page(title: &str, active_tab: &str, ctx: Value) -> Html<String> {
 // ─── base shell — new glass navbar with top tabs ────────────────────
 fn base_shell(
     title: &str,
-    navbar_center: &str,
     active_tab: &str,
     body: &str,
     extra_css: &str,
@@ -264,7 +259,7 @@ fn base_shell(
     <title>{title}</title>
     <script>(function(){{var t=localStorage.getItem('hls_theme');var d=t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches;if(d)document.documentElement.setAttribute('data-theme','dark');else document.documentElement.setAttribute('data-theme','light');}})()</script>
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Round">
-    <link rel="stylesheet" href="/static/app.css">
+    <link rel="stylesheet" href="/static/app.css?v=5">
     {extra_css}
 </head>
 <body>
@@ -273,8 +268,23 @@ fn base_shell(
         <a class="logo" href="/"><span>TG</span></a>
         <div class="t-tabs">{tabs}</div>
     </div>
-    <div class="navbar-center">{navbar_center}</div>
+    <div class="navbar-center">
+        <input type="hidden" id="searchInput">
+        <button class="search-trigger" id="searchTriggerBtn" type="button"
+                onclick="window.__thls_palette_open&&window.__thls_palette_open()" title="Search (⌘K)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.5-3.5"/>
+            </svg>
+            <span class="search-trigger-text">Search library</span>
+            <kbd class="thls-kbd">⌘K</kbd>
+        </button>
+    </div>
     <div class="navbar-right">
+        <span class="t-livepill" id="thls-status-pill" style="display:none">
+            <span class="t-livepill__dot"></span>
+            <span id="thls-status-text"></span>
+        </span>
         <a href="/upload" class="upload-btn" aria-label="Upload">
             <i class="material-icons-round">add</i>
             <span class="upload-btn-text">Upload</span>
@@ -291,7 +301,8 @@ fn base_shell(
     <aside class="sidebar" id="sidebar" hidden></aside>
     {body}
 </div>
-<script src="/static/shared.js"></script>
+<script src="/static/shared.js?v=5"></script>
+<script src="/static/browse-palette.js?v=5"></script>
 {scripts}
 </body>
 </html>"#,
@@ -324,14 +335,6 @@ fn tabs_html(active: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
-}
-
-fn search_bar() -> &'static str {
-    r#"<div class="search-bar">
-    <i class="material-icons-round search-btn" aria-hidden="true">search</i>
-    <input class="search-input" id="searchInput" type="text" placeholder="Search library">
-    <span class="kbd-hint" aria-hidden="true">⌘K</span>
-</div>"#
 }
 
 // browse_body now exposes an optional hero mount point. browse-home.js
@@ -464,92 +467,189 @@ fn upload_body() -> &'static str {
 
 fn settings_body() -> &'static str {
     r#"<main class="main settings-page" id="mainContent">
-    <div id="settingsContainer" class="settings-stack" style="max-width:1100px;margin:0 auto 24px;padding:0 56px;"></div>
-    <div class="page-card">
-        <div class="page-card-header" style="justify-content:space-between;">
-            <span class="page-card-title">Telegram Bots</span>
-            <button class="action-btn primary" onclick="openAddBotModal()">
-                <span class="material-icons-round" style="font-size:1.1rem;vertical-align:middle;">add</span>
-                Add Bot
-            </button>
-        </div>
-        <p class="settings-category-note">
-            Bots from .env cannot be deleted via the UI. Changes to the bot list take effect immediately.
-        </p>
-        <div id="botListContainer"><div class="bot-empty" style="color:var(--t-ink-3);font-size:13px;">Loading bots...</div></div>
-        <div class="settings-actions">
-            <button class="action-btn" onclick="checkAllBotHealth()">Check all health</button>
-            <span class="settings-status" id="botHealthStatus"></span>
-        </div>
+<div class="t-settings-layout">
+  <aside class="t-side t-settings-side" id="settingsSide">
+    <div class="t-side__group">Server</div>
+    <a class="t-side__item" data-section="settings-server"   aria-current="page"><i class="material-icons-round">settings</i> General</a>
+    <a class="t-side__item" data-section="settings-bots"><i class="material-icons-round">smart_toy</i> Telegram bots</a>
+    <a class="t-side__item" data-section="settings-watch"><i class="material-icons-round">folder_open</i> Watch folder</a>
+    <a class="t-side__item" data-section="settings-db"><i class="material-icons-round">storage</i> Database</a>
+    <div class="t-side__group">Media</div>
+    <a class="t-side__item" data-section="settings-media"><i class="material-icons-round">movie_filter</i> Transcoding</a>
+    <a class="t-side__item" data-section="settings-abr"><i class="material-icons-round">auto_awesome</i> ABR tiers</a>
+    <a class="t-side__item" data-section="settings-cache"><i class="material-icons-round">memory</i> Storage</a>
+    <div class="t-side__group">System</div>
+    <a class="t-side__item" data-section="settings-system"><i class="material-icons-round">tune</i> System</a>
+    <a class="t-side__item" data-section="settings-cloudflared"><i class="material-icons-round">cloud</i> Cloudflared</a>
+  </aside>
+
+  <main class="t-settings-main t-scroll" id="settingsMain">
+    <div class="settings-header">
+      <h1 class="settings-title" id="settingsHeading">General</h1>
+      <div class="settings-subtitle" id="settingsSubtitle">Streamer settings</div>
     </div>
-    <div class="page-card">
-        <div class="page-card-header"><span class="page-card-title">Watch Folder</span></div>
-        <div class="settings-stack">
-            <div class="settings-inline">
-                <input type="checkbox" id="watchEnabled">
-                <label for="watchEnabled">Enable watcher</label>
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="watchRoot">Watch root</label>
-                <input class="form-input" type="text" id="watchRoot" placeholder="/path/to/incoming">
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="watchDoneDir">Done directory</label>
-                <input class="form-input" type="text" id="watchDoneDir" placeholder="/path/to/incoming/done">
-            </div>
+
+    <section class="settings-section" id="settings-server"></section>
+
+    <section class="settings-section" id="settings-bots" hidden>
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <h2>Telegram bots</h2>
+          <div class="settings-group-sub">Bots from .env cannot be deleted via the UI. Changes take effect immediately.</div>
+        </div>
+        <div class="t-pane settings-pane">
+          <div id="botListContainer" style="padding:8px 0">
+            <div class="bot-empty" style="color:var(--t-ink-3);font-size:13px;padding:14px 18px">Loading bots…</div>
+          </div>
         </div>
         <div class="settings-actions">
-            <button class="action-btn primary" id="saveWatchSettingsBtn" onclick="saveWatchSettings()">Save</button>
-            <span class="settings-status" id="watchSettingsStatus"></span>
+          <button class="action-btn primary" onclick="openAddBotModal()">
+            <span class="material-icons-round" style="font-size:1.1rem;vertical-align:middle;">add</span> Add bot
+          </button>
+          <button class="action-btn" onclick="checkAllBotHealth()">Check all health</button>
+          <span class="settings-status" id="botHealthStatus"></span>
         </div>
-    </div>
-    <div class="page-card">
-        <div class="page-card-header"><span class="page-card-title">DB Transfer</span></div>
-        <div class="settings-stack">
-            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
-                <button class="action-btn" onclick="backupDatabase()">Create Server Backup</button>
-                <button class="action-btn" onclick="downloadDbExport()">Download Export</button>
-                <button class="action-btn" onclick="telegramDbExport()">Export to Telegram</button>
-                <span class="settings-status" id="dbExportStatus"></span>
+      </div>
+    </section>
+
+    <section class="settings-section" id="settings-watch" hidden>
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <h2>Watch folder</h2>
+          <div class="settings-group-sub">Scan a directory for new media files and auto-ingest them.</div>
+        </div>
+        <div class="t-pane settings-pane">
+          <div class="t-settings-row">
+            <div>
+              <div class="t-settings-row-label">Enable watcher</div>
+              <div class="t-settings-row-hint">Background scan every 30 seconds</div>
+            </div>
+            <div><button class="t-switch" id="watchEnabledSwitch" role="switch" aria-checked="false"></button></div>
+            <input type="checkbox" id="watchEnabled" hidden>
+          </div>
+          <div class="t-settings-row">
+            <div>
+              <div class="t-settings-row-label">Watch root</div>
+              <div class="t-settings-row-hint">Directory to scan</div>
+            </div>
+            <div><input class="t-input" id="watchRoot" placeholder="/path/to/incoming" style="width:100%;max-width:420px"></div>
+          </div>
+          <div class="t-settings-row">
+            <div>
+              <div class="t-settings-row-label">Done directory</div>
+              <div class="t-settings-row-hint">Where ingested files are moved</div>
+            </div>
+            <div><input class="t-input" id="watchDoneDir" placeholder="/path/to/incoming/done" style="width:100%;max-width:420px"></div>
+          </div>
+        </div>
+        <div class="settings-actions">
+          <button class="action-btn primary" id="saveWatchSettingsBtn" onclick="saveWatchSettings()">Save</button>
+          <span class="settings-status" id="watchSettingsStatus"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-section" id="settings-db" hidden>
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <h2>Backup & restore</h2>
+          <div class="settings-group-sub">
+            Two ways to sync libraries between servers: export the database as JSON
+            (re-uses Telegram media that's already uploaded) or replace the whole SQLite file.
+          </div>
+        </div>
+        <div class="t-pane settings-pane">
+          <div class="t-settings-row">
+            <div>
+              <div class="t-settings-row-label">Export current database</div>
+              <div class="t-settings-row-hint">Snapshot the SQLite file or generate a JSON for another server to import.</div>
+            </div>
+            <div class="settings-actions" style="margin:0;padding:0;border:0;gap:8px;flex-wrap:wrap;">
+              <button class="action-btn" onclick="backupDatabase()">Backup on server</button>
+              <button class="action-btn" onclick="downloadDbExport()">Download JSON</button>
+              <button class="action-btn" onclick="telegramDbExport()">Push JSON via bot</button>
+              <span class="settings-status" id="dbExportStatus"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <h2>Import library JSON</h2>
+          <div class="settings-group-sub">
+            Pick the source: <b>upload</b> a JSON from disk, or have one of your bots <b>fetch</b> a JSON
+            previously pushed to Telegram. The optional bot map only matters if the source server's bot
+            line-up differs from this one — leave it empty for auto-mapping.
+          </div>
+        </div>
+        <div class="t-pane settings-pane">
+          <div class="t-settings-row t-settings-row--stack">
+            <div>
+              <div class="t-settings-row-label">From local file</div>
+              <div class="t-settings-row-hint">Upload a JSON file from your computer.</div>
             </div>
             <div class="form-group">
-                <label class="form-label" for="dbImportFileInput">Local export JSON file</label>
-                <input class="form-input" type="file" id="dbImportFileInput" accept="application/json,.json">
-                <div class="field-description">Upload an export JSON from your computer. This does not use Telegram file_id/bot index fields below.</div>
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="dbImportMap">Optional: bot_index_map (source segment bot → target server bot)</label>
-                <textarea class="form-input" id="dbImportMap" rows="2" placeholder="Optional. Leave empty for auto-mapping."></textarea>
-                <div class="field-description">Leave empty to auto-map all source segment bots to this server's first bot (index 0).</div>
-            </div>
-            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
-                <button class="action-btn" onclick="importDbExportFile()">Import Local JSON</button>
+              <input class="t-input" type="file" id="dbImportFileInput" accept="application/json,.json">
+              <label class="form-label" for="dbImportMap" style="margin-top:10px">Bot map (optional)</label>
+              <textarea class="t-input" id="dbImportMap" rows="2"
+                        placeholder='e.g. {"0": 1, "1": 2} — leave empty to auto-map all to bot 0'></textarea>
+              <div class="settings-actions" style="margin-top:10px;padding-top:0;border-top:none;">
+                <button class="action-btn primary" onclick="importDbExportFile()">Import file</button>
                 <span class="settings-status" id="dbImportStatus"></span>
+              </div>
+            </div>
+          </div>
+          <div class="t-settings-row t-settings-row--stack">
+            <div>
+              <div class="t-settings-row-label">From Telegram</div>
+              <div class="t-settings-row-hint">Auto-filled after a successful "Push JSON via bot" above.</div>
             </div>
             <div class="form-group">
-                <label class="form-label" for="telegramImportFileId">Telegram export JSON file_id</label>
-                <input class="form-input" type="text" id="telegramImportFileId" autocomplete="off">
-                <div class="field-description">Use this only for Telegram JSON import. Filled automatically after a successful "Export to Telegram".</div>
+              <label class="form-label" for="telegramImportFileId">Telegram <code>file_id</code></label>
+              <input class="t-input" id="telegramImportFileId" autocomplete="off">
+              <label class="form-label" for="telegramImportBotIndex" style="margin-top:10px">Downloader bot index</label>
+              <input class="t-input" id="telegramImportBotIndex" type="number" value="0" min="0" style="width:140px">
+              <div class="settings-actions" style="margin-top:10px;padding-top:0;border-top:none;">
+                <button class="action-btn" onclick="importDbExportTelegram()">Import from Telegram</button>
+              </div>
             </div>
-            <div class="form-group">
-                <label class="form-label" for="telegramImportBotIndex">Telegram downloader bot index</label>
-                <input class="form-input" type="number" id="telegramImportBotIndex" value="0" min="0">
-                <div class="field-description">This bot downloads the export JSON file from Telegram.</div>
-            </div>
-            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
-                <button class="action-btn" onclick="importDbExportTelegram()">Import Telegram JSON</button>
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="databaseFileInput">Load SQLite database</label>
-                <input class="form-input" type="file" id="databaseFileInput" accept=".db,.sqlite,.sqlite3,application/octet-stream">
-                <div class="field-description">Replaces the live database after creating a backup.</div>
-            </div>
-            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
-                <button class="action-btn danger" id="databaseLoadBtn" onclick="loadDatabaseFromFile()">Load Database</button>
-                <span class="settings-status" id="databaseLoadStatus"></span>
-            </div>
+          </div>
         </div>
-    </div>
+      </div>
+
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <h2>Replace SQLite file</h2>
+          <div class="settings-group-sub">
+            Wipes everything and loads a different <code>streamer.db</code>. A backup is created automatically before replacement.
+          </div>
+        </div>
+        <div class="t-pane settings-pane">
+          <div class="t-settings-row t-settings-row--stack">
+            <div>
+              <div class="t-settings-row-label">Database file</div>
+              <div class="t-settings-row-hint">A <code>.db</code>, <code>.sqlite</code>, or <code>.sqlite3</code> file. Service auto-restarts.</div>
+            </div>
+            <div class="form-group">
+              <input class="t-input" type="file" id="databaseFileInput" accept=".db,.sqlite,.sqlite3,application/octet-stream">
+              <div class="settings-actions" style="margin-top:10px;padding-top:0;border-top:none;">
+                <button class="action-btn danger" id="databaseLoadBtn" onclick="loadDatabaseFromFile()">Load database</button>
+                <span class="settings-status" id="databaseLoadStatus"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-section" id="settings-media" hidden></section>
+    <section class="settings-section" id="settings-abr" hidden></section>
+    <section class="settings-section" id="settings-cache" hidden></section>
+    <section class="settings-section" id="settings-system" hidden></section>
+    <section class="settings-section" id="settings-cloudflared" hidden></section>
+  </main>
+</div>
 </main>
 <div class="modal-overlay" id="addBotModal" onclick="handleModalOverlayClick(event)">
     <div class="modal">
@@ -587,9 +687,14 @@ fn watch_body() -> &'static str {
         <div class="player-container" id="playerContainer">
             <video id="videoEl" autoplay playsinline crossorigin="anonymous"></video>
         </div>
-        <div class="breadcrumb" id="watchBreadcrumb" style="padding-top:24px;"></div>
+        <div class="breadcrumb" id="watchBreadcrumb"></div>
+        <section class="t-watch-meta-grid" id="watchMetaGrid">
+            <div class="t-watch-meta-main" id="watchMetaMain"></div>
+            <aside class="t-pane t-watch-file-details" id="watchFileDetails"></aside>
+        </section>
         <div id="episodeNav"></div>
-        <div class="player-info" id="playerInfo"></div>
+        <div class="player-info" id="playerInfo" hidden></div>
+        <section class="t-section t-watch-more" id="watchMoreLikeThis"></section>
     </div>
 </main>
 <div class="modal-overlay" id="editModal">

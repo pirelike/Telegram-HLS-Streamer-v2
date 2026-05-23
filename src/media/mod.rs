@@ -143,7 +143,8 @@ nested/video_0001.m4s?token=ignored
         let mut cfg = crate::config::Config::default();
         cfg.enable_hw_accel = false;
         cfg.abr_enabled = false;
-        cfg.hls_segment_duration = 1;
+        // Drive the per-job formula toward ~1 s segments by making the byte ceiling tiny.
+        cfg.segment_target_size = 256 * 1024;
         let output = base.join("out");
         let cancel = Arc::new(AtomicBool::new(false));
         let result = process_media(&analysis, "job1", &output, &cfg, &cancel, None)
@@ -206,8 +207,8 @@ nested/video_0001.m4s?token=ignored
                 .as_nanos()
         ));
         tokio::fs::create_dir_all(&base).await.unwrap();
-        let mut cfg = crate::config::Config::default();
-        cfg.hls_segment_duration = 4;
+        // 4 s target — alignment check tolerates up to 1.75× = 7 s.
+        let target_secs: u32 = 4;
 
         tokio::fs::write(
             base.join("playlist.m3u8"),
@@ -215,7 +216,7 @@ nested/video_0001.m4s?token=ignored
         )
         .await
         .unwrap();
-        assert!(!process::copied_segments_need_reencode(&base, &cfg)
+        assert!(!process::copied_segments_need_reencode(&base, target_secs)
             .await
             .unwrap());
 
@@ -225,14 +226,14 @@ nested/video_0001.m4s?token=ignored
         )
         .await
         .unwrap();
-        assert!(process::copied_segments_need_reencode(&base, &cfg)
+        assert!(process::copied_segments_need_reencode(&base, target_secs)
             .await
             .unwrap());
 
         tokio::fs::write(base.join("playlist.m3u8"), "#EXTM3U\n")
             .await
             .unwrap();
-        assert!(process::copied_segments_need_reencode(&base, &cfg)
+        assert!(process::copied_segments_need_reencode(&base, target_secs)
             .await
             .unwrap());
         let _ = tokio::fs::remove_dir_all(base).await;
