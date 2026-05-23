@@ -13,6 +13,7 @@
   if (!container) return;
 
   window.__THLS_HOME_HANDLED__ = true;
+  window.__thls_update_status_pill = updateStatusPill;
   loadMoreBtn?.classList.remove('visible');
 
   // skeleton while loading
@@ -35,9 +36,9 @@
     fetchSlice({ category: 'Anime Film' }),
     fetchSlice({ category: 'Anime TV', group_by: 'series' }),
     fetchHealthWithProbe(),
-  ]).then(([recent, films, series, animeFilms, animeTv, health]) => {
+  ]).then(async ([recent, films, series, animeFilms, animeTv, health]) => {
     renderHero(recent);
-    renderRows(recent, films, series, animeFilms, animeTv);
+    await renderRows(recent, films, series, animeFilms, animeTv);
     renderStats(recent, health);
     updateStatusPill(health);
   }).catch(() => {
@@ -142,14 +143,34 @@
   }
 
   // ─── Rows ───────────────────────────────────────────────────
-  function renderRows(recent, films, series, animeFilms, animeTv) {
-    // Merge persisted localStorage progress with any server-reported pct.
+  async function renderRows(recent, films, series, animeFilms, animeTv) {
+    // Fetch server-side playback progress.
+    let serverProgress = {};
+    try {
+      let clientId = localStorage.getItem('thls_client_id_v1');
+      if (clientId) {
+        const resp = await fetch('/api/playback/progress?client_id=' + encodeURIComponent(clientId));
+        if (resp.ok) {
+          const data = await resp.json();
+          for (const p of (data.progress || [])) {
+            serverProgress[p.job_id] = p;
+          }
+        }
+      }
+    } catch {}
+
+    // Merge persisted localStorage progress with server progress.
     const localProgress = (function () {
       try { return JSON.parse(localStorage.getItem('thls_progress_v1') || '{}') || {}; }
       catch { return {}; }
     })();
     const annotated = recent.map(j => {
+      const sp = serverProgress[j.job_id];
       const lp = localProgress[j.job_id];
+      // Server progress takes precedence, localStorage is fallback.
+      if (sp && sp.progress_pct > 1 && sp.progress_pct < 95) {
+        return Object.assign({}, j, { progress_pct: sp.progress_pct, resume_seconds: Math.floor(sp.position_seconds) });
+      }
       if (lp && lp.pct > 1 && lp.pct < 95) {
         return Object.assign({}, j, { progress_pct: lp.pct, resume_seconds: lp.seconds });
       }
@@ -158,7 +179,15 @@
 
     const cw = annotated
       .filter(j => j.progress_pct && j.progress_pct > 0 && j.progress_pct < 95)
-      .sort((a, b) => (localProgress[b.job_id]?.ts || 0) - (localProgress[a.job_id]?.ts || 0));
+      .sort((a, b) => {
+        const sa = serverProgress[a.job_id];
+        const sb = serverProgress[b.job_id];
+        const la = localProgress[a.job_id];
+        const lb = localProgress[b.job_id];
+        const tsA = (sa && Date.parse(sa.updated_at)) || (la?.ts) || 0;
+        const tsB = (sb && Date.parse(sb.updated_at)) || (lb?.ts) || 0;
+        return tsB - tsA;
+      });
     const anime = [...animeFilms, ...animeTv];
     const rows  = [];
 

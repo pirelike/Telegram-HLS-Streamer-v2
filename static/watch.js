@@ -4,9 +4,24 @@ let shakaUi = null;
 let currentJob = null;
 let attemptedQuotaRecovery = false;
 let currentSiblings = [];
+let currentMarkers = [];
+let skipBtn = null;
+let skipBtnAutoFade = null;
 
 // ─── Watch progress persistence (used by home "Continue Watching") ────────────
 const THLS_PROGRESS_KEY = 'thls_progress_v1';
+const THLS_CLIENT_ID_KEY = 'thls_client_id_v1';
+
+function getClientId() {
+    let id = null;
+    try { id = localStorage.getItem(THLS_CLIENT_ID_KEY); } catch {}
+    if (!id) {
+        id = 'c' + crypto.randomUUID().replace(/-/g, '');
+        try { localStorage.setItem(THLS_CLIENT_ID_KEY, id); } catch {}
+    }
+    return id;
+}
+
 function loadProgressMap() {
     try { return JSON.parse(localStorage.getItem(THLS_PROGRESS_KEY) || '{}') || {}; }
     catch { return {}; }
@@ -22,7 +37,86 @@ function saveProgress(jobId, seconds, duration) {
     }
     try { localStorage.setItem(THLS_PROGRESS_KEY, JSON.stringify(map)); } catch {}
 }
+
+async function serverSaveProgress(jobId, seconds, duration) {
+    const clientId = getClientId();
+    try {
+        await fetch(`/api/playback/progress/${encodeURIComponent(jobId)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                client_id: clientId,
+                position_seconds: Math.max(0, seconds),
+                duration_seconds: Math.max(1, duration)
+            })
+        });
+    } catch {}
+}
+
+async function serverLoadProgress(jobId) {
+    const clientId = getClientId();
+    try {
+        const resp = await fetch(`/api/playback/progress/${encodeURIComponent(jobId)}?client_id=${encodeURIComponent(clientId)}`);
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        return data.progress;
+    } catch { return null; }
+}
+
 window.THLSProgress = { load: loadProgressMap, save: saveProgress };
+window.THLSClient = { id: getClientId, save: serverSaveProgress, load: serverLoadProgress };
+
+// ─── Intro/outro skip markers ─────────────────────────────────────────────────
+async function loadMarkers(jobId) {
+    try {
+        const resp = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/markers`);
+        if (!resp.ok) return [];
+        const data = await resp.json();
+        return (data.markers || []).filter(m => m.enabled);
+    } catch { return []; }
+}
+
+function ensureSkipButton() {
+    if (skipBtn) return;
+    skipBtn = document.createElement('button');
+    skipBtn.className = 'skip-intro-btn';
+    skipBtn.textContent = 'Skip intro';
+    skipBtn.addEventListener('click', () => {
+        const marker = currentMarkers.find(m => isInsideMarker(m));
+        if (marker && shakaPlayer) {
+            const video = document.getElementById('videoEl');
+            if (video) video.currentTime = marker.end_seconds;
+            skipBtn.classList.remove('visible');
+        }
+    });
+    const container = document.getElementById('playerContainer');
+    if (container) container.appendChild(skipBtn);
+}
+
+function isInsideMarker(marker) {
+    const video = document.getElementById('videoEl');
+    if (!video || !marker) return false;
+    const t = video.currentTime;
+    return t >= marker.start_seconds && t <= marker.end_seconds;
+}
+
+function updateSkipButton() {
+    const marker = currentMarkers.find(m => isInsideMarker(m));
+    if (!marker) {
+        if (skipBtn) skipBtn.classList.remove('visible');
+        return;
+    }
+    ensureSkipButton();
+    const label = marker.marker_type === 'outro' || marker.marker_type === 'credits'
+        ? 'Skip credits'
+        : 'Skip intro';
+    skipBtn.textContent = label;
+    skipBtn.classList.add('visible');
+    clearTimeout(skipBtnAutoFade);
+    skipBtnAutoFade = setTimeout(() => {
+        if (skipBtn) skipBtn.classList.remove('visible');
+    }, 15000);
+}
 
 // ─── Player init ──────────────────────────────────────────────────────────────
 function isMobile() {
@@ -148,11 +242,17 @@ async function initPlayer(job, overrideBufferConfig = null) {
 
         renderInfoPanel(job);
 
+        // Load intro/outro markers for skip UI.
+        currentMarkers = await loadMarkers(job.job_id);
+
         // Resume from saved progress + persist while playing.
-        const saved = loadProgressMap()[job.job_id];
+        let saved = (await serverLoadProgress(job.job_id)) || loadProgressMap()[job.job_id];
         let lastSave = 0;
+        let serverLastSave = 0;
         videoEl.addEventListener('loadedmetadata', () => {
-            if (saved && saved.seconds && videoEl.duration > saved.seconds + 5) {
+            if (saved && saved.position_seconds && videoEl.duration > saved.position_seconds + 5) {
+                videoEl.currentTime = saved.position_seconds;
+            } else if (saved && saved.seconds && videoEl.duration > saved.seconds + 5) {
                 videoEl.currentTime = saved.seconds;
             }
         }, { once: true });
@@ -161,9 +261,23 @@ async function initPlayer(job, overrideBufferConfig = null) {
             if (now - lastSave < 5000) return;
             lastSave = now;
             saveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
+            updateSkipButton();
+        });
+        videoEl.addEventListener('timeupdate', () => {
+            const now = Date.now();
+            if (now - serverLastSave < 30000) return;
+            serverLastSave = now;
+            serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
         });
         videoEl.addEventListener('ended', () => {
             saveProgress(job.job_id, videoEl.duration, videoEl.duration);
+            serverSaveProgress(job.job_id, videoEl.duration, videoEl.duration);
+        });
+        videoEl.addEventListener('pause', () => {
+            serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
+        });
+        videoEl.addEventListener('seeked', () => {
+            serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
         });
 
         try { await player.load(m3u8Url); }
@@ -553,4 +667,58 @@ async function saveEditModal() {
 
     currentSiblings = await fetchSiblings(job);
     renderEpisodeNav(job, currentSiblings);
+
+    renderAnimeCommunityComments(job);
 })();
+
+// ─── Anime Community embed ────────────────────────────────────────────────────
+let _tacScriptLoaded = false;
+function renderAnimeCommunityComments(job) {
+    const isAnime = job.media_type === 'Anime TV' || job.media_type === 'Anime Film';
+    if (!isAnime) return;
+    const container = document.getElementById('animeCommunityComments');
+    if (!container) return;
+
+    const anilistId = job.external_ids?.anilist;
+    const malId = job.external_ids?.mal;
+    if (!anilistId && !malId) {
+        return; // no external id, skip
+    }
+
+    const epNum = job.media_type === 'Anime Film'
+        ? '0'
+        : (job.episode_number != null ? String(job.episode_number) : '1');
+
+    window.theAnimeCommunityConfig = {
+        AniList_ID: anilistId ? String(anilistId) : undefined,
+        MAL_ID: malId ? String(malId) : undefined,
+        episodeChapterNumber: epNum,
+        mediaType: 'anime',
+        removeBorderStyling: true
+    };
+
+    if (window.theAnimeCommunity && window.theAnimeCommunity.reload) {
+        window.theAnimeCommunity.reload();
+    } else if (!_tacScriptLoaded) {
+        _tacScriptLoaded = true;
+        container.innerHTML = '<div id="anime-community-comment-section"></div>';
+        const script = document.createElement('script');
+        script.src = 'https://theanimecommunity.com/embed.js';
+        script.id = 'anime-community-script';
+        script.onload = () => { console.log('Anime Community comments loaded'); };
+        script.onerror = () => { container.innerHTML = ''; };
+        document.head.appendChild(script);
+    }
+}
+
+window.addEventListener('message', function(event) {
+    if (event.origin !== 'https://theanimecommunity.com') return;
+    if (event.data && event.data.type === 'TAC-TIMESTAMP-CLICK') {
+        var time = Number(event.data.time);
+        if (Number.isFinite(time)) {
+            var video = document.getElementById('videoEl');
+            if (video) video.currentTime = time;
+        }
+    }
+});
+

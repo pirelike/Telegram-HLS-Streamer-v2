@@ -12,6 +12,7 @@ pub async fn analyze_media(path: &Path) -> Result<MediaAnalysis> {
         .arg("error")
         .arg("-show_format")
         .arg("-show_streams")
+        .arg("-show_chapters")
         .arg("-print_format")
         .arg("json")
         .arg(path)
@@ -24,8 +25,11 @@ pub async fn analyze_media(path: &Path) -> Result<MediaAnalysis> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let value: Value = serde_json::from_slice(&output.stdout).context("parsing ffprobe json")?;
-    analysis_from_ffprobe(path, &value).await
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let value: Value = serde_json::from_str(&raw).context("parsing ffprobe json")?;
+    let mut analysis = analysis_from_ffprobe(path, &value).await?;
+    analysis.raw_ffprobe_json = Some(raw);
+    Ok(analysis)
 }
 
 pub(crate) async fn analysis_from_ffprobe(path: &Path, value: &Value) -> Result<MediaAnalysis> {
@@ -93,6 +97,7 @@ pub(crate) async fn analysis_from_ffprobe(path: &Path, value: &Value) -> Result<
         video_streams,
         audio_streams,
         subtitle_streams,
+        raw_ffprobe_json: None,
     })
 }
 

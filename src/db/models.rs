@@ -263,6 +263,18 @@ pub struct DbExport {
     pub segments: Vec<SegmentRow>,
     #[serde(default)]
     pub segment_parts: Vec<SegmentPartExportRow>,
+    #[serde(default)]
+    pub external_metadata: Vec<ExternalMetadataRow>,
+    #[serde(default)]
+    pub job_metadata_links: Vec<JobMetadataLinkRow>,
+    #[serde(default)]
+    pub series_metadata_links: Vec<SeriesMetadataLinkRow>,
+    #[serde(default)]
+    pub playback_progress: Vec<PlaybackProgressRow>,
+    #[serde(default)]
+    pub media_markers: Vec<MediaMarkerRow>,
+    #[serde(default)]
+    pub media_fingerprints: Vec<MediaFingerprintRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -371,6 +383,217 @@ pub(super) fn segment_part_export_from_row(
         bot_index: row.get(5)?,
         file_size: row.get(6)?,
     })
+}
+
+pub(super) const EXTERNAL_METADATA_SELECT_SQL: &str =
+    "SELECT id, provider, provider_id, media_kind, title, original_title, overview, poster_url, backdrop_url, release_date, year, rating, raw_json, fetched_at FROM external_metadata";
+
+pub(super) fn external_metadata_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ExternalMetadataRow> {
+    Ok(ExternalMetadataRow {
+        id: row.get(0)?,
+        provider: row.get(1)?,
+        provider_id: row.get(2)?,
+        media_kind: row.get(3)?,
+        title: row.get(4)?,
+        original_title: row.get(5)?,
+        overview: row.get(6)?,
+        poster_url: row.get(7)?,
+        backdrop_url: row.get(8)?,
+        release_date: row.get(9)?,
+        year: row.get(10)?,
+        rating: row.get(11)?,
+        raw_json: row.get(12)?,
+        fetched_at: row.get(13)?,
+    })
+}
+
+pub(super) fn job_metadata_link_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<JobMetadataLinkRow> {
+    Ok(JobMetadataLinkRow {
+        job_id: row.get(0)?,
+        metadata_id: row.get(1)?,
+        role: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
+pub(super) fn series_metadata_link_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SeriesMetadataLinkRow> {
+    Ok(SeriesMetadataLinkRow {
+        media_type: row.get(0)?,
+        series_name: row.get(1)?,
+        metadata_id: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
+pub(super) fn playback_progress_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PlaybackProgressRow> {
+    Ok(PlaybackProgressRow {
+        client_id: row.get(0)?,
+        job_id: row.get(1)?,
+        position_seconds: row.get(2)?,
+        duration_seconds: row.get(3)?,
+        progress_pct: row.get(4)?,
+        completed: row.get::<_, i64>(5)? == 1,
+        updated_at: row.get(6)?,
+    })
+}
+
+pub(super) fn media_marker_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaMarkerRow> {
+    Ok(MediaMarkerRow {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        marker_type: row.get(2)?,
+        start_seconds: row.get(3)?,
+        end_seconds: row.get(4)?,
+        source: row.get(5)?,
+        confidence: row.get(6)?,
+        enabled: row.get::<_, i64>(7)? == 1,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+pub(super) fn media_fingerprint_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MediaFingerprintRow> {
+    Ok(MediaFingerprintRow {
+        job_id: row.get(0)?,
+        media_type: row.get(1)?,
+        series_name: row.get(2)?,
+        season_number: row.get(3)?,
+        duration_seconds: row.get(4)?,
+        fingerprint: row.get(5)?,
+        fingerprint_source: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+// --- External metadata ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExternalMetadataRow {
+    pub id: i64,
+    pub provider: String,
+    pub provider_id: String,
+    pub media_kind: String,
+    pub title: String,
+    pub original_title: String,
+    pub overview: String,
+    pub poster_url: String,
+    pub backdrop_url: String,
+    pub release_date: String,
+    pub year: Option<i64>,
+    pub rating: Option<f64>,
+    pub raw_json: String,
+    pub fetched_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NewExternalMetadata {
+    pub provider: String,
+    pub provider_id: String,
+    pub media_kind: String,
+    pub title: String,
+    pub original_title: String,
+    pub overview: String,
+    pub poster_url: String,
+    pub backdrop_url: String,
+    pub release_date: String,
+    pub year: Option<i64>,
+    pub rating: Option<f64>,
+    pub raw_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobMetadataLinkRow {
+    pub job_id: String,
+    pub metadata_id: i64,
+    pub role: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SeriesMetadataLinkRow {
+    pub media_type: String,
+    pub series_name: String,
+    pub metadata_id: i64,
+    pub created_at: String,
+}
+
+// --- Playback progress ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlaybackProgressRow {
+    pub client_id: String,
+    pub job_id: String,
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+    pub progress_pct: i64,
+    pub completed: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NewPlaybackProgress {
+    pub client_id: String,
+    pub job_id: String,
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+}
+
+// --- Media markers ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaMarkerRow {
+    pub id: i64,
+    pub job_id: String,
+    pub marker_type: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub source: String,
+    pub confidence: f64,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NewMediaMarker {
+    pub marker_type: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub source: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaFingerprintRow {
+    pub job_id: String,
+    pub media_type: String,
+    pub series_name: String,
+    pub season_number: Option<i64>,
+    pub duration_seconds: f64,
+    pub fingerprint: String,
+    pub fingerprint_source: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NewMediaFingerprint {
+    pub job_id: String,
+    pub media_type: String,
+    pub series_name: String,
+    pub season_number: Option<i64>,
+    pub duration_seconds: f64,
+    pub fingerprint: String,
+    pub fingerprint_source: String,
 }
 
 // --- Helpers used across sub-modules ---

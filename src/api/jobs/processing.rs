@@ -503,6 +503,9 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
         "job cycle complete"
     );
     finish_job_complete(&state, &request.job_id).await;
+
+    detect_and_save_markers(&state, &request, &analysis).await;
+
     super::super::playback::spawn_cache_warmup(state.clone(), request.job_id.clone());
     super::super::db_transfer::trigger_automatic_db_sync(
         state.clone(),
@@ -1262,5 +1265,106 @@ pub async fn clean_orphaned_processing_dirs(state: &Arc<AppState>) {
     }
     if cleaned > 0 {
         tracing::info!(cleaned, "processing directory cleanup complete");
+    }
+}
+
+async fn detect_and_save_markers(
+    state: &Arc<AppState>,
+    request: &JobRequest,
+    analysis: &media::MediaAnalysis,
+) {
+    let cfg = state.config.read().await.clone();
+    if !cfg.intro_detection_enabled {
+        return;
+    }
+    let metadata = &request.metadata;
+    let media_type = metadata.media_type.as_deref().unwrap_or("Film");
+    let series_name = metadata.series_name.as_deref().unwrap_or("");
+    let season_number = metadata.season_number.map(i64::from);
+
+    let fingerprints = if series_name.is_empty() {
+        Vec::new()
+    } else {
+        match state.db_conn().await {
+            Ok(conn) => {
+                let mt = media_type.to_string();
+                let sn = series_name.to_string();
+                let sn_copy = season_number;
+                match tokio::task::spawn_blocking(move || {
+                    db::get_media_fingerprints_for_series(&conn, &mt, &sn, sn_copy)
+                })
+                .await
+                {
+                    Ok(Ok(fps)) => fps,
+                    _ => Vec::new(),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %request.job_id, error = %e, "marker detection: db unavailable");
+                return;
+            }
+        }
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let new_fingerprint = if cfg.intro_chromaprint_enabled
+        && !series_name.is_empty()
+        && media::chromaprint_available()
+    {
+        match media::generate_fingerprint(&request.source_path, analysis.duration, &cancel).await {
+            Ok(fp) => Some(fp),
+            Err(e) => {
+                tracing::debug!(job_id = %request.job_id, error = %e, "chromaprint fingerprint generation skipped");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    match media::detect_markers(
+        analysis,
+        media_type,
+        series_name,
+        season_number,
+        &fingerprints,
+        new_fingerprint.as_deref(),
+        &cancel,
+    )
+    .await
+    {
+        Ok(result) => {
+            let jid = request.job_id.clone();
+            if !result.markers.is_empty() {
+                let markers_copy = result.markers.clone();
+                if let Ok(conn) = state.db_conn().await {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        db::save_media_markers(&conn, &jid, &markers_copy)
+                    })
+                    .await;
+                }
+            }
+            if let Some(fp) = &new_fingerprint {
+                if let Ok(conn) = state.db_conn().await {
+                    let fingerprint_entry = db::NewMediaFingerprint {
+                        job_id: request.job_id.clone(),
+                        media_type: media_type.to_string(),
+                        series_name: series_name.to_string(),
+                        season_number,
+                        duration_seconds: analysis.duration,
+                        fingerprint: fp.clone(),
+                        fingerprint_source: "chromaprint".to_string(),
+                    };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        db::save_media_fingerprint(&conn, &fingerprint_entry)
+                    })
+                    .await;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(job_id = %request.job_id, error = %e, "marker detection failed (non-fatal)");
+        }
     }
 }

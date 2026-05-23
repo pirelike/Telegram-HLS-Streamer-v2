@@ -259,7 +259,7 @@ fn base_shell(
     <title>{title}</title>
     <script>(function(){{var t=localStorage.getItem('hls_theme');var d=t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches;if(d)document.documentElement.setAttribute('data-theme','dark');else document.documentElement.setAttribute('data-theme','light');}})()</script>
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Round">
-    <link rel="stylesheet" href="/static/app.css?v=5">
+    <link rel="stylesheet" href="/static/app.css?v=6">
     {extra_css}
 </head>
 <body>
@@ -280,10 +280,19 @@ fn base_shell(
             <span class="search-trigger-text">Search library</span>
             <kbd class="thls-kbd">⌘K</kbd>
         </button>
-        <span class="t-livepill" id="thls-status-pill" style="display:none">
+        <span class="t-livepill" id="thls-status-pill" style="display:none" onclick="window.__thls_toggle_jobs_panel && window.__thls_toggle_jobs_panel()">
             <span class="t-livepill__dot"></span>
             <span id="thls-status-text"></span>
         </span>
+        <div class="jobs-panel hidden" id="jobsPanel">
+            <div class="jobs-panel__head">
+                <span class="jobs-panel__title">Active Jobs</span>
+                <button class="jobs-panel__close" onclick="window.__thls_toggle_jobs_panel()">&times;</button>
+            </div>
+            <div class="jobs-panel__list" id="jobsPanelList">
+                <div class="jobs-panel__empty">No active jobs</div>
+            </div>
+        </div>
         <a href="/upload" class="upload-btn" aria-label="Upload">
             <i class="material-icons-round">add</i>
             <span class="upload-btn-text">Upload</span>
@@ -300,7 +309,7 @@ fn base_shell(
     <aside class="sidebar" id="sidebar" hidden></aside>
     {body}
 </div>
-<script src="/static/shared.js?v=5"></script>
+<script src="/static/shared.js?v=6"></script>
 <script src="/static/browse-palette.js?v=5"></script>
 {scripts}
 </body>
@@ -439,7 +448,7 @@ fn upload_body() -> &'static str {
             <div class="metadata-table-wrap" id="metadataTableWrap"></div>
             <button class="action-btn primary start-upload-btn" id="startUploadBtn" disabled>Start Upload</button>
         </div>
-        <div class="error-msg" id="errorMsg"></div>
+        <div class="error-msg hidden" id="errorMsg"></div>
         <div class="analysis-card hidden" id="analysisCard">
             <h4 style="margin:0 0 10px;font-size:13px;color:var(--t-ink-3);">Detected Streams</h4>
             <div class="stream-badges" id="streamBadges"></div>
@@ -690,6 +699,7 @@ fn watch_body() -> &'static str {
         <div id="episodeNav"></div>
         <div class="player-info" id="playerInfo" hidden></div>
         <section class="t-section t-watch-more" id="watchMoreLikeThis"></section>
+        <section id="animeCommunityComments" style="margin-top:32px"></section>
     </div>
 </main>
 <div class="modal-overlay" id="editModal">

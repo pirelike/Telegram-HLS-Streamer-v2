@@ -12,6 +12,7 @@ FFprobe/FFmpeg-based media analysis and HLS processing. This module turns an inp
 | `tiers.rs` | ABR tier parsing and source-aware tier selection. | 113 |
 | `encoder.rs` | Encoder selection/probing, hardware-device args, video filter construction. | 113 |
 | `process.rs` | Core FFmpeg pipeline for video/audio/subtitle/thumbnail outputs and segment-duration collection. | 769 |
+| `markers.rs` | Intro/outro marker detection: chapter parsing and Chromaprint fingerprint comparison. | 200 |
 
 ## Public API surface
 
@@ -64,3 +65,5 @@ media/ ──► config
 | Add/change encoder probing or filter args | `encoder.rs`. |
 | Change video/audio/subtitle output commands | `process.rs`. |
 | Change thumbnail behavior | `process.rs`. |
+| Add/change intro/outro detection | `markers.rs`. |
+| Change fingerprint matching | `markers.rs` and `src/db/`. |

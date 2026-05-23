@@ -8,6 +8,8 @@ pub struct MediaAnalysis {
     pub video_streams: Vec<VideoStream>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
+    #[serde(default)]
+    pub raw_ffprobe_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
