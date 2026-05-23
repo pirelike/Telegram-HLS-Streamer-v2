@@ -90,31 +90,67 @@ function renderJobs() {
     const ctx = window.BROWSE_CTX;
     const items = allJobs;
 
+    const headerLabels = { all: 'All Videos', Film: 'Films', Series: 'Series', 'Anime Film': 'Anime Films', 'Anime TV': 'Anime TV' };
+    let sectionTitle = headerLabels[ctx.category] || ctx.category;
+    if (ctx.view === 'seasons') sectionTitle = ctx.seriesName || sectionTitle;
+
+    const isCategoryGrid = ctx.view === 'grid' || ctx.view === 'series_list';
+    let header = '';
+    if (isCategoryGrid) {
+        const count = items.length;
+        const lower = sectionTitle.toLowerCase();
+        header =
+          `<div class="t-cat-head">
+             <div class="eyebrow">Library · ${escapeHtml(sectionTitle)}</div>
+             <h1>${count}${hasMoreJobs ? '+' : ''} ${escapeHtml(lower)}</h1>
+             <div class="subtitle">Sorted by recently added.</div>
+             <div class="t-fbar">
+               <i class="material-icons-round">filter_list</i>
+               ${['All','Unwatched','4K','HDR','HEVC','AV1','2024']
+                  .map((c,i)=>`<button class="t-chip" aria-pressed="${i===0?'true':'false'}">${c}</button>`).join('')}
+               <div style="flex:1"></div>
+               <span style="color:var(--t-ink-3);font-size:13px">Sort</span>
+               <button class="t-chip">Recently added</button>
+             </div>
+           </div>`;
+    } else if (ctx.view === 'seasons') {
+        header = renderSeriesDetailHeader(items);
+    } else {
+        header = renderBreadcrumbs() + `<h2 class="section-header">${escapeHtml(sectionTitle)}</h2>`;
+    }
+
     if (items.length === 0) {
-        videosContainer.innerHTML = `${renderBreadcrumbs()}<div class="no-results">
+        videosContainer.innerHTML = `${header}<div class="no-results">
             <i class="material-icons-round">video_library</i>
             <p>No items found</p>
         </div>`;
         return;
     }
 
-    const headerLabels = { all: 'All Videos', Film: 'Films', Series: 'Series', 'Anime Film': 'Anime Films', 'Anime TV': 'Anime TV' };
-    let sectionTitle = headerLabels[ctx.category] || ctx.category;
     let contentHtml = '';
-
     if (ctx.view === 'series_list') {
         contentHtml = `<div class="video-grid posters">${items.map(j => renderCard(j, 'series')).join('')}</div>`;
     } else if (ctx.view === 'seasons') {
-        sectionTitle = ctx.seriesName || sectionTitle;
-        contentHtml = `<div class="video-grid posters">${items.map(j => renderCard(j, 'season')).join('')}</div>`;
+        contentHtml = renderSeriesSeasonContent(items);
+    } else if (ctx.view === 'episodes') {
+        contentHtml = `<div class="t-episode-list" style="padding:0 56px 56px">${items.map(renderEpisodeRow).join('')}</div>`;
     } else {
-        // 'grid' or 'episodes'
-        const gridClass = ctx.view === 'episodes' ? 'video-grid episodes' : 'video-grid';
-        contentHtml = `<div class="${gridClass}">${items.map(j => renderCard(j, 'video')).join('')}</div>`;
+        contentHtml = `<div class="video-grid">${items.map(j => renderCard(j, 'video')).join('')}</div>`;
     }
 
-    const sectionHeader = `<h2 class="section-header">${escapeHtml(sectionTitle)}</h2>`;
-    videosContainer.innerHTML = renderBreadcrumbs() + sectionHeader + contentHtml;
+    videosContainer.innerHTML = header + contentHtml;
+
+    // Wire filter chips (visual-only for now — toggle aria-pressed within the bar)
+    videosContainer.querySelectorAll('.t-fbar .t-chip').forEach((chip, i, all) => {
+        chip.addEventListener('click', () => {
+            // sort chip is the last one — don't toggle the filter group
+            if (i === all.length - 1) return;
+            all.forEach((c, j) => {
+                if (j === all.length - 1) return;
+                c.setAttribute('aria-pressed', c === chip ? 'true' : 'false');
+            });
+        });
+    });
 }
 
 function renderCard(j, type) {
@@ -201,6 +237,191 @@ function renderCard(j, type) {
             </div>
         </div>
     </a>`;
+}
+
+// ─── Series detail (seasons view) ────────────────────────────────────────────
+let _seriesDetailSelected = null;
+let _seriesDetailEpisodes = {};
+
+function renderSeriesDetailHeader(seasonItems) {
+    const ctx = window.BROWSE_CTX;
+    const sample = seasonItems.find(j => j.has_thumbnail) || seasonItems[0] || {};
+    const seriesName = ctx.seriesName || cleanTitle(sample.filename || '');
+    const totalEps = seasonItems.reduce((acc, s) => acc + (s.episode_count || 0), 0);
+    const seasonCount = seasonItems.length;
+    const grad = jobIdToGradient(sample.job_id || seriesName);
+    const heroBg = sample.has_thumbnail
+        ? `background-image:url('/thumbnail/${escapeAttr(sample.job_id)}');background-size:cover;background-position:center`
+        : `background:${grad}`;
+    const cat = window.BROWSE_CTX.category;
+    const catRoot = cat === 'Anime TV' ? '/anime-tv' : '/series';
+    const catLabel = cat === 'Anime TV' ? 'Anime TV' : 'Series';
+    const resumeHref = sample.job_id ? `/watch/${escapeAttr(sample.job_id)}` : '#';
+
+    return `
+      <header class="t-hero t-series-hero">
+        <div class="t-hero__art" style="${heroBg}"></div>
+        <div class="t-hero__scrim"></div>
+        <div class="t-hero__body">
+          <div class="t-hero__eyebrow">
+            <a href="${catRoot}" style="color:rgba(255,255,255,0.7)">${catLabel}</a>
+            <i class="material-icons-round" style="font-size:12px;opacity:.6">chevron_right</i>
+            <span style="color:#fff">${escapeHtml(seriesName)}</span>
+          </div>
+          <h1 class="t-hero__title">${escapeHtml(seriesName)}</h1>
+          <div class="t-hero__meta">
+            <span>${totalEps} episode${totalEps !== 1 ? 's' : ''}</span>
+            <span class="t-dot"></span>
+            <span>${seasonCount} season${seasonCount !== 1 ? 's' : ''}</span>
+          </div>
+          <div class="t-hero__actions">
+            <a class="t-btn t-btn--primary" href="${resumeHref}">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5.5v13l11-6.5z"/></svg>
+              Play first episode
+            </a>
+          </div>
+        </div>
+      </header>`;
+}
+
+function renderSeriesSeasonContent(seasonItems) {
+    const ctx = window.BROWSE_CTX;
+    const seriesSlug = ctx.seriesSlug || slugify(ctx.seriesName || '');
+    const catRoot = ctx.category === 'Anime TV' ? '/anime-tv' : '/series';
+
+    const sortedSeasons = seasonItems.slice().sort((a, b) => {
+        const an = a.season_number == null ? 1e9 : a.season_number;
+        const bn = b.season_number == null ? 1e9 : b.season_number;
+        return an - bn;
+    });
+    if (_seriesDetailSelected == null) {
+        _seriesDetailSelected = sortedSeasons[0]?.season_number ?? null;
+    }
+
+    const tabs = sortedSeasons.map(s => {
+        const num = s.season_number;
+        const label = num == null ? 'Specials' : `Season ${num}`;
+        const isActive = num === _seriesDetailSelected;
+        return `<button class="t-tab" data-season="${num == null ? 'specials' : num}"
+                ${isActive ? 'aria-current="page"' : ''}>${label}</button>`;
+    }).join('');
+
+    setTimeout(() => loadSeasonEpisodes(_seriesDetailSelected), 0);
+
+    return `
+      <section class="t-section" style="padding-top:28px">
+        <div class="t-series-meta-row">
+          <h2>Episodes</h2>
+          <div style="display:flex;gap:4px;flex-wrap:wrap" id="seasonTabs">${tabs}</div>
+          <div style="flex:1"></div>
+          <div style="color:var(--t-ink-3);font-size:13px" id="seasonSummary"></div>
+        </div>
+        <div class="t-episode-list" id="seasonEpisodeList">
+          <div class="no-results" style="padding:32px"><p>Loading episodes…</p></div>
+        </div>
+      </section>`;
+}
+
+function loadSeasonEpisodes(seasonNumber) {
+    const ctx = window.BROWSE_CTX;
+    const tabs = document.getElementById('seasonTabs');
+    if (tabs) {
+        tabs.querySelectorAll('.t-tab').forEach(t => {
+            const v = t.dataset.season;
+            const matches = (seasonNumber == null && v === 'specials') || (String(seasonNumber) === v);
+            if (matches) t.setAttribute('aria-current', 'page');
+            else t.removeAttribute('aria-current');
+            t.onclick = () => {
+                const sn = v === 'specials' ? null : parseInt(v, 10);
+                _seriesDetailSelected = sn;
+                loadSeasonEpisodes(sn);
+            };
+        });
+    }
+    const list = document.getElementById('seasonEpisodeList');
+    if (!list) return;
+
+    const cacheKey = String(seasonNumber);
+    if (_seriesDetailEpisodes[cacheKey]) {
+        renderSeasonEpisodeList(_seriesDetailEpisodes[cacheKey], seasonNumber);
+        return;
+    }
+
+    const url = new URL('/api/jobs', window.location.origin);
+    url.searchParams.set('category', ctx.category);
+    url.searchParams.set('series_name', ctx.seriesName);
+    url.searchParams.set('season_number', seasonNumber === null ? 'null' : seasonNumber);
+    url.searchParams.set('limit', '500');
+    fetch(url)
+        .then(r => r.json())
+        .then(d => {
+            const episodes = (d.jobs || []).slice().sort((a, b) =>
+                (a.episode_number || 0) - (b.episode_number || 0));
+            _seriesDetailEpisodes[cacheKey] = episodes;
+            renderSeasonEpisodeList(episodes, seasonNumber);
+        })
+        .catch(() => {
+            list.innerHTML = '<div class="no-results"><p>Could not load episodes.</p></div>';
+        });
+}
+
+function renderSeasonEpisodeList(episodes, seasonNumber) {
+    const list = document.getElementById('seasonEpisodeList');
+    if (!list) return;
+    if (!episodes.length) {
+        list.innerHTML = '<div class="no-results"><p>No episodes in this season.</p></div>';
+    } else {
+        list.innerHTML = episodes.map(renderEpisodeRow).join('');
+    }
+    const summary = document.getElementById('seasonSummary');
+    if (summary) {
+        const label = seasonNumber == null ? 'Specials' : `Season ${seasonNumber}`;
+        summary.textContent = `${label} · ${episodes.length} episode${episodes.length !== 1 ? 's' : ''}`;
+    }
+}
+
+// ─── Episode list row (Series detail) ────────────────────────────────────────
+function renderEpisodeRow(j) {
+    const safeId = escapeAttr(j.job_id);
+    const dur    = formatDuration(j.duration);
+    const title  = escapeHtml(cleanTitle(j.filename || j.job_id));
+    const s = j.season_number, e = j.episode_number;
+    const epCode = (s != null && e != null)
+        ? `S${String(s).padStart(2,'0')}·E${String(e).padStart(2,'0')}`
+        : (e != null ? `Ep ${e}` : '');
+    const grad = jobIdToGradient(j.job_id);
+    const thumb = j.has_thumbnail
+        ? `<img class="thumb-img" src="/thumbnail/${safeId}" alt="" loading="lazy" onload="this.classList.add('loaded')">`
+        : `<div class="thumb-placeholder"><i class="material-icons-round">play_circle_filled</i></div>`;
+    const progressMap = (() => {
+        try { return JSON.parse(localStorage.getItem('thls_progress_v1') || '{}') || {}; }
+        catch { return {}; }
+    })();
+    const lp = progressMap[j.job_id];
+    const progress = lp && lp.pct > 1 && lp.pct < 95
+        ? `<div class="thumb-progress" style="--p:${lp.pct}%"></div>` : '';
+    return `
+      <a class="t-episode-row" href="/watch/${safeId}"
+         oncontextmenu="event.preventDefault();openEditModal('${safeId}');">
+        <div class="thumb-wrap" style="background:${grad}">
+          ${thumb}
+          ${dur ? `<div class="thumb-duration">${dur}</div>` : ''}
+          ${progress}
+        </div>
+        <div style="min-width:0">
+          <div class="t-episode-row__title">
+            ${epCode ? `<div class="ep-code">${epCode}</div>` : ''}
+            <div class="ep-name">${title}</div>
+          </div>
+          <div class="t-episode-row__desc">
+            ${j.media_type ? escapeHtml(j.media_type) : ''}${j.video_height ? ` · ${j.video_height}p` : ''}${j.audio_count ? ` · ${j.audio_count} audio track${j.audio_count !== 1 ? 's' : ''}` : ''}
+          </div>
+        </div>
+        <button class="t-iconbtn" title="More"
+                onclick="event.preventDefault();event.stopPropagation();openEditModal('${safeId}');">
+          <i class="material-icons-round">more_horiz</i>
+        </button>
+      </a>`;
 }
 
 // ─── Edit Metadata & Delete ───────────────────────────────────────────────────

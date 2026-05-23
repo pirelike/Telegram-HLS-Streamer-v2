@@ -5,6 +5,25 @@ let currentJob = null;
 let attemptedQuotaRecovery = false;
 let currentSiblings = [];
 
+// ─── Watch progress persistence (used by home "Continue Watching") ────────────
+const THLS_PROGRESS_KEY = 'thls_progress_v1';
+function loadProgressMap() {
+    try { return JSON.parse(localStorage.getItem(THLS_PROGRESS_KEY) || '{}') || {}; }
+    catch { return {}; }
+}
+function saveProgress(jobId, seconds, duration) {
+    if (!jobId || !duration || duration < 5) return;
+    const pct = Math.max(0, Math.min(100, Math.round((seconds / duration) * 100)));
+    const map = loadProgressMap();
+    if (pct >= 95 || pct <= 1) {
+        delete map[jobId];                              // treat as done / not started
+    } else {
+        map[jobId] = { pct, seconds: Math.floor(seconds), duration: Math.floor(duration), ts: Date.now() };
+    }
+    try { localStorage.setItem(THLS_PROGRESS_KEY, JSON.stringify(map)); } catch {}
+}
+window.THLSProgress = { load: loadProgressMap, save: saveProgress };
+
 // ─── Player init ──────────────────────────────────────────────────────────────
 function isMobile() {
     return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
@@ -129,6 +148,24 @@ async function initPlayer(job, overrideBufferConfig = null) {
 
         renderInfoPanel(job);
 
+        // Resume from saved progress + persist while playing.
+        const saved = loadProgressMap()[job.job_id];
+        let lastSave = 0;
+        videoEl.addEventListener('loadedmetadata', () => {
+            if (saved && saved.seconds && videoEl.duration > saved.seconds + 5) {
+                videoEl.currentTime = saved.seconds;
+            }
+        }, { once: true });
+        videoEl.addEventListener('timeupdate', () => {
+            const now = Date.now();
+            if (now - lastSave < 5000) return;
+            lastSave = now;
+            saveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
+        });
+        videoEl.addEventListener('ended', () => {
+            saveProgress(job.job_id, videoEl.duration, videoEl.duration);
+        });
+
         try { await player.load(m3u8Url); }
         catch (e) {
             console.error('Shaka load error', e);
@@ -139,33 +176,127 @@ async function initPlayer(job, overrideBufferConfig = null) {
 }
 
 function renderInfoPanel(job) {
-    const m3u8Url = `${window.location.origin}/hls/${job.job_id}/master.m3u8`;
-    const audioCount = job.audio_count || 0;
-    const subCount = job.subtitle_count || 0;
-    const metaParts = [];
-    if (job.media_type) metaParts.push(escapeHtml(job.media_type));
-    if (job.series_name) metaParts.push(escapeHtml(job.series_name));
-    if (job.duration > 0) metaParts.push(formatDuration(job.duration));
-    if (audioCount > 0) metaParts.push(`${audioCount} audio track${audioCount !== 1 ? 's' : ''}`);
-    if (subCount > 0) metaParts.push(`${subCount} subtitle${subCount !== 1 ? 's' : ''}`);
+    const main = document.getElementById('watchMetaMain');
+    const aside = document.getElementById('watchFileDetails');
+    if (!main || !aside) return;
 
-    document.getElementById('playerInfo').innerHTML = `
-        <div class="player-title">${escapeHtml(cleanTitle(job.filename || job.job_id))}</div>
-        <div class="player-meta">${metaParts.join(' &bull; ')}</div>
-        <div class="player-m3u8">
-            <div class="url-box">
-                <span class="url-text" id="playerM3u8Url">${escapeHtml(m3u8Url)}</span>
-                <button class="copy-btn" onclick="copyPlayerUrl()">Copy M3U8</button>
-            </div>
-            <div class="player-actions" style="margin-top: 1rem; display: flex; gap: 0.5rem;">
-                <button class="action-btn" onclick="openEditModal('${escapeAttr(job.job_id)}')">
-                    <i class="material-icons-round" style="font-size:1.1rem;vertical-align:middle;margin-right:0.2rem;">edit</i> Edit Metadata
-                </button>
-                <button class="action-btn danger" onclick="deleteJob('${escapeAttr(job.job_id)}')">
-                    <i class="material-icons-round" style="font-size:1.1rem;vertical-align:middle;margin-right:0.2rem;">delete</i> Delete Video
-                </button>
-            </div>
+    const audioCount = job.audio_count || 0;
+    const subCount   = job.subtitle_count || 0;
+    const m3u8Url    = `${window.location.origin}/hls/${job.job_id}/master.m3u8`;
+    const safeId     = escapeAttr(job.job_id);
+
+    const eyebrowParts = [
+        job.media_type ? escapeHtml(job.media_type) : null,
+        job.video_height ? `${job.video_height}p` : null,
+        subCount > 0 ? `SUB · ${subCount}` : null,
+        audioCount > 1 ? `AUDIO · ${audioCount}` : null,
+    ].filter(Boolean);
+    const eyebrowHtml = eyebrowParts.map((p, i) =>
+        (i > 0 ? '<span class="dot"></span>' : '') + `<span>${p}</span>`
+    ).join('');
+
+    const metaParts = [];
+    if (job.duration > 0) metaParts.push(formatDuration(job.duration));
+    if (job.video_height) metaParts.push(`${job.video_height}p`);
+    if (job.video_codec) metaParts.push(escapeHtml(job.video_codec));
+    if (job.series_name && job.is_series) {
+        if (job.season_number != null && job.episode_number != null) {
+            metaParts.push(`S${String(job.season_number).padStart(2,'0')}E${String(job.episode_number).padStart(2,'0')}`);
+        } else if (job.part_number != null) {
+            metaParts.push(`Part ${job.part_number}`);
+        }
+    }
+    const metaHtml = metaParts.map((p, i) =>
+        (i > 0 ? '<span class="dot"></span>' : '') + `<span>${escapeHtml(p)}</span>`
+    ).join('');
+
+    // Saved progress → resume label
+    const progressMap = (window.THLSProgress?.load && window.THLSProgress.load()) || {};
+    const saved = progressMap[job.job_id];
+    const resumeLabel = saved && saved.seconds > 5
+        ? `Resume at ${formatDuration(saved.seconds)}` : 'Play';
+    const resumeIcon = saved && saved.seconds > 5
+        ? '<i class="material-icons-round" style="font-size:18px">play_arrow</i>'
+        : '<i class="material-icons-round" style="font-size:18px">play_arrow</i>';
+
+    main.innerHTML = `
+        <div class="eyebrow">${eyebrowHtml}</div>
+        <h1>${escapeHtml(cleanTitle(job.filename || job.job_id))}</h1>
+        ${metaHtml ? `<div class="meta-row">${metaHtml}</div>` : ''}
+        ${job.series_name ? `<p class="desc" style="opacity:.7">From ${escapeHtml(job.series_name)}.</p>` : ''}
+        <div class="t-watch-actions">
+            <button class="t-btn t-btn--primary" onclick="document.getElementById('videoEl').play()">
+                ${resumeIcon} ${resumeLabel}
+            </button>
+            <button class="t-btn t-btn--ghost" onclick="copyPlayerUrl()" title="Copy M3U8">
+                <i class="material-icons-round" style="font-size:16px">link</i> Copy M3U8
+            </button>
+            <button class="t-btn t-btn--ghost" onclick="openEditModal('${safeId}')">
+                <i class="material-icons-round" style="font-size:16px">edit</i> Edit
+            </button>
+            <button class="t-btn t-btn--ghost" onclick="deleteJob('${safeId}')" style="color:#ff6b6b">
+                <i class="material-icons-round" style="font-size:16px">delete</i> Delete
+            </button>
+            <span id="playerM3u8Url" hidden>${escapeHtml(m3u8Url)}</span>
         </div>`;
+
+    const rows = [
+        ['Original',  job.filename || job.job_id],
+        ['Stored',    [
+            job.segment_count ? `${job.segment_count} segments` : null,
+            job.total_bytes != null ? formatBytes(job.total_bytes) : null,
+        ].filter(Boolean).join(' · ') || '—'],
+        ['Codec',     [job.video_codec, job.video_height ? `${job.video_height}p` : null].filter(Boolean).join(' · ') || '—'],
+        ['Audio',     audioCount > 0 ? `${audioCount} track${audioCount !== 1 ? 's' : ''}` : '—'],
+        ['Subtitles', subCount > 0 ? `${subCount} track${subCount !== 1 ? 's' : ''}` : '—'],
+        ['Job ID',    job.job_id],
+    ];
+    aside.innerHTML =
+        `<div class="head">File details</div>` +
+        rows.map(([k, v]) =>
+            `<div class="row"><span>${escapeHtml(k)}</span><span title="${escapeHtml(String(v))}">${escapeHtml(String(v))}</span></div>`
+        ).join('') +
+        `<button class="t-btn t-btn--quiet" style="margin-top:14px;width:100%;background:var(--t-surface)"
+                 onclick="openEditModal('${safeId}')">Edit metadata</button>`;
+
+    renderMoreLikeThis(job);
+}
+
+function renderMoreLikeThis(job) {
+    const host = document.getElementById('watchMoreLikeThis');
+    if (!host) return;
+    const cat = job.media_type || 'Film';
+    const url = new URL('/api/jobs', window.location.origin);
+    url.searchParams.set('category', cat);
+    url.searchParams.set('limit', '12');
+    fetch(url)
+        .then(r => r.json())
+        .then(d => {
+            const items = (d.jobs || []).filter(j => j.job_id !== job.job_id).slice(0, 8);
+            if (!items.length) { host.innerHTML = ''; return; }
+            host.innerHTML =
+                `<div class="t-section-head"><div><h2 class="t-section-title">More like this</h2></div></div>` +
+                `<div class="t-row">${items.map(j => moreCardHtml(j)).join('')}</div>`;
+        })
+        .catch(() => { host.innerHTML = ''; });
+}
+function moreCardHtml(j) {
+    const safeId = escapeAttr(j.job_id);
+    const title  = escapeHtml(cleanTitle(j.filename || j.job_id));
+    const dur    = formatDuration(j.duration);
+    const grad   = jobIdToGradient(j.job_id);
+    const thumb  = j.has_thumbnail
+        ? `<img class="thumb-img" src="/thumbnail/${safeId}" alt="" loading="lazy" onload="this.classList.add('loaded')">`
+        : `<div class="thumb-placeholder"><i class="material-icons-round">play_circle_filled</i></div>`;
+    return `<a class="video-card" href="/watch/${safeId}">
+        <div class="thumb-wrap" style="background:${grad}">
+          ${thumb}
+          ${dur ? `<div class="thumb-duration">${dur}</div>` : ''}
+        </div>
+        <div class="card-meta">
+          <div class="card-title">${title}</div>
+        </div>
+      </a>`;
 }
 
 // ─── Watch breadcrumb ─────────────────────────────────────────────────────────

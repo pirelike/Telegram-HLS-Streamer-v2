@@ -55,6 +55,13 @@ pub struct Config {
     pub video_bitrate: String,
     pub audio_bitrate: String,
 
+    // INTERNAL FALLBACK ONLY — NOT loaded from settings (no registry entry).
+    // Used by playlist-rendering paths (api/playlists.rs, api/playback/virtual_.rs)
+    // when there is no job context to compute a real value from. Encode-time
+    // call sites derive a per-job value via
+    // media::process::target_segment_seconds_for_tier. Do not plumb this field
+    // into the encode pipeline. See the comment block on that helper for full
+    // background.
     pub hls_segment_duration: u32,
     pub audio_segment_duration: u32,
 

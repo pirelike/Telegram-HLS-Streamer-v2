@@ -15,6 +15,109 @@ use super::models::*;
 use super::tiers::{select_video_tiers_with, tier0_bitrate};
 use crate::config::Config;
 
+// ============================================================================
+// Per-job HLS segment duration — DO NOT REGRESS TO A GLOBAL SETTING
+// ============================================================================
+//
+// HISTORY
+// -------
+// Up to season N-1 we had a global user-facing setting `HLS_SEGMENT_DURATION`
+// (default 4 s) passed verbatim to ffmpeg's `-hls_time`. This was wrong in
+// practice: a 4 s slice of a 50 Mbps 4K master is ~25 MB, well past Telegram's
+// 20 MB per-file ceiling, so the segment had to be re-encoded down or split at
+// upload time. Meanwhile a 4 s slice of a 1 Mbps 480p master is ~500 KB and
+// wasted everyone's time by producing 5× more segments than necessary.
+//
+// In season N we deleted the user-facing setting and switched to deriving the
+// per-tier segment duration from `SEGMENT_TARGET_SIZE` (the byte ceiling we
+// want each segment to land near).
+//
+// THE FORMULA
+// -----------
+//   target_seconds = SEGMENT_TARGET_SIZE / byterate
+//
+// where `byterate` is the bytes-per-second the encoded tier is expected to
+// produce:
+//
+//   - Copy tier (no re-encode): byterate = file_size / duration of the source.
+//   - Encode tier:               byterate = tier_bitrate_bps / 8.
+//
+// The result is clamped to [2, 30] s so a 200 KB GIF or a 4 GB IMAX rip don't
+// produce useless GOPs.
+//
+// WHY NOT JUST PICK A SHORT DURATION?
+// -----------------------------------
+// Short durations (≤ 2 s) explode segment count and balloon the playlist; HLS
+// player join latency suffers. Long durations (≥ 30 s) cripple seeking and
+// blow past Telegram's per-file ceiling on high-bitrate sources. The clamp is
+// load-bearing — keep it.
+//
+// WHY NOT EXPOSE THIS AS A SETTING?
+// ---------------------------------
+// `SEGMENT_TARGET_SIZE` already exposes the only knob the user actually cares
+// about ("how big a single chunk Telegram has to swallow"). The seconds figure
+// is a *consequence* of that knob and the per-job source bitrate; giving the
+// user a second knob just lets them desync the two. Don't add it back.
+//
+// IF YOU NEED TO TOUCH THIS
+// -------------------------
+// - The fallback `Config.hls_segment_duration` field (= 4 s by default) is
+//   intentionally NOT loaded from settings any more. It is used only by the
+//   playlist-rendering paths (`api/playlists.rs`, `api/playback/virtual_.rs`)
+//   where there is no job context to compute a real value from. Leave it.
+// - Encode-time callers (`encode_video_tier_ts`, `copied_segments_need_reencode`,
+//   `repair_oversized_video_segments`, `repair_oversized_segment_max_bitrate`)
+//   take `target_secs: u32` plumbed from `target_segment_seconds_for_tier`.
+//   New encode-time call sites should plumb it the same way; do not reach for
+//   `cfg.hls_segment_duration`.
+// - Audio is a separate concern. Audio bitrate is small and stable, so
+//   `AUDIO_SEGMENT_DURATION` is intentionally still a static user setting
+//   (see settings_registry.rs, adaptive_bitrate category). Don't merge it
+//   into this formula.
+// - Tests in `src/media/mod.rs` drive the formula by setting
+//   `cfg.segment_target_size`, not by setting a segment-duration field.
+// ============================================================================
+pub(crate) fn target_segment_seconds_for_tier(
+    cfg: &Config,
+    analysis: &MediaAnalysis,
+    tier: &VideoTier,
+) -> u32 {
+    let target_bytes = cfg.segment_target_size as f64;
+
+    let byterate: f64 = if tier.copy {
+        // Copy tier: the muxer just re-packages the source, so the output's
+        // byterate matches the source's byterate. duration.max(1.0) guards
+        // against zero-duration probes from corrupt inputs.
+        let dur = analysis.duration.max(1.0);
+        (analysis.file_size as f64 / dur).max(1.0)
+    } else {
+        // Encode tier: ffmpeg targets `tier.bitrate` (e.g. "5M", "1500k").
+        // 4 Mbps fallback only fires if the tier string is malformed —
+        // tiers come from the registry/UI which validate the format.
+        let bps = parse_bitrate_bps(&tier.bitrate).unwrap_or(4_000_000);
+        (bps as f64 / 8.0).max(1.0)
+    };
+
+    // [2, 30] s clamp — see "WHY NOT JUST PICK A SHORT DURATION?" above.
+    let secs = (target_bytes / byterate).round().max(1.0);
+    secs.clamp(2.0, 30.0) as u32
+}
+
+/// Parses ffmpeg-style bitrate strings ("5M", "1500k", "4000000") into
+/// bits-per-second. Returns `None` for malformed input so callers can fall
+/// back to a safe default.
+fn parse_bitrate_bps(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    let (num, mult) = match trimmed.bytes().last()? {
+        b'k' | b'K' => (&trimmed[..trimmed.len() - 1], 1_000u64),
+        b'm' | b'M' => (&trimmed[..trimmed.len() - 1], 1_000_000u64),
+        b'g' | b'G' => (&trimmed[..trimmed.len() - 1], 1_000_000_000u64),
+        _ => (trimmed, 1u64),
+    };
+    let v: f64 = num.parse().ok()?;
+    Some((v * mult as f64) as u64)
+}
+
 pub async fn process_media(
     analysis: &MediaAnalysis,
     job_id: &str,
@@ -257,40 +360,44 @@ async fn encode_video_tier(
     let permit = acquire_ffmpeg_permit(encode_semaphore, cancel).await?;
     encode_video_tier_ts(analysis, video, tier, encoder, cfg, &ts_dir, cancel).await?;
     drop(permit);
-    let effective_tier = if tier.copy && copied_segments_need_reencode(&ts_dir, cfg).await? {
-        tracing::warn!(
-            tier = tier.index,
-            "copy-mode video tier has poorly aligned segments; re-encoding whole tier"
-        );
-        tokio::fs::remove_dir_all(&ts_dir).await?;
-        tokio::fs::create_dir_all(&ts_dir).await?;
-        let reencode_tier = VideoTier {
-            index: tier.index,
-            height: tier.height,
-            bitrate: tier0_bitrate(cfg, video.height),
-            copy: false,
+    let copy_target_secs = target_segment_seconds_for_tier(cfg, analysis, tier);
+    let effective_tier =
+        if tier.copy && copied_segments_need_reencode(&ts_dir, copy_target_secs).await? {
+            tracing::warn!(
+                tier = tier.index,
+                "copy-mode video tier has poorly aligned segments; re-encoding whole tier"
+            );
+            tokio::fs::remove_dir_all(&ts_dir).await?;
+            tokio::fs::create_dir_all(&ts_dir).await?;
+            let reencode_tier = VideoTier {
+                index: tier.index,
+                height: tier.height,
+                bitrate: tier0_bitrate(cfg, video.height),
+                copy: false,
+            };
+            let permit = acquire_ffmpeg_permit(encode_semaphore, cancel).await?;
+            encode_video_tier_ts(
+                analysis,
+                video,
+                &reencode_tier,
+                encoder,
+                cfg,
+                &ts_dir,
+                cancel,
+            )
+            .await?;
+            drop(permit);
+            reencode_tier
+        } else {
+            tier.clone()
         };
-        let permit = acquire_ffmpeg_permit(encode_semaphore, cancel).await?;
-        encode_video_tier_ts(
-            analysis,
-            video,
-            &reencode_tier,
-            encoder,
-            cfg,
-            &ts_dir,
-            cancel,
-        )
-        .await?;
-        drop(permit);
-        reencode_tier
-    } else {
-        tier.clone()
-    };
+    let repair_target_secs = target_segment_seconds_for_tier(cfg, analysis, &effective_tier);
     repair_oversized_video_segments(
         &ts_dir,
         &effective_tier,
         encoder,
         cfg,
+        repair_target_secs,
         cancel,
         encode_semaphore,
     )
@@ -327,14 +434,14 @@ async fn encode_video_tier(
     for path in &oversized_m4s {
         let duration = probe_duration(path)
             .await
-            .unwrap_or(cfg.hls_segment_duration as f64);
+            .unwrap_or(repair_target_secs as f64);
         let bps = max_bitrate_for_segment(cfg.telegram_max_file_size, duration);
         if repair_needs_split(bps) {
             // Upload-time splitting also cannot help here — the segment duration is too long
             // to fit within the Telegram limit at any sane bitrate. Fail loudly.
             anyhow::bail!(
                 "oversized .m4s segment {} cannot be split at upload time (required bitrate {}bps too low); \
-                 lower source bitrate or reduce hls_segment_duration",
+                 lower source bitrate or shrink SEGMENT_TARGET_SIZE",
                 path.display(),
                 bps
             );
@@ -359,6 +466,15 @@ async fn encode_video_tier_ts(
     dir: &Path,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
+    let target_secs = target_segment_seconds_for_tier(cfg, analysis, tier);
+    tracing::debug!(
+        tier = tier.index,
+        copy = tier.copy,
+        target_secs,
+        source_bytes = analysis.file_size,
+        source_duration = analysis.duration,
+        "per-job HLS segment duration"
+    );
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y").arg("-nostdin");
     add_encoder_device_args(&mut cmd, encoder);
@@ -386,10 +502,7 @@ async fn encode_video_tier_ts(
             .arg("-sc_threshold")
             .arg("0")
             .arg("-force_key_frames")
-            .arg(format!(
-                "expr:gte(t,n_forced*{})",
-                cfg.hls_segment_duration.max(1)
-            ));
+            .arg(format!("expr:gte(t,n_forced*{})", target_secs.max(1)));
         add_forced_idr_args(&mut cmd, encoder);
         let scale = if tier.height < video.height {
             Some(format!(
@@ -406,7 +519,7 @@ async fn encode_video_tier_ts(
     cmd.arg("-f")
         .arg("hls")
         .arg("-hls_time")
-        .arg(cfg.hls_segment_duration.to_string())
+        .arg(target_secs.to_string())
         .arg("-hls_playlist_type")
         .arg("vod")
         .arg("-hls_segment_type")
@@ -428,6 +541,7 @@ async fn repair_oversized_video_segments(
     _tier: &VideoTier,
     encoder: &SelectedEncoder,
     cfg: &Config,
+    target_secs: u32,
     cancel: &Arc<AtomicBool>,
     encode_semaphore: &Arc<Semaphore>,
 ) -> Result<()> {
@@ -468,7 +582,7 @@ async fn repair_oversized_video_segments(
 
         let duration = probe_duration(&path)
             .await
-            .unwrap_or(cfg.hls_segment_duration as f64);
+            .unwrap_or(target_secs as f64);
         let bps = max_bitrate_for_segment(cfg.telegram_max_file_size, duration);
         if repair_needs_split(bps) {
             tracing::warn!(
@@ -481,7 +595,7 @@ async fn repair_oversized_video_segments(
 
         handles.push(tokio::spawn(async move {
             let _permit = acquire_ffmpeg_permit(&encode_semaphore, &cancel).await?;
-            repair_oversized_segment_max_bitrate(&path, &encoder, &cfg, &cancel).await
+            repair_oversized_segment_max_bitrate(&path, &encoder, &cfg, target_secs, &cancel).await
         }));
     }
 
@@ -492,15 +606,13 @@ async fn repair_oversized_video_segments(
     Ok(())
 }
 
-pub(crate) async fn copied_segments_need_reencode(dir: &Path, cfg: &Config) -> Result<bool> {
+pub(crate) async fn copied_segments_need_reencode(dir: &Path, target_secs: u32) -> Result<bool> {
     let playlist = tokio::fs::read_to_string(dir.join("playlist.m3u8")).await?;
     let durations = parse_hls_segment_durations("video", &playlist);
     if durations.is_empty() {
         return Ok(true);
     }
-    let limit = (cfg.hls_segment_duration as f64 * 2.0)
-        .min(cfg.hls_segment_duration as f64 * 1.75)
-        .max(0.001);
+    let limit = (target_secs as f64 * 1.75).max(0.001);
     Ok(durations.values().any(|d| *d <= 0.0 || *d > limit))
 }
 
@@ -521,11 +633,12 @@ async fn repair_oversized_segment_max_bitrate(
     path: &Path,
     encoder: &SelectedEncoder,
     cfg: &Config,
+    target_secs: u32,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
     let duration = probe_duration(path)
         .await
-        .unwrap_or(cfg.hls_segment_duration as f64);
+        .unwrap_or(target_secs as f64);
     // telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
     let max_size = (cfg.telegram_max_file_size as f64 * 0.95) as u64;
     let seconds = duration.max(0.1);
@@ -579,10 +692,7 @@ async fn repair_oversized_segment_max_bitrate(
         .arg("-sc_threshold")
         .arg("0")
         .arg("-force_key_frames")
-        .arg(format!(
-            "expr:gte(t,n_forced*{})",
-            cfg.hls_segment_duration.max(1)
-        ));
+        .arg(format!("expr:gte(t,n_forced*{})", target_secs.max(1)));
     add_forced_idr_args(&mut cmd, encoder);
     if let Some(filter) = video_filter(encoder, None) {
         cmd.arg("-vf").arg(filter);
