@@ -329,4 +329,4 @@ async function saveEditModal() {
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
-loadJobs();
+if (!window.__THLS_HOME_HANDLED__) loadJobs();

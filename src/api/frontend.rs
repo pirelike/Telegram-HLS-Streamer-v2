@@ -1,3 +1,23 @@
+// ============================================================
+// THLS — Apple-inspired UI · DROP-IN frontend.rs
+// ------------------------------------------------------------
+// Save as: src/api/frontend.rs   (replaces the existing file)
+//
+// Public API (handler functions + routes) is UNCHANGED.
+// What's new in the markup:
+//   • Top-tab navigation (Home / Films / Series / Anime Films
+//     / Anime TV) replaces the old sidebar.
+//   • Glass navbar with brand mark, search, ⌘K palette trigger,
+//     upload, theme toggle, settings.
+//   • Browse shell exposes #thlsHero + #videosContainer so the
+//     new browse.js can render a hero on Home (only) and rows.
+//   • Existing inner DOM IDs (#videosContainer, #editModal,
+//     drop-zone, settings fields, watch player) are preserved —
+//     browse.js / upload.js / settings.js / watch.js need no
+//     changes for everything except Home, which uses a tiny
+//     new file: static/browse-home.js (also in this folder).
+// ============================================================
+
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -8,17 +28,18 @@ use serde_json::{json, Value};
 use super::{api_error, db_unavailable, valid_job_id, AppState};
 use crate::db;
 
+// ─── handlers (unchanged signatures) ────────────────────────────────
 pub(super) async fn handle_home() -> Html<String> {
     browse_page(
         "Home",
         "home",
         json!({
             "category": "all",
-            "view": "grid",
+            "view": "home",  // ← new: triggers hero + rows in browse.js
             "seriesName": Value::Null,
             "seriesSlug": Value::Null,
             "seasonNumber": Value::Null,
-            "breadcrumbs": [{"label": "Home", "href": "/"}],
+            "breadcrumbs": [],
         }),
     )
 }
@@ -116,6 +137,7 @@ pub(super) async fn handle_watch_page(Path(job_id): Path<String>) -> Response {
     .into_response()
 }
 
+// ─── series path helper (unchanged) ─────────────────────────────────
 async fn series_path_response(
     state: Arc<AppState>,
     category: &str,
@@ -205,7 +227,7 @@ fn category_ctx(category: &str, label: &str, href: &str) -> Value {
     })
 }
 
-fn browse_page(title: &str, active_sidebar: &str, ctx: Value) -> Html<String> {
+fn browse_page(title: &str, active_tab: &str, ctx: Value) -> Html<String> {
     let context = format!(
         r#"<script>window.BROWSE_CTX = {};</script>"#,
         serde_json::to_string(&ctx).expect("serialise browse ctx")
@@ -213,17 +235,22 @@ fn browse_page(title: &str, active_sidebar: &str, ctx: Value) -> Html<String> {
     base_shell(
         &format!("{title} - Telegram HLS Streamer"),
         search_bar(),
-        active_sidebar,
+        active_tab,
         browse_body(),
         "",
-        &format!("{context}<script src=\"/static/browse.js\"></script>"),
+        &format!(
+            "{context}\
+             <script src=\"/static/browse-home.js\"></script>\
+             <script src=\"/static/browse.js\"></script>"
+        ),
     )
 }
 
+// ─── base shell — new glass navbar with top tabs ────────────────────
 fn base_shell(
     title: &str,
     navbar_center: &str,
-    active_sidebar: &str,
+    active_tab: &str,
     body: &str,
     extra_css: &str,
     scripts: &str,
@@ -235,7 +262,7 @@ fn base_shell(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{title}</title>
-    <script>(function(){{var t=localStorage.getItem('hls_theme');var d=t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches;if(d)document.documentElement.setAttribute('data-theme','dark');}})()</script>
+    <script>(function(){{var t=localStorage.getItem('hls_theme');var d=t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches;if(d)document.documentElement.setAttribute('data-theme','dark');else document.documentElement.setAttribute('data-theme','light');}})()</script>
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Round">
     <link rel="stylesheet" href="/static/app.css">
     {extra_css}
@@ -243,10 +270,8 @@ fn base_shell(
 <body>
 <nav class="navbar">
     <div class="navbar-left">
-        <button class="hamburger" id="hamburgerBtn" title="Toggle sidebar" aria-label="Toggle sidebar">
-            <i class="material-icons-round">menu</i>
-        </button>
-        <a class="logo" href="/"><span>TG</span>HLS</a>
+        <a class="logo" href="/"><span>TG</span></a>
+        <div class="t-tabs">{tabs}</div>
     </div>
     <div class="navbar-center">{navbar_center}</div>
     <div class="navbar-right">
@@ -254,8 +279,8 @@ fn base_shell(
             <i class="material-icons-round">add</i>
             <span class="upload-btn-text">Upload</span>
         </a>
-        <button class="navbar-icon-btn" id="themeToggleBtn" title="Toggle dark mode">
-            <i class="material-icons-round">dark_mode</i>
+        <button class="navbar-icon-btn" id="themeToggleBtn" title="Toggle theme">
+            <i class="material-icons-round">contrast</i>
         </button>
         <a href="/settings" class="navbar-icon-btn" title="Settings">
             <i class="material-icons-round">settings</i>
@@ -263,40 +288,39 @@ fn base_shell(
     </div>
 </nav>
 <div class="app-body">
-    <aside class="sidebar" id="sidebar">
-        <div class="sidebar-inner">
-            {sidebar}
-        </div>
-    </aside>
+    <aside class="sidebar" id="sidebar" hidden></aside>
     {body}
 </div>
 <script src="/static/shared.js"></script>
 {scripts}
 </body>
 </html>"#,
-        sidebar = sidebar_html(active_sidebar),
+        tabs = tabs_html(active_tab),
     ))
 }
 
-fn sidebar_html(active: &str) -> String {
+fn tabs_html(active: &str) -> String {
     let items = [
-        ("home", "/", "home", "Home"),
-        ("films", "/films", "movie", "Films"),
-        ("series", "/series", "tv", "Series"),
-        ("anime-films", "/anime-films", "auto_awesome", "Anime Films"),
-        ("anime-tv", "/anime-tv", "theater_comedy", "Anime TV"),
+        ("home", "/", "Home"),
+        ("films", "/films", "Films"),
+        ("series", "/series", "Series"),
+        ("anime-films", "/anime-films", "Anime Films"),
+        ("anime-tv", "/anime-tv", "Anime TV"),
     ];
     items
         .iter()
-        .map(|(key, href, icon, label)| {
-            let class = if *key == active {
-                "sidebar-item active"
+        .map(|(key, href, label)| {
+            let cls = if *key == active {
+                "t-tab active"
             } else {
-                "sidebar-item"
+                "t-tab"
             };
-            format!(
-                r#"<a class="{class}" href="{href}"><i class="sidebar-icon material-icons-round">{icon}</i> {label}</a>"#
-            )
+            let aria = if *key == active {
+                r#" aria-current="page""#
+            } else {
+                ""
+            };
+            format!(r#"<a class="{cls}"{aria} href="{href}">{label}</a>"#)
         })
         .collect::<Vec<_>>()
         .join("")
@@ -304,15 +328,17 @@ fn sidebar_html(active: &str) -> String {
 
 fn search_bar() -> &'static str {
     r#"<div class="search-bar">
-    <input class="search-input" id="searchInput" type="text" placeholder="Search videos...">
-    <button class="search-btn" title="Search">
-        <i class="material-icons-round">search</i>
-    </button>
+    <i class="material-icons-round search-btn" aria-hidden="true">search</i>
+    <input class="search-input" id="searchInput" type="text" placeholder="Search library">
+    <span class="kbd-hint" aria-hidden="true">⌘K</span>
 </div>"#
 }
 
+// browse_body now exposes an optional hero mount point. browse-home.js
+// only fills it when BROWSE_CTX.view === "home".
 fn browse_body() -> &'static str {
     r#"<main class="main" id="mainContent">
+    <div id="thlsHero"></div>
     <div class="browse-view" id="browseView">
         <div id="videosContainer"></div>
         <button class="load-more-btn" id="loadMoreBtn" onclick="loadMoreJobs()">Load more</button>
@@ -329,12 +355,12 @@ fn browse_body() -> &'static str {
         <div class="modal-body" style="padding: 1rem;">
             <input type="hidden" id="editJobId">
             <div style="margin-bottom: 1rem;">
-                <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Title</label>
-                <input type="text" id="editTitle" class="meta-input" style="width:100%;">
+                <label class="form-label">Title</label>
+                <input type="text" id="editTitle" class="form-input" style="width:100%;">
             </div>
             <div style="margin-bottom: 1rem;">
-                <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Category</label>
-                <select id="editCategory" class="meta-input" style="width:100%;" onchange="updateEditModalFields()">
+                <label class="form-label">Category</label>
+                <select id="editCategory" class="form-input" style="width:100%;" onchange="updateEditModalFields()">
                     <option value="Film">Film</option>
                     <option value="Film Series">Film Series</option>
                     <option value="TV Series">TV Series</option>
@@ -344,21 +370,21 @@ fn browse_body() -> &'static str {
                 </select>
             </div>
             <div style="margin-bottom: 1rem;" id="editSeriesGroup">
-                <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Series Name</label>
-                <input type="text" id="editSeriesName" class="meta-input" style="width:100%;">
+                <label class="form-label">Series Name</label>
+                <input type="text" id="editSeriesName" class="form-input" style="width:100%;">
             </div>
             <div style="display:flex; gap:1rem; margin-bottom: 1rem;">
                 <div style="flex:1;" id="editSeasonGroup">
-                    <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Season</label>
-                    <input type="number" id="editSeasonNumber" class="meta-input" style="width:100%;">
+                    <label class="form-label">Season</label>
+                    <input type="number" id="editSeasonNumber" class="form-input" style="width:100%;">
                 </div>
                 <div style="flex:1;" id="editEpisodeGroup">
-                    <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Episode</label>
-                    <input type="number" id="editEpisodeNumber" class="meta-input" style="width:100%;">
+                    <label class="form-label">Episode</label>
+                    <input type="number" id="editEpisodeNumber" class="form-input" style="width:100%;">
                 </div>
                 <div style="flex:1;" id="editPartGroup">
-                    <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Part #</label>
-                    <input type="number" id="editPartNumber" class="meta-input" style="width:100%;">
+                    <label class="form-label">Part #</label>
+                    <input type="number" id="editPartNumber" class="form-input" style="width:100%;">
                 </div>
             </div>
             <div style="display:flex; justify-content:flex-end; gap:0.5rem; margin-top:1.5rem;">
@@ -370,13 +396,16 @@ fn browse_body() -> &'static str {
 </div>"#
 }
 
+// ─── upload_body / settings_body / watch_body (unchanged inner DOM) ─
+// Bodies kept structurally identical so upload.js / settings.js / watch.js
+// continue to find their IDs. Visual changes come from app.css.
 fn upload_body() -> &'static str {
     r##"<main class="main upload-page" id="mainContent">
     <div class="page-card">
         <div class="page-card-header"><span class="page-card-title">Upload Video</span></div>
-        <div class="resume-banner" id="resumeBanner">
+        <div class="resume-banner hidden" id="resumeBanner">
             <span class="resume-banner-text" id="resumeBannerText"></span>
-            <button class="resume-dismiss" onclick="dismissResume()">Dismiss</button>
+            <button class="action-btn" onclick="dismissResume()">Dismiss</button>
         </div>
         <div class="segmented-control" id="categoryControl">
             <button class="seg-btn active" data-cat="Film">Film</button>
@@ -390,11 +419,11 @@ fn upload_body() -> &'static str {
             <input type="file" id="fileInput" accept="video/*,.mkv,.avi,.mp4,.mov,.webm,.ts,.m4v,.flv">
             <input type="file" id="folderInput" webkitdirectory multiple style="display:none">
             <div class="drop-icon"><i class="material-icons-round">movie</i></div>
-            <div class="drop-text" id="dropText">Drop your video here or <strong>click to browse</strong><br>
-                <small>Supports large files - MKV, MP4, AVI, MOV, WebM - Resumable</small>
+            <div class="drop-text" id="dropText">Drop your video here or <strong>click to browse</strong>
+                <small>Supports large files — MKV, MP4, AVI, MOV, WebM — Resumable</small>
             </div>
         </div>
-        <div style="text-align:center;margin-top:-0.5rem;margin-bottom:1.5rem;">
+        <div style="text-align:center;margin-top:12px;margin-bottom:24px;">
             <button type="button" class="folder-upload-btn hidden" id="folderUploadBtn" onclick="document.getElementById('folderInput').click()">
                 <i class="material-icons-round" style="font-size:1.1rem;vertical-align:middle;margin-right:0.25rem;">folder_open</i> Upload Folder
             </button>
@@ -402,18 +431,18 @@ fn upload_body() -> &'static str {
         <div class="metadata-section hidden" id="metadataSection">
             <div class="apply-all-row hidden" id="applyAllRow">
                 <span class="apply-all-label" id="applyAllLabel">Series name:</span>
-                <input class="apply-all-input" type="text" id="applyAllInput" placeholder="Apply to all rows">
-                <button class="apply-all-btn" id="applyAllBtn">Apply</button>
+                <input class="form-input apply-all-input" type="text" id="applyAllInput" placeholder="Apply to all rows">
+                <button class="action-btn apply-all-btn" id="applyAllBtn">Apply</button>
             </div>
             <div class="metadata-table-wrap" id="metadataTableWrap"></div>
-            <button class="start-upload-btn" id="startUploadBtn" disabled>Start Upload</button>
+            <button class="action-btn primary start-upload-btn" id="startUploadBtn" disabled>Start Upload</button>
         </div>
         <div class="error-msg" id="errorMsg"></div>
-        <div class="analysis-card" id="analysisCard">
-            <h4>Detected Streams</h4>
+        <div class="analysis-card hidden" id="analysisCard">
+            <h4 style="margin:0 0 10px;font-size:13px;color:var(--t-ink-3);">Detected Streams</h4>
             <div class="stream-badges" id="streamBadges"></div>
         </div>
-        <div class="progress-block" id="progressContainer">
+        <div class="progress-block hidden" id="progressContainer">
             <div class="status-text" id="statusText">Preparing...</div>
             <div class="progress-bar-bg"><div class="progress-bar" id="progressBar"></div></div>
             <div class="progress-info"><span id="progressStep">-</span><span id="progressPct">0%</span></div>
@@ -421,8 +450,8 @@ fn upload_body() -> &'static str {
             <div class="activity-log" id="activityLog"></div>
             <button class="cancel-btn" id="cancelBtn" onclick="cancelUpload()">Cancel</button>
         </div>
-        <div class="result-block" id="resultCard">
-            <h4><i class="material-icons-round" style="vertical-align:middle;margin-right:0.3rem;">check_circle</i> Stream Ready</h4>
+        <div class="result-block hidden" id="resultCard">
+            <h4 style="margin:0 0 10px;font-size:14px;"><i class="material-icons-round" style="vertical-align:middle;margin-right:0.3rem;color:var(--t-success);">check_circle</i> Stream Ready</h4>
             <div class="url-box">
                 <span class="url-text" id="masterUrl"></span>
                 <button class="copy-btn" onclick="copyUrl()">Copy</button>
@@ -435,7 +464,7 @@ fn upload_body() -> &'static str {
 
 fn settings_body() -> &'static str {
     r#"<main class="main settings-page" id="mainContent">
-    <div id="settingsContainer" class="settings-stack"></div>
+    <div id="settingsContainer" class="settings-stack" style="max-width:1100px;margin:0 auto 24px;padding:0 56px;"></div>
     <div class="page-card">
         <div class="page-card-header" style="justify-content:space-between;">
             <span class="page-card-title">Telegram Bots</span>
@@ -447,7 +476,7 @@ fn settings_body() -> &'static str {
         <p class="settings-category-note">
             Bots from .env cannot be deleted via the UI. Changes to the bot list take effect immediately.
         </p>
-        <div id="botListContainer"><div class="bot-empty">Loading bots...</div></div>
+        <div id="botListContainer"><div class="bot-empty" style="color:var(--t-ink-3);font-size:13px;">Loading bots...</div></div>
         <div class="settings-actions">
             <button class="action-btn" onclick="checkAllBotHealth()">Check all health</button>
             <span class="settings-status" id="botHealthStatus"></span>
@@ -470,14 +499,14 @@ fn settings_body() -> &'static str {
             </div>
         </div>
         <div class="settings-actions">
-            <button class="settings-btn" id="saveWatchSettingsBtn" onclick="saveWatchSettings()">Save</button>
+            <button class="action-btn primary" id="saveWatchSettingsBtn" onclick="saveWatchSettings()">Save</button>
             <span class="settings-status" id="watchSettingsStatus"></span>
         </div>
     </div>
     <div class="page-card">
         <div class="page-card-header"><span class="page-card-title">DB Transfer</span></div>
         <div class="settings-stack">
-            <div class="settings-actions" style="margin-top:0">
+            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
                 <button class="action-btn" onclick="backupDatabase()">Create Server Backup</button>
                 <button class="action-btn" onclick="downloadDbExport()">Download Export</button>
                 <button class="action-btn" onclick="telegramDbExport()">Export to Telegram</button>
@@ -490,10 +519,10 @@ fn settings_body() -> &'static str {
             </div>
             <div class="form-group">
                 <label class="form-label" for="dbImportMap">Optional: bot_index_map (source segment bot → target server bot)</label>
-                <textarea class="form-input" id="dbImportMap" rows="2" placeholder='Optional. Leave empty for auto-mapping.'></textarea>
-                <div class="field-description">Leave empty to auto-map all source segment bots to this server's first bot (index 0). Provide explicit mapping to remap segments to specific target bots.</div>
+                <textarea class="form-input" id="dbImportMap" rows="2" placeholder="Optional. Leave empty for auto-mapping."></textarea>
+                <div class="field-description">Leave empty to auto-map all source segment bots to this server's first bot (index 0).</div>
             </div>
-            <div class="settings-actions" style="margin-top:0">
+            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
                 <button class="action-btn" onclick="importDbExportFile()">Import Local JSON</button>
                 <span class="settings-status" id="dbImportStatus"></span>
             </div>
@@ -505,9 +534,9 @@ fn settings_body() -> &'static str {
             <div class="form-group">
                 <label class="form-label" for="telegramImportBotIndex">Telegram downloader bot index</label>
                 <input class="form-input" type="number" id="telegramImportBotIndex" value="0" min="0">
-                <div class="field-description">This bot downloads the export JSON file from Telegram. It does not remap segment storage bots.</div>
+                <div class="field-description">This bot downloads the export JSON file from Telegram.</div>
             </div>
-            <div class="settings-actions" style="margin-top:0">
+            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
                 <button class="action-btn" onclick="importDbExportTelegram()">Import Telegram JSON</button>
             </div>
             <div class="form-group">
@@ -515,7 +544,7 @@ fn settings_body() -> &'static str {
                 <input class="form-input" type="file" id="databaseFileInput" accept=".db,.sqlite,.sqlite3,application/octet-stream">
                 <div class="field-description">Replaces the live database after creating a backup.</div>
             </div>
-            <div class="settings-actions" style="margin-top:0">
+            <div class="settings-actions" style="margin-top:0;padding-top:0;border-top:none;">
                 <button class="action-btn danger" id="databaseLoadBtn" onclick="loadDatabaseFromFile()">Load Database</button>
                 <span class="settings-status" id="databaseLoadStatus"></span>
             </div>
@@ -541,11 +570,11 @@ fn settings_body() -> &'static str {
             <div class="field-description">Must be a negative integer.</div>
         </div>
         <div class="form-group">
-            <label class="form-label" for="newBotLabel">Label <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+            <label class="form-label" for="newBotLabel">Label <span style="font-weight:400;color:var(--t-ink-3)">(optional)</span></label>
             <input class="form-input" type="text" id="newBotLabel" placeholder="e.g. Main storage bot">
         </div>
         <div class="settings-actions">
-            <button class="modal-btn primary" id="addBotSaveBtn" onclick="testAndSaveBot()">Test &amp; Save</button>
+            <button class="action-btn primary" id="addBotSaveBtn" onclick="testAndSaveBot()">Test &amp; Save</button>
             <span class="settings-status" id="addBotStatus"></span>
         </div>
     </div>
@@ -555,10 +584,10 @@ fn settings_body() -> &'static str {
 fn watch_body() -> &'static str {
     r#"<main class="main watch-page" id="mainContent">
     <div class="player-view active">
-        <div class="breadcrumb" id="watchBreadcrumb"></div>
         <div class="player-container" id="playerContainer">
             <video id="videoEl" autoplay playsinline crossorigin="anonymous"></video>
         </div>
+        <div class="breadcrumb" id="watchBreadcrumb" style="padding-top:24px;"></div>
         <div id="episodeNav"></div>
         <div class="player-info" id="playerInfo"></div>
     </div>
@@ -574,12 +603,12 @@ fn watch_body() -> &'static str {
         <div class="modal-body" style="padding: 1rem;">
             <input type="hidden" id="editJobId">
             <div style="margin-bottom: 1rem;">
-                <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Title</label>
-                <input type="text" id="editTitle" class="meta-input" style="width:100%;">
+                <label class="form-label">Title</label>
+                <input type="text" id="editTitle" class="form-input" style="width:100%;">
             </div>
             <div style="margin-bottom: 1rem;">
-                <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Category</label>
-                <select id="editCategory" class="meta-input" style="width:100%;" onchange="updateEditModalFields()">
+                <label class="form-label">Category</label>
+                <select id="editCategory" class="form-input" style="width:100%;" onchange="updateEditModalFields()">
                     <option value="Film">Film</option>
                     <option value="Film Series">Film Series</option>
                     <option value="TV Series">TV Series</option>
@@ -589,21 +618,21 @@ fn watch_body() -> &'static str {
                 </select>
             </div>
             <div style="margin-bottom: 1rem;" id="editSeriesGroup">
-                <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Series Name</label>
-                <input type="text" id="editSeriesName" class="meta-input" style="width:100%;">
+                <label class="form-label">Series Name</label>
+                <input type="text" id="editSeriesName" class="form-input" style="width:100%;">
             </div>
             <div style="display:flex; gap:1rem; margin-bottom: 1rem;">
                 <div style="flex:1;" id="editSeasonGroup">
-                    <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Season</label>
-                    <input type="number" id="editSeasonNumber" class="meta-input" style="width:100%;">
+                    <label class="form-label">Season</label>
+                    <input type="number" id="editSeasonNumber" class="form-input" style="width:100%;">
                 </div>
                 <div style="flex:1;" id="editEpisodeGroup">
-                    <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Episode</label>
-                    <input type="number" id="editEpisodeNumber" class="meta-input" style="width:100%;">
+                    <label class="form-label">Episode</label>
+                    <input type="number" id="editEpisodeNumber" class="form-input" style="width:100%;">
                 </div>
                 <div style="flex:1;" id="editPartGroup">
-                    <label style="display:block; margin-bottom:0.5rem; color:var(--text-muted); font-size:0.875rem;">Part #</label>
-                    <input type="number" id="editPartNumber" class="meta-input" style="width:100%;">
+                    <label class="form-label">Part #</label>
+                    <input type="number" id="editPartNumber" class="form-input" style="width:100%;">
                 </div>
             </div>
             <div style="display:flex; justify-content:flex-end; gap:0.5rem; margin-top:1.5rem;">
