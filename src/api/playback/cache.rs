@@ -114,6 +114,7 @@ impl SegmentCache {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn get_bytes(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         self.get(key).await.map(|entry| entry.bytes)
     }

@@ -53,6 +53,7 @@ Common `.env` values:
 | `TELEGRAM_BOT_TOKEN_1` | unset | First Telegram bot token. |
 | `TELEGRAM_CHANNEL_ID_1` | unset | Channel used by the first bot. |
 | `TELEGRAM_MAX_FILE_SIZE` | `20971520` | Per-file Telegram upload ceiling. Raise if Telegram increases Bot API limits. |
+| `TELEGRAM_ENCRYPTION_KEY` | unset | Optional 32-byte hex key for encrypting new Telegram uploads. Generate with `openssl rand -hex 32`; losing it makes encrypted uploads unrecoverable. |
 | `SEGMENT_TARGET_SIZE` | `15728640` | Preferred HLS segment target. User-configurable; adjust if upload ceiling changes. |
 | `MAX_UPLOAD_SIZE` | `107374182400` | Max accepted client upload size. |
 | `UPLOAD_CHUNK_SIZE` | `10485760` | Browser/client upload chunk size. |
@@ -103,6 +104,8 @@ Use `/settings` or `/api/watch-settings` to configure watch-folder ingest. The s
 Browse pages list jobs through `/api/jobs`. The watch page at `/watch/<job_id>` loads metadata and plays HLS using the generated master playlist at `/hls/<job_id>/master.m3u8`.
 
 Segments are served through `/segment/<job_id>/<segment_key>`. The server retrieves them from Telegram, caches them in-process, and can prefetch nearby segments.
+
+If `TELEGRAM_ENCRYPTION_KEY` is set, new Telegram uploads are stored as random `.dat` documents containing AEAD ciphertext. Existing plaintext Telegram files remain playable. Keep the key backed up separately; encrypted segments, thumbnails, subtitles, split parts, and DB sync snapshots cannot be recovered without it.
 
 ### Database Transfer
 

@@ -135,6 +135,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         name: "add_marker_fingerprint_windows",
         run: run_migration_25,
     },
+    Migration {
+        revision: 26,
+        name: "add_telegram_encryption_nonces",
+        run: run_migration_26,
+    },
 ];
 
 // Public wrappers for test access
@@ -212,6 +217,9 @@ pub(crate) fn run_migration_24(conn: &Connection) -> Result<()> {
 }
 pub(crate) fn run_migration_25(conn: &Connection) -> Result<()> {
     migration_25_add_marker_fingerprint_windows(conn)
+}
+pub(crate) fn run_migration_26(conn: &Connection) -> Result<()> {
+    migration_26_add_telegram_encryption_nonces(conn)
 }
 
 fn table_sql_contains(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
@@ -349,7 +357,7 @@ fn add_column_if_missing(
 fn validate_table_name(table: &str) -> Result<&str> {
     match table {
         "jobs" | "tracks" | "segments" | "settings" | "bots" | "schema_migrations"
-        | "segment_parts" | "kv_internal" => Ok(table),
+        | "segment_parts" | "kv_internal" | "db_sync_uploads" => Ok(table),
         _ => bail!("unknown sqlite table: {table}"),
     }
 }
@@ -406,7 +414,8 @@ fn validate_column_name(column: &str) -> Result<&str> {
         | "mode"
         | "created_at_unix"
         | "prefix"
-        | "episode_title" => Ok(column),
+        | "episode_title"
+        | "encryption_nonce" => Ok(column),
         _ => bail!("unknown sqlite column: {column}"),
     }
 }
@@ -530,6 +539,8 @@ fn detect_legacy_revision(conn: &Connection) -> Result<i64> {
         && column_exists(conn, "jobs", "created_at_unix")?
         && column_exists(conn, "segments", "prefix")?
         && column_exists(conn, "segments", "name")?
+        && column_exists(conn, "segment_parts", "prefix")?
+        && column_exists(conn, "segment_parts", "name")?
     {
         rev = 18;
     }
@@ -1233,6 +1244,23 @@ fn migration_25_add_marker_fingerprint_windows(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+fn migration_26_add_telegram_encryption_nonces(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "segments", "encryption_nonce", "TEXT DEFAULT NULL")?;
+    add_column_if_missing(
+        conn,
+        "segment_parts",
+        "encryption_nonce",
+        "TEXT DEFAULT NULL",
+    )?;
+    add_column_if_missing(
+        conn,
+        "db_sync_uploads",
+        "encryption_nonce",
+        "TEXT DEFAULT NULL",
+    )?;
+    Ok(())
+}
+
 fn backfill_segment_key_parts(conn: &Connection, table: &str) -> Result<()> {
     let table = validate_table_name(table)?;
     conn.execute_batch(&format!(
@@ -1369,6 +1397,20 @@ mod tests {
 
         assert!(index_exists(&conn, "idx_jobs_media_created").unwrap());
         assert!(index_exists(&conn, "idx_jobs_series_created").unwrap());
+    }
+
+    #[test]
+    fn test_migration_26_adds_encryption_nonce_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.revision < 26) {
+            (migration.run)(&conn).unwrap();
+        }
+
+        run_migration_26(&conn).unwrap();
+
+        assert!(column_exists(&conn, "segments", "encryption_nonce").unwrap());
+        assert!(column_exists(&conn, "segment_parts", "encryption_nonce").unwrap());
+        assert!(column_exists(&conn, "db_sync_uploads", "encryption_nonce").unwrap());
     }
 
     #[test]

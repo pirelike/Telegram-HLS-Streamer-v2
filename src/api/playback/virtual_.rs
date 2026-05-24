@@ -283,6 +283,13 @@ async fn fetch_source_for_virtual(
                 )
                 .await
                 .with_context(|| format!("fetching part of {source_key}"))?;
+                let aad = super::real::segment_part_aad(source_key, part.part_index);
+                let bytes = crate::crypto::decrypt_optional(
+                    cfg.telegram_encryption_key.as_ref(),
+                    part.encryption_nonce.as_deref(),
+                    &aad,
+                    bytes,
+                )?;
                 all_bytes.extend_from_slice(&bytes);
             }
             let entry =
@@ -302,9 +309,11 @@ async fn fetch_source_for_virtual(
         state,
         cfg,
         &cache_key,
+        job_id,
         &segment.file_id,
         segment.bot_index,
         source_key,
+        segment.encryption_nonce.as_deref(),
     )
     .await?;
     Ok((*entry.bytes).clone())

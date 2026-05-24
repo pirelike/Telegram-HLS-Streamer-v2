@@ -1403,6 +1403,7 @@ dependencies = [
  "r2d2_sqlite",
  "rand 0.8.6",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

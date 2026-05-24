@@ -223,6 +223,40 @@ async fn fake_telegram_server() -> String {
     format!("http://{addr}")
 }
 
+struct FakeTelegramBytes {
+    bytes: Vec<u8>,
+}
+
+async fn fake_telegram_bytes_handler(
+    State(fake): State<Arc<FakeTelegramBytes>>,
+    AxumPath(path): AxumPath<String>,
+) -> AxumResponse {
+    if path.ends_with("/getFile") {
+        return Json(json!({
+            "ok": true,
+            "result": { "file_path": "payload.bin" }
+        }))
+        .into_response();
+    }
+    if path.contains("file/bot") {
+        return fake.bytes.clone().into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+async fn fake_telegram_bytes_server(bytes: Vec<u8>) -> String {
+    let fake = Arc::new(FakeTelegramBytes { bytes });
+    let app = axum::Router::new()
+        .route("/*path", any(fake_telegram_bytes_handler))
+        .with_state(fake);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 async fn init_upload(state: Arc<AppState>, filename: &str, total_size: u64) -> Value {
     let response = router(state)
         .oneshot(
@@ -288,6 +322,7 @@ async fn save_complete_job(
         file_size: 123,
         duration: Some(4.0),
         is_split: false,
+        encryption_nonce: None,
     }];
     db::save_job(&mut conn, &job, &tracks, &segments, &[]).unwrap();
 }
@@ -326,6 +361,7 @@ async fn cold_segment_waiter_succeeds_when_leader_disconnects() {
             file_size: 18,
             duration: Some(4.0),
             is_split: false,
+            encryption_nonce: None,
         };
         db::save_job(&mut conn, &job, &[], &[segment], &[]).unwrap();
     }
@@ -354,6 +390,53 @@ async fn cold_segment_waiter_succeeds_when_leader_disconnects() {
     assert_eq!(&bytes, b"cold segment bytes");
 
     assert!(state.cache.snapshot().entries >= 1);
+}
+
+#[tokio::test]
+async fn encrypted_segment_is_decrypted_before_response() {
+    let key = crate::crypto::EncryptionKey::from_hex(&"44".repeat(crate::crypto::KEY_LEN)).unwrap();
+    let encrypted = key
+        .encrypt(b"plain segment bytes", "video_0/video_0001.m4s")
+        .unwrap();
+    let fake_telegram = fake_telegram_bytes_server(encrypted.ciphertext).await;
+    let state = app_state_with_telegram_base(fake_telegram);
+    {
+        let mut cfg = state.config.read().await.as_ref().clone();
+        cfg.telegram_encryption_key = Some(key);
+        cfg.bots = vec![crate::config::BotConfig {
+            token: "12345678:abcdefghijklmnopqrstuvwxyzABCDEFGHI".into(),
+            channel_id: -100,
+            source: crate::config::BotSource::Env,
+            db_id: None,
+            label: "test".into(),
+        }];
+        *state.config.write().await = Arc::new(cfg);
+    }
+    {
+        let mut conn = state.db_conn().await.unwrap();
+        let job = db::NewJob::complete("encrypted", "Encrypted");
+        let segment = db::NewSegment {
+            segment_key: "video_0/video_0001.m4s".into(),
+            file_id: "A".repeat(50),
+            bot_index: 0,
+            file_size: 19,
+            duration: Some(4.0),
+            is_split: false,
+            encryption_nonce: Some(encrypted.nonce_hex),
+        };
+        db::save_job(&mut conn, &job, &[], &[segment], &[]).unwrap();
+    }
+
+    let response = router(state)
+        .oneshot(
+            Request::get("/segment/encrypted/video_0/video_0001.m4s")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_bytes(response).await, b"plain segment bytes");
 }
 
 #[tokio::test]

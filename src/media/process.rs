@@ -1168,7 +1168,7 @@ pub(crate) fn output_audio_channels(audio: &AudioStream) -> i64 {
     let layout = audio.channel_layout.as_str();
     if audio.channels == 1 {
         1
-    } else if audio.channels == 2 || layout == "5.1" || layout == "3.1" {
+    } else if audio.channels == 2 || layout.starts_with("5.1") || layout.starts_with("3.1") {
         audio.channels
     } else {
         2
@@ -1216,31 +1216,27 @@ pub(crate) fn double_bitrate(raw: &str) -> String {
     if raw.is_empty() {
         return "0".to_string();
     }
-    let last_char = raw.chars().last().unwrap();
-    if last_char.is_ascii_alphabetic() {
-        let unit = last_char;
-        let number_str = &raw[..raw.len() - unit.len_utf8()];
-        if let Ok(number) = number_str.parse::<f64>() {
-            let doubled = number * 2.0;
-            if doubled.fract() == 0.0 {
-                format!("{:.0}{}", doubled, unit)
-            } else {
-                format!("{}{}", doubled, unit)
-            }
-        } else {
-            raw.to_string()
-        }
+    let lower = raw.to_ascii_lowercase();
+    let suffixes = ["kbps", "mbps", "gbps", "bps", "k", "m", "g"];
+    let (number_str, suffix_len) = suffixes
+        .iter()
+        .find_map(|s| lower.ends_with(s).then(|| s.len()))
+        .map_or((raw, 0), |len| (&raw[..raw.len() - len], len));
+    let suffix = if suffix_len > 0 {
+        &raw[raw.len() - suffix_len..]
     } else {
-        if let Ok(number) = raw.parse::<f64>() {
+        ""
+    };
+    match number_str.trim().parse::<f64>() {
+        Ok(number) => {
             let doubled = number * 2.0;
             if doubled.fract() == 0.0 {
-                format!("{:.0}", doubled)
+                format!("{:.0}{}", doubled, suffix)
             } else {
-                format!("{}", doubled)
+                format!("{}{}", doubled, suffix)
             }
-        } else {
-            raw.to_string()
         }
+        Err(_) => raw.to_string(),
     }
 }
 

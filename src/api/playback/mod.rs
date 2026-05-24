@@ -188,15 +188,15 @@ fn bytes_for_key(key: &str, bytes: Vec<u8>) -> Vec<u8> {
     {
         return bytes;
     }
-    if bytes.starts_with(b"WEBVTT\r\n") {
-        let mut out = b"WEBVTT\r\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\r\n".to_vec();
-        out.extend_from_slice(&bytes[b"WEBVTT\r\n".len()..]);
-        return out;
-    }
-    if bytes.starts_with(b"WEBVTT\n") {
-        let mut out = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n".to_vec();
-        out.extend_from_slice(&bytes[b"WEBVTT\n".len()..]);
-        return out;
+    if bytes.starts_with(b"WEBVTT") {
+        if let Some(pos) = bytes.iter().position(|&b| b == b'\n') {
+            let nl = pos + 1;
+            let mut out = Vec::with_capacity(bytes.len() + 64);
+            out.extend_from_slice(&bytes[..nl]);
+            out.extend_from_slice(b"X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n");
+            out.extend_from_slice(&bytes[nl..]);
+            return out;
+        }
     }
     bytes
 }

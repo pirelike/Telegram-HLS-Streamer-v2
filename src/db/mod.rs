@@ -16,7 +16,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
-pub const LATEST_SCHEMA_REVISION: i64 = 25;
+pub const LATEST_SCHEMA_REVISION: i64 = 26;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 pub type DbConn = r2d2::PooledConnection<SqliteConnectionManager>;
@@ -239,6 +239,9 @@ mod tests {
         assert!(migrations::column_exists(&conn, "tracks", "mode").unwrap());
         assert!(migrations::column_exists(&conn, "segments", "prefix").unwrap());
         assert!(migrations::column_exists(&conn, "segments", "name").unwrap());
+        assert!(migrations::column_exists(&conn, "segments", "encryption_nonce").unwrap());
+        assert!(migrations::column_exists(&conn, "segment_parts", "encryption_nonce").unwrap());
+        assert!(migrations::column_exists(&conn, "db_sync_uploads", "encryption_nonce").unwrap());
         assert!(migrations::table_exists(&conn, "kv_internal").unwrap());
         assert_connection_pragmas(&conn);
         drop(conn);
@@ -416,6 +419,7 @@ mod tests {
             file_size: 123,
             duration: Some(4.0),
             is_split: false,
+            encryption_nonce: Some("00112233445566778899aabb".into()),
         }];
         save_job(&mut conn, &job, &tracks, &segments, &[]).unwrap();
 
@@ -433,6 +437,14 @@ mod tests {
                 .unwrap()
                 .bot_index,
             2
+        );
+        assert_eq!(
+            get_segment(&conn, "job1", "video_0/video_0001.m4s")
+                .unwrap()
+                .unwrap()
+                .encryption_nonce
+                .as_deref(),
+            Some("00112233445566778899aabb")
         );
         let (mode, bitrate_bps): (String, i64) = conn
             .query_row(
@@ -503,6 +515,14 @@ mod tests {
                 .bot_index,
             5
         );
+        assert_eq!(
+            get_segment(&conn2, "job1", "video_0/video_0001.m4s")
+                .unwrap()
+                .unwrap()
+                .encryption_nonce
+                .as_deref(),
+            Some("00112233445566778899aabb")
+        );
         assert!(delete_job(&conn2, "job1").unwrap());
         assert!(get_segment(&conn2, "job1", "video_0/video_0001.m4s")
             .unwrap()
@@ -521,6 +541,7 @@ mod tests {
             file_size: 42,
             duration: Some(4.0),
             is_split: false,
+            encryption_nonce: None,
         }];
         save_job(&mut source, &job, &[], &segments, &[]).unwrap();
         let export = export_to_dict(&source).unwrap();
@@ -852,6 +873,7 @@ mod tests {
             file_size: 123,
             duration: Some(4.0),
             is_split: false,
+            encryption_nonce: None,
         }];
         let parts = vec![NewSegmentPart {
             job_id: "job1".into(),
@@ -860,6 +882,7 @@ mod tests {
             file_id: "part-id".into(),
             bot_index: 0,
             file_size: 50,
+            encryption_nonce: None,
         }];
         save_job(&mut conn, &job, &[], &segments, &parts).unwrap();
 
@@ -934,6 +957,7 @@ mod tests {
             file_size: 1024,
             duration: Some(10.0),
             is_split: true,
+            encryption_nonce: None,
         }];
         save_job(&mut conn, &job, &[], &segments, &[]).unwrap();
 
@@ -970,6 +994,7 @@ mod tests {
             file_size: 2048,
             duration: Some(10.0),
             is_split: false,
+            encryption_nonce: None,
         }];
         save_job(&mut conn, &job, &[], &segments, &[]).unwrap();
 
@@ -1022,6 +1047,7 @@ mod tests {
             file_size: 500,
             duration: Some(4.0),
             is_split: false,
+            encryption_nonce: None,
         }];
         save_job(&mut conn, &job, &[], &segments, &[]).unwrap();
 
@@ -1031,6 +1057,7 @@ mod tests {
             "video_0/video_0001.m4s",
             "fresh_file_id",
             1,
+            Some("abcdefabcdefabcdefabcdef"),
         )
         .unwrap();
         assert!(updated);
@@ -1040,6 +1067,10 @@ mod tests {
             .unwrap();
         assert_eq!(lookup.file_id, "fresh_file_id");
         assert_eq!(lookup.bot_index, 1);
+        assert_eq!(
+            lookup.encryption_nonce.as_deref(),
+            Some("abcdefabcdefabcdefabcdef")
+        );
     }
 
     #[test]
@@ -1071,6 +1102,7 @@ mod tests {
             file_size: 1000,
             duration: Some(4.0),
             is_split: true,
+            encryption_nonce: None,
         }];
         let parts = vec![NewSegmentPart {
             job_id: "test_update_part_fid".into(),
@@ -1079,6 +1111,7 @@ mod tests {
             file_id: "stale_part_id".into(),
             bot_index: 0,
             file_size: 500,
+            encryption_nonce: None,
         }];
         save_job(&mut conn, &job, &[], &segments, &parts).unwrap();
 
@@ -1089,6 +1122,7 @@ mod tests {
             0,
             "fresh_part_id",
             2,
+            Some("abcdefabcdefabcdefabcdef"),
         )
         .unwrap();
         assert!(updated);
@@ -1098,5 +1132,9 @@ mod tests {
                 .unwrap();
         assert_eq!(lookup[0].file_id, "fresh_part_id");
         assert_eq!(lookup[0].bot_index, 2);
+        assert_eq!(
+            lookup[0].encryption_nonce.as_deref(),
+            Some("abcdefabcdefabcdefabcdef")
+        );
     }
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 use crate::config::BotConfig;
+use crate::crypto::EncryptionKey;
 
 pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 const MAX_ATTEMPTS: usize = 3;
@@ -30,6 +31,7 @@ pub struct UploadedFile {
     pub file_id: String,
     pub bot_index: i64,
     pub file_size: u64,
+    pub encryption_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,60 +204,156 @@ pub async fn upload_document(
     bot_index: i64,
     path: &Path,
     segment_key: String,
+    encryption_key: Option<&EncryptionKey>,
     // max_file_size is typically cfg.telegram_max_file_size — user-configurable;
     // raise if Telegram increases Bot API limits.
     max_file_size: u64,
 ) -> Result<UploadedFile> {
-    let file_size = tokio::fs::metadata(path)
+    let plaintext_size = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("stat {}", path.display()))?
         .len();
-    if file_size > max_file_size {
+    let prepared =
+        prepare_upload_payload(path, &segment_key, encryption_key, plaintext_size).await?;
+    if prepared.upload_size > max_file_size {
         runtime.record_upload_error(bot_index).await;
+        let upload_size = prepared.upload_size;
+        let _ = prepared.cleanup().await;
         bail!(
             "telegram_file_too_large: {} is {} bytes, max is {}",
             path.display(),
-            file_size,
+            upload_size,
             max_file_size
         );
     }
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("invalid upload filename: {}", path.display()))?
-        .to_string();
+    let upload_result = upload_prepared_document(
+        client,
+        runtime,
+        base_url,
+        bot,
+        bot_index,
+        &prepared.path,
+        &prepared.filename,
+        segment_key,
+        plaintext_size,
+        prepared.upload_size,
+        prepared.encryption_nonce.clone(),
+    )
+    .await;
+    let cleanup_result = prepared.cleanup().await;
+    if let Err(e) = cleanup_result {
+        tracing::warn!(error = %e, "failed to remove encrypted upload staging file");
+    }
+    upload_result
+}
+
+struct PreparedUpload {
+    path: PathBuf,
+    filename: String,
+    upload_size: u64,
+    encryption_nonce: Option<String>,
+    cleanup_path: Option<PathBuf>,
+}
+
+impl PreparedUpload {
+    async fn cleanup(self) -> Result<()> {
+        if let Some(path) = self.cleanup_path {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn prepare_upload_payload(
+    path: &Path,
+    segment_key: &str,
+    encryption_key: Option<&EncryptionKey>,
+    plaintext_size: u64,
+) -> Result<PreparedUpload> {
+    let Some(key) = encryption_key else {
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("invalid upload filename: {}", path.display()))?
+            .to_string();
+        return Ok(PreparedUpload {
+            path: path.to_path_buf(),
+            filename,
+            upload_size: plaintext_size,
+            encryption_nonce: None,
+            cleanup_path: None,
+        });
+    };
+
+    let plaintext = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read upload file {}", path.display()))?;
+    let encrypted = key.encrypt(&plaintext, segment_key)?;
+    let filename = format!("{}.dat", uuid::Uuid::new_v4().simple());
+    let staged_path = std::env::temp_dir().join(format!("thls-upload-{filename}"));
+    tokio::fs::write(&staged_path, &encrypted.ciphertext)
+        .await
+        .with_context(|| format!("write encrypted upload {}", staged_path.display()))?;
+    Ok(PreparedUpload {
+        path: staged_path.clone(),
+        filename,
+        upload_size: encrypted.ciphertext.len() as u64,
+        encryption_nonce: Some(encrypted.nonce_hex),
+        cleanup_path: Some(staged_path),
+    })
+}
+
+async fn upload_prepared_document(
+    client: &reqwest::Client,
+    runtime: &TelegramRuntime,
+    base_url: &str,
+    bot: BotConfig,
+    bot_index: i64,
+    path: &Path,
+    filename: &str,
+    segment_key: String,
+    plaintext_size: u64,
+    upload_size: u64,
+    encryption_nonce: Option<String>,
+) -> Result<UploadedFile> {
     let lock = runtime.upload_lock(&bot.token).await;
     let mut guard = lock.lock().await;
     let started = Instant::now();
     tracing::info!(
         segment_key = %segment_key,
         bot_index,
-        file_size,
+        file_size = plaintext_size,
+        upload_size,
         filename = %filename,
         "telegram upload started"
     );
 
     for attempt in 0..MAX_ATTEMPTS {
-        match send_document_attempt(client, base_url, &bot, path, &filename, file_size).await {
+        match send_document_attempt(client, base_url, &bot, path, filename, upload_size).await {
             Ok((file_id, remote_size)) => {
-                if remote_size != file_size {
+                if remote_size != upload_size {
                     runtime.record_upload_error(bot_index).await;
                     runtime.record_consecutive_failure(bot_index).await;
                     bail!(
                         "upload_integrity_mismatch: {} local={} telegram={}",
                         segment_key,
-                        file_size,
+                        upload_size,
                         remote_size
                     );
                 }
                 runtime
-                    .record_upload_success(bot_index, file_size, started.elapsed().as_secs_f64())
+                    .record_upload_success(bot_index, upload_size, started.elapsed().as_secs_f64())
                     .await;
                 runtime.reset_consecutive_failures(bot_index).await;
                 tracing::info!(
                     segment_key = %segment_key,
                     bot_index,
-                    file_size,
+                    file_size = plaintext_size,
+                    upload_size,
                     elapsed_ms = started.elapsed().as_millis(),
                     "telegram upload complete"
                 );
@@ -263,7 +361,8 @@ pub async fn upload_document(
                     segment_key,
                     file_id,
                     bot_index,
-                    file_size,
+                    file_size: plaintext_size,
+                    encryption_nonce,
                 });
             }
             Err(TelegramError::Permanent(e)) => {
@@ -645,6 +744,7 @@ mod tests {
     use axum::routing::any;
     use axum::Router;
     use serde_json::json;
+    use tokio::sync::Mutex;
 
     use crate::config::{BotConfig, BotSource};
 
@@ -657,16 +757,18 @@ mod tests {
         bad_request: bool,
         forbidden: bool,
         download_bytes: Vec<u8>,
+        upload_bodies: Mutex<Vec<Vec<u8>>>,
     }
 
     async fn fake_handler(
         State(fake): State<Arc<FakeTelegram>>,
         method: Method,
         uri: Uri,
-        _body: Bytes,
+        body: Bytes,
     ) -> Response {
         let path = uri.path();
         if method == Method::POST && path.ends_with("/sendDocument") {
+            fake.upload_bodies.lock().await.push(body.to_vec());
             let attempt = fake.send_attempts.fetch_add(1, Ordering::SeqCst);
             if fake.rate_limit_first && attempt == 0 {
                 return (
@@ -778,6 +880,7 @@ mod tests {
             bad_request: false,
             forbidden: false,
             download_bytes: Vec::new(),
+            upload_bodies: Mutex::new(Vec::new()),
         })
         .await;
         let runtime = TelegramRuntime::new();
@@ -789,6 +892,7 @@ mod tests {
             2,
             &path,
             "video_0/video_0001.m4s".into(),
+            None,
             20,
         )
         .await
@@ -804,6 +908,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_upload_uses_random_dat_filename_and_records_plain_size() {
+        let path = temp_file(b"abcdef").await;
+        let (base_url, fake) = fake_server(FakeTelegram {
+            send_attempts: AtomicUsize::new(0),
+            upload_size: 22,
+            mismatch: false,
+            rate_limit_first: false,
+            bad_request: false,
+            forbidden: false,
+            download_bytes: Vec::new(),
+            upload_bodies: Mutex::new(Vec::new()),
+        })
+        .await;
+        let runtime = TelegramRuntime::new();
+        let key =
+            crate::crypto::EncryptionKey::from_hex(&"33".repeat(crate::crypto::KEY_LEN)).unwrap();
+        let uploaded = upload_document(
+            &reqwest::Client::new(),
+            &runtime,
+            &base_url,
+            bot(),
+            0,
+            &path,
+            "video_0/video_0001.m4s".into(),
+            Some(&key),
+            22,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(uploaded.file_size, 6);
+        assert!(uploaded.encryption_nonce.is_some());
+        let metrics = runtime.metrics_snapshot().await;
+        assert_eq!(metrics.per_bot.get(&0).unwrap().upload_bytes, 22);
+        let bodies = fake.upload_bodies.lock().await;
+        let body = String::from_utf8_lossy(&bodies[0]);
+        assert!(body.contains(".dat\""));
+        assert!(!body.contains("video_0001.m4s"));
+        assert!(!body.as_bytes().windows(6).any(|w| w == b"abcdef"));
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
     async fn oversized_upload_fails_before_contacting_telegram() {
         let path = temp_file(b"abcdef").await;
         let (base_url, fake) = fake_server(FakeTelegram {
@@ -814,6 +961,7 @@ mod tests {
             bad_request: false,
             forbidden: false,
             download_bytes: Vec::new(),
+            upload_bodies: Mutex::new(Vec::new()),
         })
         .await;
         let runtime = TelegramRuntime::new();
@@ -825,6 +973,7 @@ mod tests {
             0,
             &path,
             "video_0/video_0001.m4s".into(),
+            None,
             5,
         )
         .await
@@ -847,6 +996,7 @@ mod tests {
             bad_request: false,
             forbidden: false,
             download_bytes: Vec::new(),
+            upload_bodies: Mutex::new(Vec::new()),
         })
         .await;
         let runtime = TelegramRuntime::new();
@@ -858,6 +1008,7 @@ mod tests {
             0,
             &path,
             "video_0/video_0001.m4s".into(),
+            None,
             20,
         )
         .await
@@ -879,6 +1030,7 @@ mod tests {
             bad_request: false,
             forbidden: false,
             download_bytes: Vec::new(),
+            upload_bodies: Mutex::new(Vec::new()),
         })
         .await;
         let runtime = TelegramRuntime::new();
@@ -890,6 +1042,7 @@ mod tests {
             0,
             &path,
             "video_0/video_0001.m4s".into(),
+            None,
             20,
         )
         .await
@@ -904,6 +1057,7 @@ mod tests {
             bad_request: true,
             forbidden: false,
             download_bytes: Vec::new(),
+            upload_bodies: Mutex::new(Vec::new()),
         })
         .await;
         let runtime = TelegramRuntime::new();
@@ -915,6 +1069,7 @@ mod tests {
             0,
             &path,
             "video_0/video_0001.m4s".into(),
+            None,
             20,
         )
         .await
@@ -934,6 +1089,7 @@ mod tests {
             bad_request: false,
             forbidden: false,
             download_bytes: b"payload".to_vec(),
+            upload_bodies: Mutex::new(Vec::new()),
         })
         .await;
         let runtime = TelegramRuntime::new();
@@ -965,6 +1121,7 @@ mod tests {
             bad_request: false,
             forbidden: true,
             download_bytes: Vec::new(),
+            upload_bodies: Mutex::new(Vec::new()),
         })
         .await;
         let runtime = TelegramRuntime::new();
@@ -976,6 +1133,7 @@ mod tests {
             0,
             &path,
             "video_0/video_0001.m4s".into(),
+            None,
             20,
         )
         .await

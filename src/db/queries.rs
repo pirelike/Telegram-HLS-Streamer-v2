@@ -111,8 +111,8 @@ pub fn save_job(
     for segment in segments {
         let (prefix, name) = split_segment_key(&segment.segment_key);
         tx.execute(
-            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, file_size, duration, is_split, prefix, name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO segments(job_id, segment_key, file_id, bot_index, file_size, duration, is_split, prefix, name, encryption_nonce)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 job.job_id,
                 segment.segment_key,
@@ -123,14 +123,15 @@ pub fn save_job(
                 bool_to_i64(segment.is_split),
                 prefix,
                 name,
+                segment.encryption_nonce,
             ],
         )?;
     }
     for part in segment_parts {
         let (prefix, name) = split_segment_key(&part.segment_key);
         tx.execute(
-            "INSERT INTO segment_parts(job_id, segment_key, part_index, file_id, bot_index, file_size, prefix, name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO segment_parts(job_id, segment_key, part_index, file_id, bot_index, file_size, prefix, name, encryption_nonce)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 job.job_id,
                 part.segment_key,
@@ -140,6 +141,7 @@ pub fn save_job(
                 part.file_size,
                 prefix,
                 name,
+                part.encryption_nonce,
             ],
         )?;
     }
@@ -323,13 +325,14 @@ pub fn get_segment(
     segment_key: &str,
 ) -> Result<Option<SegmentLookup>> {
     conn.query_row(
-        "SELECT file_id, bot_index, is_split FROM segments WHERE job_id = ?1 AND segment_key = ?2",
+        "SELECT file_id, bot_index, is_split, encryption_nonce FROM segments WHERE job_id = ?1 AND segment_key = ?2",
         params![job_id, segment_key],
         |r| {
             Ok(SegmentLookup {
                 file_id: r.get(0)?,
                 bot_index: r.get(1)?,
                 is_split: r.get::<_, i64>(2)? == 1,
+                encryption_nonce: r.get(3)?,
             })
         },
     )
@@ -343,13 +346,15 @@ pub fn get_segment_parts(
     segment_key: &str,
 ) -> Result<Vec<SegmentPartLookup>> {
     let mut stmt = conn.prepare(
-        "SELECT file_id, bot_index, file_size FROM segment_parts WHERE job_id = ?1 AND segment_key = ?2 ORDER BY part_index ASC",
+        "SELECT file_id, bot_index, file_size, part_index, encryption_nonce FROM segment_parts WHERE job_id = ?1 AND segment_key = ?2 ORDER BY part_index ASC",
     )?;
     let rows = stmt.query_map(params![job_id, segment_key], |r| {
         Ok(SegmentPartLookup {
             file_id: r.get(0)?,
             bot_index: r.get(1)?,
             file_size: r.get(2)?,
+            part_index: r.get(3)?,
+            encryption_nonce: r.get(4)?,
         })
     })?;
     rows.map(|r| r.map_err(Into::into)).collect()
@@ -360,12 +365,11 @@ pub fn get_segments_for_prefix(
     job_id: &str,
     prefix: &str,
 ) -> Result<Vec<SegmentRow>> {
-    let like = format!("{prefix}/%");
     let mut stmt = conn.prepare(
         &(SEGMENT_SELECT_SQL.to_owned()
-            + " WHERE job_id = ?1 AND segment_key LIKE ?2 ORDER BY segment_key ASC"),
+            + " WHERE job_id = ?1 AND prefix = ?2 ORDER BY segment_key ASC"),
     )?;
-    let rows = stmt.query_map(params![job_id, like], segment_from_row)?;
+    let rows = stmt.query_map(params![job_id, prefix], segment_from_row)?;
     rows.map(|r| r.map_err(Into::into)).collect()
 }
 
@@ -803,10 +807,11 @@ pub fn update_segment_file_id(
     segment_key: &str,
     new_file_id: &str,
     new_bot_index: i64,
+    encryption_nonce: Option<&str>,
 ) -> Result<bool> {
     Ok(conn.execute(
-        "UPDATE segments SET file_id = ?1, bot_index = ?2 WHERE job_id = ?3 AND segment_key = ?4",
-        params![new_file_id, new_bot_index, job_id, segment_key],
+        "UPDATE segments SET file_id = ?1, bot_index = ?2, encryption_nonce = ?3 WHERE job_id = ?4 AND segment_key = ?5",
+        params![new_file_id, new_bot_index, encryption_nonce, job_id, segment_key],
     )? > 0)
 }
 
@@ -817,10 +822,11 @@ pub fn update_segment_part_file_id(
     part_index: i64,
     new_file_id: &str,
     new_bot_index: i64,
+    encryption_nonce: Option<&str>,
 ) -> Result<bool> {
     Ok(conn.execute(
-        "UPDATE segment_parts SET file_id = ?1, bot_index = ?2 WHERE job_id = ?3 AND segment_key = ?4 AND part_index = ?5",
-        params![new_file_id, new_bot_index, job_id, segment_key, part_index],
+        "UPDATE segment_parts SET file_id = ?1, bot_index = ?2, encryption_nonce = ?3 WHERE job_id = ?4 AND segment_key = ?5 AND part_index = ?6",
+        params![new_file_id, new_bot_index, encryption_nonce, job_id, segment_key, part_index],
     )? > 0)
 }
 
@@ -858,17 +864,26 @@ pub fn record_db_sync_upload(
     part_index: i64,
     file_id: &str,
     file_size: u64,
+    encryption_nonce: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO db_sync_uploads(snapshot_id, bot_index, part_index, file_id, file_size, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'complete')
+        "INSERT INTO db_sync_uploads(snapshot_id, bot_index, part_index, file_id, file_size, encryption_nonce, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'complete')
          ON CONFLICT(snapshot_id, bot_index, part_index) DO UPDATE SET
             file_id=excluded.file_id,
             file_size=excluded.file_size,
+            encryption_nonce=excluded.encryption_nonce,
             uploaded_at=CURRENT_TIMESTAMP,
             status='complete',
             error=NULL",
-        params![snapshot_id, bot_index, part_index, file_id, file_size as i64],
+        params![
+            snapshot_id,
+            bot_index,
+            part_index,
+            file_id,
+            file_size as i64,
+            encryption_nonce
+        ],
     )?;
     Ok(())
 }

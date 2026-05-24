@@ -57,7 +57,7 @@ pub fn select_video_tiers_with(
         copy: copy_tier0,
     }];
     // Virtual ABR disables eager tiers; honor that even with an override.
-    if !cfg.virtual_abr_tiers {
+    if cfg.abr_enabled && !cfg.virtual_abr_tiers {
         for (height, bitrate) in parse_tiers(tiers_raw) {
             let include = if copy_tier0 {
                 height < source_height

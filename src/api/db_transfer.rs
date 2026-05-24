@@ -23,6 +23,9 @@ struct ExportRequest {
 struct ImportJsonRequest {
     file_id: Option<String>,
     bot_index: Option<i64>,
+    encryption_nonce: Option<String>,
+    snapshot_id: Option<String>,
+    part_index: Option<i64>,
 }
 
 struct DbSnapshot {
@@ -192,6 +195,24 @@ pub(super) async fn handle_db_import(
                     e.to_string(),
                 )
             }
+        };
+        let downloaded_bytes = match req.encryption_nonce.as_deref() {
+            Some(nonce) => {
+                let snapshot_id = req.snapshot_id.as_deref().unwrap_or("manual");
+                let aad = crate::crypto::db_sync_aad(snapshot_id, req.part_index.unwrap_or(0));
+                match crate::crypto::decrypt_optional(
+                    cfg.telegram_encryption_key.as_ref(),
+                    Some(nonce),
+                    &aad,
+                    downloaded_bytes,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return api_error(StatusCode::BAD_REQUEST, "decrypt_failed", e.to_string())
+                    }
+                }
+            }
+            None => downloaded_bytes,
         };
         let source = stage_import_database(&state, downloaded_bytes).await;
         match source {
@@ -407,7 +428,7 @@ pub(crate) async fn bootstrap_db_sync_if_configured(state: Arc<AppState>) {
         tracing::warn!("DB_SYNC_BOOTSTRAP has no uploads array");
         return;
     };
-    let mut by_bot: BTreeMap<i64, Vec<(i64, String)>> = BTreeMap::new();
+    let mut by_bot: BTreeMap<i64, Vec<BootstrapPart>> = BTreeMap::new();
     for upload in upload_values {
         let Some(bot_index) = upload.get("bot_index").and_then(serde_json::Value::as_i64) else {
             continue;
@@ -423,14 +444,20 @@ pub(crate) async fn bootstrap_db_sync_if_configured(state: Arc<AppState>) {
         else {
             continue;
         };
-        by_bot
-            .entry(bot_index)
-            .or_default()
-            .push((part_index, file_id.to_string()));
+        let encryption_nonce = upload
+            .get("encryption_nonce")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        by_bot.entry(bot_index).or_default().push(BootstrapPart {
+            part_index,
+            file_id: file_id.to_string(),
+            encryption_nonce,
+        });
     }
     for (bot_index, mut parts) in by_bot {
-        parts.sort_by_key(|(part_index, _)| *part_index);
-        match download_bootstrap_parts(&state, &cfg, bot_index, &parts).await {
+        parts.sort_by_key(|part| part.part_index);
+        match download_bootstrap_parts(&state, &cfg, snapshot_id, bot_index, &parts).await {
             Ok(bytes) => match stage_import_database(&state, bytes).await {
                 Ok(path) => {
                     let response = merge_database_path(&state, path.clone()).await;
@@ -459,23 +486,38 @@ pub(crate) async fn bootstrap_db_sync_if_configured(state: Arc<AppState>) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BootstrapPart {
+    part_index: i64,
+    file_id: String,
+    encryption_nonce: Option<String>,
+}
+
 async fn download_bootstrap_parts(
     state: &AppState,
     cfg: &Config,
+    snapshot_id: &str,
     bot_index: i64,
-    parts: &[(i64, String)],
+    parts: &[BootstrapPart],
 ) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
-    for (_, file_id) in parts {
+    for part in parts {
         let bytes = telegram::get_file_bytes(
             &state.http,
             &state.telegram,
             &state.telegram_base_url,
             &cfg.bots,
-            file_id,
+            &part.file_id,
             bot_index,
         )
         .await?;
+        let aad = crate::crypto::db_sync_aad(snapshot_id, part.part_index);
+        let bytes = crate::crypto::decrypt_optional(
+            cfg.telegram_encryption_key.as_ref(),
+            part.encryption_nonce.as_deref(),
+            &aad,
+            bytes,
+        )?;
         out.extend_from_slice(&bytes);
     }
     Ok(out)
@@ -528,15 +570,16 @@ async fn upload_snapshot_to_all_bots(
 
     let mut uploads = Vec::new();
     let mut failed_bots = Vec::new();
-    let upload_paths = snapshot_upload_paths(&snapshot, cfg.telegram_max_file_size).await?;
+    let upload_paths = snapshot_upload_paths(
+        &snapshot,
+        cfg.telegram_max_file_size,
+        cfg.telegram_encryption_key.is_some(),
+    )
+    .await?;
 
     for (bot_index, bot) in cfg.bots.iter().cloned().enumerate() {
         for (part_index, path) in upload_paths.iter().enumerate() {
-            let name = if upload_paths.len() == 1 {
-                snapshot.filename.clone()
-            } else {
-                format!("{}.part{:03}", snapshot.filename, part_index)
-            };
+            let logical_key = crate::crypto::db_sync_aad(&snapshot.id, part_index as i64);
             let uploaded = telegram::upload_document(
                 &state.http,
                 &state.telegram,
@@ -544,7 +587,8 @@ async fn upload_snapshot_to_all_bots(
                 bot.clone(),
                 bot_index as i64,
                 path,
-                format!("db-sync/{name}"),
+                logical_key,
+                cfg.telegram_encryption_key.as_ref(),
                 cfg.telegram_max_file_size,
             )
             .await;
@@ -558,12 +602,14 @@ async fn upload_snapshot_to_all_bots(
                         part_index as i64,
                         &uploaded.file_id,
                         uploaded.file_size,
+                        uploaded.encryption_nonce.as_deref(),
                     )?;
                     uploads.push(json!({
                         "bot_index": bot_index,
                         "part_index": part_index,
                         "file_id": uploaded.file_id,
                         "size": uploaded.file_size,
+                        "encryption_nonce": uploaded.encryption_nonce,
                     }));
                 }
                 Err(e) => {
@@ -631,15 +677,17 @@ async fn upload_snapshot_to_all_bots(
 async fn snapshot_upload_paths(
     snapshot: &DbSnapshot,
     max_size: u64,
+    encrypted: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     if max_size == 0 {
         anyhow::bail!("telegram_max_file_size must be greater than zero");
     }
-    if snapshot.size_bytes <= max_size {
+    let max_plaintext_size = crate::crypto::max_plaintext_size(max_size, encrypted)?;
+    if snapshot.size_bytes <= max_plaintext_size {
         return Ok(vec![snapshot.path.clone()]);
     }
     let bytes = tokio::fs::read(&snapshot.path).await?;
-    let chunk_size = max_size as usize;
+    let chunk_size = max_plaintext_size as usize;
     let mut paths = Vec::new();
     for (i, chunk) in bytes.chunks(chunk_size).enumerate() {
         let path = snapshot.path.with_extension(format!("db.part{i:03}"));
