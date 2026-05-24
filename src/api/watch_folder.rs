@@ -356,6 +356,21 @@ async fn claim_and_enqueue(
     let rename_target = target.clone();
     let source_clone = source.clone();
     tokio::task::spawn_blocking(move || std::fs::rename(&source_clone, &rename_target)).await??;
+
+    // Skip if an active job already exists for this file (prevents re-enqueue after restart)
+    {
+        let conn = state.db_conn().await?;
+        let filename_check = filename.clone();
+        let exists = tokio::task::spawn_blocking(move || {
+            crate::db::job_exists_active_by_filename(&conn, &filename_check)
+        })
+        .await??;
+        if exists {
+            tracing::info!(filename = %filename, "watch folder file already has an active job; skipping");
+            return Ok(());
+        }
+    }
+
     let enqueue_result = enqueue_job(
         state,
         filename.clone(),
@@ -474,6 +489,7 @@ mod tests {
             selected_encoder: RwLock::new(crate::media::cpu_encoder()),
             last_bot_index: std::sync::atomic::AtomicI64::new(0),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            ingest_download_semaphore: Arc::new(tokio::sync::Semaphore::new(5)),
         })
     }
 

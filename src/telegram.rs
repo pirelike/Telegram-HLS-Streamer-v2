@@ -15,6 +15,14 @@ use crate::config::BotConfig;
 
 pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 const MAX_ATTEMPTS: usize = 3;
+const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
+
+fn jittered_backoff(attempt: usize) -> Duration {
+    let base = 2_u64.pow(attempt as u32);
+    let half = base.saturating_sub(1) / 2;
+    let jitter = rand::random::<u64>() % (half.saturating_add(1));
+    Duration::from_secs(base.saturating_add(jitter))
+}
 
 #[derive(Debug, Clone)]
 pub struct UploadedFile {
@@ -88,6 +96,31 @@ impl TelegramRuntime {
             .or_default()
             .download_errors += 1;
     }
+
+    pub(crate) async fn record_consecutive_failure(&self, bot_index: i64) {
+        let mut metrics = self.metrics.lock().await;
+        metrics
+            .per_bot
+            .entry(bot_index)
+            .or_default()
+            .consecutive_failures += 1;
+    }
+
+    pub(crate) async fn reset_consecutive_failures(&self, bot_index: i64) {
+        let mut metrics = self.metrics.lock().await;
+        if let Some(bot) = metrics.per_bot.get_mut(&bot_index) {
+            bot.consecutive_failures = 0;
+        }
+    }
+
+    pub async fn is_bot_healthy(&self, bot_index: i64) -> bool {
+        let metrics = self.metrics.lock().await;
+        metrics
+            .per_bot
+            .get(&bot_index)
+            .map(|b| b.consecutive_failures < CONSECUTIVE_FAILURE_THRESHOLD)
+            .unwrap_or(true) // unknown bot = healthy
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -109,6 +142,7 @@ pub struct PerBotMetrics {
     pub download_count: u64,
     pub download_bytes: u64,
     pub download_errors: u64,
+    pub consecutive_failures: u32,
 }
 
 pub async fn probe_bot(
@@ -206,6 +240,7 @@ pub async fn upload_document(
             Ok((file_id, remote_size)) => {
                 if remote_size != file_size {
                     runtime.record_upload_error(bot_index).await;
+                    runtime.record_consecutive_failure(bot_index).await;
                     bail!(
                         "upload_integrity_mismatch: {} local={} telegram={}",
                         segment_key,
@@ -216,6 +251,7 @@ pub async fn upload_document(
                 runtime
                     .record_upload_success(bot_index, file_size, started.elapsed().as_secs_f64())
                     .await;
+                runtime.reset_consecutive_failures(bot_index).await;
                 tracing::info!(
                     segment_key = %segment_key,
                     bot_index,
@@ -232,6 +268,7 @@ pub async fn upload_document(
             }
             Err(TelegramError::Permanent(e)) => {
                 runtime.record_upload_error(bot_index).await;
+                runtime.record_consecutive_failure(bot_index).await;
                 tracing::warn!(
                     segment_key = %segment_key,
                     bot_index,
@@ -261,11 +298,12 @@ pub async fn upload_document(
                     "Telegram upload attempt failed; retrying"
                 );
                 drop(guard);
-                sleep(Duration::from_secs(2_u64.pow(attempt as u32))).await;
+                sleep(jittered_backoff(attempt)).await;
                 guard = lock.lock().await;
             }
             Err(e) => {
                 runtime.record_upload_error(bot_index).await;
+                runtime.record_consecutive_failure(bot_index).await;
                 let err = e.into_anyhow();
                 tracing::warn!(
                     segment_key = %segment_key,
@@ -306,13 +344,17 @@ pub async fn get_file_bytes(
                         started.elapsed().as_secs_f64(),
                     )
                     .await;
+                runtime.reset_consecutive_failures(bot_index).await;
                 return Ok(bytes);
             }
             Err(TelegramError::Permanent(e)) => {
                 runtime.record_download_error(bot_index).await;
+                runtime.record_consecutive_failure(bot_index).await;
                 return Err(e);
             }
-            Err(TelegramError::RetryAfter(wait)) if attempt + 1 < MAX_ATTEMPTS => sleep(wait).await,
+            Err(TelegramError::RetryAfter(wait)) if attempt + 1 < MAX_ATTEMPTS => {
+                sleep(wait).await;
+            }
             Err(TelegramError::Retryable(e)) if attempt + 1 < MAX_ATTEMPTS => {
                 tracing::warn!(
                     error = %e,
@@ -320,10 +362,11 @@ pub async fn get_file_bytes(
                     file_id = %file_id,
                     "Telegram download attempt failed; retrying"
                 );
-                sleep(Duration::from_secs(2_u64.pow(attempt as u32))).await;
+                sleep(jittered_backoff(attempt)).await;
             }
             Err(e) => {
                 runtime.record_download_error(bot_index).await;
+                runtime.record_consecutive_failure(bot_index).await;
                 return Err(e.into_anyhow());
             }
         }
@@ -445,11 +488,12 @@ pub async fn get_file_response(
                     return Err(anyhow!("download failed: status {}", resp.status()));
                 }
                 // Metrics are recorded by the caller after the full stream completes.
-                let _ = runtime; // metrics recorded externally for streaming path
+                runtime.reset_consecutive_failures(bot_index).await;
                 return Ok(resp);
             }
             Err(TelegramError::Permanent(e)) => {
                 runtime.record_download_error(bot_index).await;
+                runtime.record_consecutive_failure(bot_index).await;
                 return Err(e);
             }
             Err(TelegramError::RetryAfter(wait)) if attempt + 1 < MAX_ATTEMPTS => {
@@ -462,10 +506,11 @@ pub async fn get_file_response(
                     file_id = %file_id,
                     "getFile attempt failed; retrying"
                 );
-                sleep(Duration::from_secs(2_u64.pow(attempt as u32))).await;
+                sleep(jittered_backoff(attempt)).await;
             }
             Err(e) => {
                 runtime.record_download_error(bot_index).await;
+                runtime.record_consecutive_failure(bot_index).await;
                 return Err(e.into_anyhow());
             }
         }

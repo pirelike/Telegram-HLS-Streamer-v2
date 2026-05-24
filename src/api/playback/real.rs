@@ -535,6 +535,21 @@ async fn extract_recovery_segment_from_source(
     let Some(segment_path) = recovery_segment_path(key) else {
         bail!("invalid recovery segment key {key}");
     };
+    // Recovery via full source re-encode is capped to init segments only.
+    // Full re-encode for a media segment could take hours for feature-length
+    // content and consume tens of GB of disk — not practical for a single segment.
+    let file_name = segment_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !file_name.starts_with("init") {
+        tracing::info!(
+            job_id = %job_id,
+            key = %key,
+            "skipping stale file_id recovery for non-init segment"
+        );
+        return Ok(None);
+    }
     let work_dir = state.processing_dir.join(format!(
         "reupload_extract_{}",
         uuid::Uuid::new_v4().simple()

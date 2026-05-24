@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use axum::extract::State;
@@ -15,6 +16,10 @@ use tokio::io::AsyncWriteExt;
 
 use super::jobs::{enqueue_existing_job, JobMetadata, JobState, JobStatus};
 use super::{api_error, uploads, AppState};
+
+const DOWNLOAD_TIMEOUT_SECS: u64 = 3600;
+const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DOWNLOAD_READ_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct UrlIngestRequest {
@@ -45,6 +50,14 @@ pub(super) async fn handle_url_ingest(
     if let Err(e) = validate_public_url(&url).await {
         return api_error(StatusCode::BAD_REQUEST, "blocked_url", e);
     }
+    let Ok(permit) = state.ingest_download_semaphore.clone().try_acquire_owned() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ingest_busy",
+            "too many concurrent URL downloads, try again later",
+        );
+    };
+
     let cfg = state.config.read().await.clone();
     let job_id = uuid::Uuid::new_v4().simple().to_string();
     let filename = url
@@ -57,16 +70,21 @@ pub(super) async fn handle_url_ingest(
     let path = state.uploads_dir.join(&stored_name);
     insert_download_state(&state, &job_id, &filename, &path).await;
 
-    tokio::spawn(download_and_enqueue(
-        state,
-        url,
-        job_id.clone(),
-        filename,
-        stored_name,
-        path,
-        cfg.max_upload_size,
-    ));
-    Json(json!({ "job_id": job_id, "message": "downloading" })).into_response()
+    let job_id_response = job_id.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        download_and_enqueue(
+            state,
+            url,
+            job_id,
+            filename,
+            stored_name,
+            path,
+            cfg.max_upload_size,
+        )
+        .await;
+    });
+    Json(json!({ "job_id": job_id_response, "message": "downloading" })).into_response()
 }
 
 async fn download_and_enqueue(
@@ -78,219 +96,234 @@ async fn download_and_enqueue(
     path: std::path::PathBuf,
     max_upload_size: u64,
 ) {
-    for redirects in 0..=5 {
-        if redirects == 5 {
-            let _ = download_failed(
-                &state,
-                &job_id,
-                &path,
-                StatusCode::BAD_REQUEST,
-                "too_many_redirects",
-                "too many redirects",
-            )
-            .await;
-            break;
-        }
-        let addrs = match checked_addrs(&url).await {
-            Ok(addrs) => addrs,
-            Err(e) => {
+    let download_result = tokio::time::timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS), async {
+        for redirects in 0..=5 {
+            if redirects == 5 {
                 let _ = download_failed(
                     &state,
                     &job_id,
                     &path,
                     StatusCode::BAD_REQUEST,
-                    "blocked_url",
-                    e,
+                    "too_many_redirects",
+                    "too many redirects",
                 )
                 .await;
                 break;
             }
-        };
-        let client = match client_for_url(&url, &addrs) {
-            Ok(client) => client,
-            Err(e) => {
-                let _ = download_failed(
-                    &state,
-                    &job_id,
-                    &path,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "http_client_failed",
-                    e.to_string(),
-                )
-                .await;
-                break;
-            }
-        };
-        let resp = match client.get(url.clone()).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                let _ = download_failed(
-                    &state,
-                    &job_id,
-                    &path,
-                    StatusCode::BAD_GATEWAY,
-                    "download_failed",
-                    e.to_string(),
-                )
-                .await;
-                break;
-            }
-        };
-        if resp.status().is_redirection() {
-            let Some(location) = resp
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-            else {
-                let _ = download_failed(
-                    &state,
-                    &job_id,
-                    &path,
-                    StatusCode::BAD_GATEWAY,
-                    "invalid_redirect",
-                    "redirect missing location",
-                )
-                .await;
-                break;
+            let addrs = match checked_addrs(&url).await {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    let _ = download_failed(
+                        &state,
+                        &job_id,
+                        &path,
+                        StatusCode::BAD_REQUEST,
+                        "blocked_url",
+                        e,
+                    )
+                    .await;
+                    break;
+                }
             };
-            url = match url.join(location) {
-                Ok(next) => next,
+            let client = match client_for_url(&url, &addrs) {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = download_failed(
+                        &state,
+                        &job_id,
+                        &path,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "http_client_failed",
+                        e.to_string(),
+                    )
+                    .await;
+                    break;
+                }
+            };
+            let resp = match client.get(url.clone()).send().await {
+                Ok(resp) => resp,
                 Err(e) => {
                     let _ = download_failed(
                         &state,
                         &job_id,
                         &path,
                         StatusCode::BAD_GATEWAY,
-                        "invalid_redirect",
+                        "download_failed",
                         e.to_string(),
                     )
                     .await;
                     break;
                 }
             };
-            if let Err(e) = validate_public_url(&url).await {
-                let _ = download_failed(
-                    &state,
-                    &job_id,
-                    &path,
-                    StatusCode::BAD_REQUEST,
-                    "blocked_url",
-                    e,
-                )
-                .await;
-                break;
-            }
-            continue;
-        }
-        if !resp.status().is_success() {
-            let _ = download_failed(
-                &state,
-                &job_id,
-                &path,
-                StatusCode::BAD_GATEWAY,
-                "download_failed",
-                format!("remote returned {}", resp.status()),
-            )
-            .await;
-            break;
-        }
-        if let Some(len) = resp.content_length() {
-            if len > max_upload_size {
-                let _ = download_failed(
-                    &state,
-                    &job_id,
-                    &path,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "too_large",
-                    "remote file is too large",
-                )
-                .await;
-                break;
-            }
-            if let Err(e) = check_disk_space(&state, len) {
-                let _ = download_failed(&state, &job_id, &path, e.0, e.1, e.2).await;
-                break;
-            }
-        } else if let Err(e) = check_disk_space(&state, max_upload_size) {
-            // No Content-Length header; check that at least max_upload_size bytes of free space exist
-            // before starting the download.
-            let _ = download_failed(&state, &job_id, &path, e.0, e.1, e.2).await;
-            break;
-        }
-        if let Some(content_type) = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-        {
-            if clearly_non_media(content_type) {
-                let _ = download_failed(
-                    &state,
-                    &job_id,
-                    &path,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_content_type",
-                    "remote content type is not media",
-                )
-                .await;
-                break;
-            }
-        }
-        match stream_to_file(&state, &job_id, &path, resp, max_upload_size).await {
-            Ok(()) => {
-                if job_cancelled(&state, &job_id).await {
-                    break;
-                }
-                {
-                    let jobs = state.jobs.lock().await;
-                    if let Some(job) = jobs.get(&job_id) {
-                        if job.status == JobStatus::Error {
-                            break;
-                        }
-                    }
-                }
-                let metadata = JobMetadata {
-                    title: Some(filename.clone()),
-                    ..Default::default()
-                };
-                if let Err(e) = enqueue_existing_job(
-                    &state,
-                    job_id.clone(),
-                    filename,
-                    path.clone(),
-                    metadata,
-                    true,
-                    Some(stored_name),
-                    false,
-                )
-                .await
-                {
+            if resp.status().is_redirection() {
+                let Some(location) = resp
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                else {
                     let _ = download_failed(
                         &state,
                         &job_id,
                         &path,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "queue_full",
-                        e.to_string(),
+                        StatusCode::BAD_GATEWAY,
+                        "invalid_redirect",
+                        "redirect missing location",
                     )
                     .await;
-                }
-            }
-            Err(e) => {
-                if e == "cancelled" {
+                    break;
+                };
+                url = match url.join(location) {
+                    Ok(next) => next,
+                    Err(e) => {
+                        let _ = download_failed(
+                            &state,
+                            &job_id,
+                            &path,
+                            StatusCode::BAD_GATEWAY,
+                            "invalid_redirect",
+                            e.to_string(),
+                        )
+                        .await;
+                        break;
+                    }
+                };
+                if let Err(e) = validate_public_url(&url).await {
+                    let _ = download_failed(
+                        &state,
+                        &job_id,
+                        &path,
+                        StatusCode::BAD_REQUEST,
+                        "blocked_url",
+                        e,
+                    )
+                    .await;
                     break;
                 }
+                continue;
+            }
+            if !resp.status().is_success() {
                 let _ = download_failed(
                     &state,
                     &job_id,
                     &path,
                     StatusCode::BAD_GATEWAY,
                     "download_failed",
-                    e,
+                    format!("remote returned {}", resp.status()),
                 )
                 .await;
+                break;
             }
+            if let Some(len) = resp.content_length() {
+                if len > max_upload_size {
+                    let _ = download_failed(
+                        &state,
+                        &job_id,
+                        &path,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "too_large",
+                        "remote file is too large",
+                    )
+                    .await;
+                    break;
+                }
+                if let Err(e) = check_disk_space(&state, len) {
+                    let _ = download_failed(&state, &job_id, &path, e.0, e.1, e.2).await;
+                    break;
+                }
+            } else if let Err(e) = check_disk_space(&state, max_upload_size) {
+                // No Content-Length header; check that at least max_upload_size bytes of free space exist
+                // before starting the download.
+                let _ = download_failed(&state, &job_id, &path, e.0, e.1, e.2).await;
+                break;
+            }
+            if let Some(content_type) = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+            {
+                if clearly_non_media(content_type) {
+                    let _ = download_failed(
+                        &state,
+                        &job_id,
+                        &path,
+                        StatusCode::BAD_REQUEST,
+                        "invalid_content_type",
+                        "remote content type is not media",
+                    )
+                    .await;
+                    break;
+                }
+            }
+            match stream_to_file(&state, &job_id, &path, resp, max_upload_size).await {
+                Ok(()) => {
+                    if job_cancelled(&state, &job_id).await {
+                        break;
+                    }
+                    {
+                        let jobs = state.jobs.lock().await;
+                        if let Some(job) = jobs.get(&job_id) {
+                            if job.status == JobStatus::Error {
+                                break;
+                            }
+                        }
+                    }
+                    let metadata = JobMetadata {
+                        title: Some(filename.clone()),
+                        ..Default::default()
+                    };
+                    if let Err(e) = enqueue_existing_job(
+                        &state,
+                        job_id.clone(),
+                        filename,
+                        path.clone(),
+                        metadata,
+                        true,
+                        Some(stored_name),
+                        false,
+                    )
+                    .await
+                    {
+                        let _ = download_failed(
+                            &state,
+                            &job_id,
+                            &path,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "queue_full",
+                            e.to_string(),
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    if e == "cancelled" {
+                        break;
+                    }
+                    let _ = download_failed(
+                        &state,
+                        &job_id,
+                        &path,
+                        StatusCode::BAD_GATEWAY,
+                        "download_failed",
+                        e,
+                    )
+                    .await;
+                }
+            }
+            break;
         }
-        break;
+    })
+    .await;
+
+    if download_result.is_err() {
+        let _ = download_failed(
+            &state,
+            &job_id,
+            &path,
+            StatusCode::GATEWAY_TIMEOUT,
+            "download_timed_out",
+            "download timed out",
+        )
+        .await;
     }
 }
 
@@ -438,6 +471,8 @@ async fn validate_public_url(url: &Url) -> Result<(), String> {
 fn client_for_url(url: &Url, addrs: &[SocketAddr]) -> Result<Client, reqwest::Error> {
     let host = url.host_str().unwrap_or_default();
     Client::builder()
+        .connect_timeout(Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(DOWNLOAD_READ_TIMEOUT_SECS))
         .redirect(Policy::none())
         .resolve_to_addrs(host, addrs)
         .build()

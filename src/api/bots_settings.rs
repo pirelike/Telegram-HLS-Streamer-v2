@@ -58,15 +58,15 @@ pub(super) async fn handle_post_settings(
             Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_setting", e),
         }
     }
-    let mut new_cfg = {
-        let guard = state.config.write().await;
-        guard.as_ref().clone()
-    };
-    if normalized
-        .get("TMDB_API_KEY")
-        .is_some_and(|value| new_cfg.is_unchanged_masked_tmdb_api_key(value))
+    // Check masked TMDB key against current config (read-lock only)
     {
-        normalized.remove("TMDB_API_KEY");
+        let guard = state.config.read().await;
+        if normalized
+            .get("TMDB_API_KEY")
+            .is_some_and(|value| guard.is_unchanged_masked_tmdb_api_key(value))
+        {
+            normalized.remove("TMDB_API_KEY");
+        }
     }
 
     {
@@ -94,7 +94,31 @@ pub(super) async fn handle_post_settings(
             format!("settings applied to database but not persisted to .env: {e}. Changes will be lost on restart."),
         );
     }
-    config::apply_normalized_settings(&mut new_cfg, &normalized);
+    // Reload config from DB (canonical source — eliminates TOCTOU)
+    let new_cfg = {
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
+        match tokio::task::spawn_blocking(move || Config::load(&conn)).await {
+            Ok(Ok(cfg)) => cfg,
+            Ok(Err(e)) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "config_reload_failed",
+                    e.to_string(),
+                );
+            }
+            Err(e) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "config_reload_failed",
+                    e.to_string(),
+                );
+            }
+        }
+    };
+
     let response = settings_response(&new_cfg);
     store_config(&state, new_cfg, updates_encoder_settings(&normalized)).await;
     if matches!(

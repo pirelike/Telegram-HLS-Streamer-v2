@@ -586,18 +586,14 @@ async fn check_upload_rate_limit(state: &AppState, ip: std::net::IpAddr) -> Opti
     {
         requests.pop_front();
     }
-    if requests.is_empty() {
-        limits.remove(&ip);
-        return None;
-    }
-    if requests.len() >= max {
+    requests.push_back(now);
+    if requests.len() > max {
         return Some(api_error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
             "upload rate limit exceeded",
         ));
     }
-    requests.push_back(now);
     None
 }
 
@@ -635,4 +631,36 @@ pub(crate) fn free_space_bytes(path: &FsPath) -> std::io::Result<u64> {
 #[cfg(not(unix))]
 pub(crate) fn free_space_bytes(_path: &FsPath) -> std::io::Result<u64> {
     Ok(u64::MAX)
+}
+
+pub(crate) async fn cleanup_orphaned_uploads(uploads_dir: &std::path::Path) {
+    let mut dir = match tokio::fs::read_dir(uploads_dir).await {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!(dir = %uploads_dir.display(), error = %e, "cannot read uploads directory for orphan cleanup");
+            return;
+        }
+    };
+    let mut cleaned = 0u64;
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type().await else {
+            continue;
+        };
+        if ft.is_dir() {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "cleaned orphaned upload file");
+                cleaned += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to clean orphaned upload file");
+            }
+        }
+    }
+    if cleaned > 0 {
+        tracing::info!(count = cleaned, dir = %uploads_dir.display(), "cleaned orphaned upload files");
+    }
 }
