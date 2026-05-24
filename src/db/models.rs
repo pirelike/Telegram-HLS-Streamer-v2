@@ -24,6 +24,7 @@ pub struct JobRow {
     pub part_number: Option<i64>,
     pub error: Option<String>,
     pub source_path: Option<String>,
+    pub episode_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -222,6 +223,7 @@ impl Default for JobListFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SeriesGroupRow {
     pub series_name: String,
+    pub media_type: String,
     pub episode_count: i64,
     pub last_updated: String,
     pub job_id: String,
@@ -309,7 +311,7 @@ pub struct DbSyncSnapshotRow {
 
 // --- SQL constants ---
 
-pub(super) const JOB_SELECT_SQL: &str = "SELECT job_id, filename, duration, file_size, video_codec, video_width, video_height, status, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number, error, source_path FROM jobs";
+pub(super) const JOB_SELECT_SQL: &str = "SELECT job_id, filename, duration, file_size, video_codec, video_width, video_height, status, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number, error, source_path, episode_title FROM jobs";
 pub(super) const TRACK_SELECT_SQL: &str = "SELECT id, job_id, track_type, track_index, codec, language, title, channels, width, height, bitrate, original_stream_index FROM tracks";
 pub(super) const SEGMENT_SELECT_SQL: &str =
     "SELECT id, job_id, segment_key, file_id, bot_index, file_size, duration, is_split FROM segments";
@@ -338,6 +340,7 @@ pub(super) fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> 
         part_number: row.get(15)?,
         error: row.get(16)?,
         source_path: row.get(17)?,
+        episode_title: row.get(18)?,
     })
 }
 
@@ -468,10 +471,13 @@ pub(super) fn media_fingerprint_from_row(
         media_type: row.get(1)?,
         series_name: row.get(2)?,
         season_number: row.get(3)?,
-        duration_seconds: row.get(4)?,
-        fingerprint: row.get(5)?,
-        fingerprint_source: row.get(6)?,
-        created_at: row.get(7)?,
+        window_type: row.get(4)?,
+        window_start_seconds: row.get(5)?,
+        window_duration_seconds: row.get(6)?,
+        duration_seconds: row.get(7)?,
+        fingerprint: row.get(8)?,
+        fingerprint_source: row.get(9)?,
+        created_at: row.get(10)?,
     })
 }
 
@@ -579,6 +585,12 @@ pub struct MediaFingerprintRow {
     pub media_type: String,
     pub series_name: String,
     pub season_number: Option<i64>,
+    #[serde(default = "default_intro_window_type")]
+    pub window_type: String,
+    #[serde(default)]
+    pub window_start_seconds: f64,
+    #[serde(default)]
+    pub window_duration_seconds: f64,
     pub duration_seconds: f64,
     pub fingerprint: String,
     pub fingerprint_source: String,
@@ -591,9 +603,16 @@ pub struct NewMediaFingerprint {
     pub media_type: String,
     pub series_name: String,
     pub season_number: Option<i64>,
+    pub window_type: String,
+    pub window_start_seconds: f64,
+    pub window_duration_seconds: f64,
     pub duration_seconds: f64,
     pub fingerprint: String,
     pub fingerprint_source: String,
+}
+
+fn default_intro_window_type() -> String {
+    "intro".into()
 }
 
 // --- Helpers used across sub-modules ---

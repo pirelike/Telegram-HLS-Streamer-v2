@@ -246,22 +246,22 @@ async function initPlayer(job, overrideBufferConfig = null) {
         currentMarkers = await loadMarkers(job.job_id);
 
         // Resume from saved progress + persist while playing.
-        let saved = (await serverLoadProgress(job.job_id)) || loadProgressMap()[job.job_id];
+        const saved = (await serverLoadProgress(job.job_id)) || loadProgressMap()[job.job_id];
+        const resumeSeconds = (() => {
+            const seconds = Number(saved?.position_seconds ?? saved?.seconds ?? 0);
+            const knownDuration = Number(job.duration || 0);
+            if (!Number.isFinite(seconds) || seconds <= 5) return 0;
+            if (knownDuration > 0 && knownDuration <= seconds + 5) return 0;
+            return seconds;
+        })();
         let lastSave = 0;
         let serverLastSave = 0;
-        videoEl.addEventListener('loadedmetadata', () => {
-            if (saved && saved.position_seconds && videoEl.duration > saved.position_seconds + 5) {
-                videoEl.currentTime = saved.position_seconds;
-            } else if (saved && saved.seconds && videoEl.duration > saved.seconds + 5) {
-                videoEl.currentTime = saved.seconds;
-            }
-        }, { once: true });
         videoEl.addEventListener('timeupdate', () => {
             const now = Date.now();
+            updateSkipButton();
             if (now - lastSave < 5000) return;
             lastSave = now;
             saveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
-            updateSkipButton();
         });
         videoEl.addEventListener('timeupdate', () => {
             const now = Date.now();
@@ -280,7 +280,15 @@ async function initPlayer(job, overrideBufferConfig = null) {
             serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
         });
 
-        try { await player.load(m3u8Url); }
+        try {
+            await player.load(m3u8Url, resumeSeconds || undefined);
+            const duration = Number(videoEl.duration || job.duration || 0);
+            if (resumeSeconds > 0
+                && (!duration || duration > resumeSeconds + 5)
+                && Math.abs((videoEl.currentTime || 0) - resumeSeconds) > 2) {
+                videoEl.currentTime = resumeSeconds;
+            }
+        }
         catch (e) {
             console.error('Shaka load error', e);
             document.getElementById('playerInfo').insertAdjacentHTML('afterbegin',
@@ -299,8 +307,24 @@ function renderInfoPanel(job) {
     const m3u8Url    = `${window.location.origin}/hls/${job.job_id}/master.m3u8`;
     const safeId     = escapeAttr(job.job_id);
 
+    const ext = job.external_metadata || {};
+    const displayTitle = (ext.title && ext.title !== job.filename)
+        ? escapeHtml(ext.title)
+        : escapeHtml(cleanTitle(job.filename || job.job_id));
+
+    // Backdrop: use external backdrop behind the page hero area
+    const backdropUrl = ext.backdrop_url || ext.poster_url || '';
+    const heroEl = document.getElementById('watchMetaGrid');
+    if (heroEl && backdropUrl) {
+        heroEl.style.backgroundImage = `url('${escapeAttr(backdropUrl)}')`;
+        heroEl.style.backgroundSize = 'cover';
+        heroEl.style.backgroundPosition = 'center top';
+        heroEl.classList.add('has-backdrop');
+    }
+
     const eyebrowParts = [
         job.media_type ? escapeHtml(job.media_type) : null,
+        ext.year ? String(ext.year) : null,
         job.video_height ? `${job.video_height}p` : null,
         subCount > 0 ? `SUB · ${subCount}` : null,
         audioCount > 1 ? `AUDIO · ${audioCount}` : null,
@@ -313,6 +337,7 @@ function renderInfoPanel(job) {
     if (job.duration > 0) metaParts.push(formatDuration(job.duration));
     if (job.video_height) metaParts.push(`${job.video_height}p`);
     if (job.video_codec) metaParts.push(escapeHtml(job.video_codec));
+    if (ext.rating) metaParts.push(`★ ${ext.rating.toFixed(1)}`);
     if (job.series_name && job.is_series) {
         if (job.season_number != null && job.episode_number != null) {
             metaParts.push(`S${String(job.season_number).padStart(2,'0')}E${String(job.episode_number).padStart(2,'0')}`);
@@ -323,6 +348,10 @@ function renderInfoPanel(job) {
     const metaHtml = metaParts.map((p, i) =>
         (i > 0 ? '<span class="dot"></span>' : '') + `<span>${escapeHtml(p)}</span>`
     ).join('');
+
+    const overviewHtml = ext.overview
+        ? `<p class="desc">${escapeHtml(ext.overview)}</p>`
+        : (job.series_name ? `<p class="desc" style="opacity:.7">From ${escapeHtml(job.series_name)}.</p>` : '');
 
     // Saved progress → resume label
     const progressMap = (window.THLSProgress?.load && window.THLSProgress.load()) || {};
@@ -335,9 +364,9 @@ function renderInfoPanel(job) {
 
     main.innerHTML = `
         <div class="eyebrow">${eyebrowHtml}</div>
-        <h1>${escapeHtml(cleanTitle(job.filename || job.job_id))}</h1>
+        <h1>${displayTitle}</h1>
         ${metaHtml ? `<div class="meta-row">${metaHtml}</div>` : ''}
-        ${job.series_name ? `<p class="desc" style="opacity:.7">From ${escapeHtml(job.series_name)}.</p>` : ''}
+        ${overviewHtml}
         <div class="t-watch-actions">
             <button class="t-btn t-btn--primary" onclick="document.getElementById('videoEl').play()">
                 ${resumeIcon} ${resumeLabel}
@@ -535,6 +564,85 @@ async function deleteJob(jobId) {
 
 function closeEditModal() {
     document.getElementById('editModal').classList.remove('active');
+    document.getElementById('metaSearchResults').style.display = 'none';
+    document.getElementById('metaSearchResults').innerHTML = '';
+    document.getElementById('metaSearchQuery').value = '';
+    document.getElementById('metaLinkedInfo').textContent = '';
+}
+
+function parseDirectMetaId(q, selectedProvider) {
+    let m = q.match(/anilist\.co\/(anime|manga|manhwa|novel)\/(\d+)/i);
+    if (m) return { provider: 'anilist', id: m[2], kind: m[1].toLowerCase() };
+    m = q.match(/themoviedb\.org\/(movie|tv)\/(\d+)/i);
+    if (m) return { provider: 'tmdb', id: m[2], kind: m[1].toLowerCase() };
+    if (selectedProvider === 'anilist' && /^\d+$/.test(q)) return { provider: 'anilist', id: q, kind: 'anime' };
+    return null;
+}
+
+async function searchExternalMetadata() {
+    const jobId = document.getElementById('editJobId').value;
+    const provider = document.getElementById('metaProvider').value;
+    const q = document.getElementById('metaSearchQuery').value.trim();
+    if (!q) return;
+
+    const direct = parseDirectMetaId(q, provider);
+    if (direct) {
+        await linkMetadata(jobId, direct.provider, direct.id, direct.kind);
+        return;
+    }
+
+    const btn = document.getElementById('metaSearchBtn');
+    btn.disabled = true;
+    btn.textContent = '…';
+    const resultsEl = document.getElementById('metaSearchResults');
+    try {
+        const resp = await fetch(`/api/metadata/search?provider=${encodeURIComponent(provider)}&q=${encodeURIComponent(q)}`);
+        const data = await resp.json();
+        const items = data.results || [];
+        if (!items.length) {
+            resultsEl.innerHTML = '<div style="padding:8px;color:var(--t-ink-3);font-size:13px;">No results.</div>';
+        } else {
+            resultsEl.innerHTML = items.map(r => {
+                const title = escapeHtml(r.title || r.original_title || '');
+                const year  = r.year ? ` (${r.year})` : '';
+                const kind  = r.media_kind ? ` · ${escapeHtml(r.media_kind)}` : '';
+                const poster = r.poster_url ? `<img src="${escapeAttr(r.poster_url)}" style="width:32px;height:48px;object-fit:cover;border-radius:3px;flex-shrink:0;" loading="lazy">` : '<div style="width:32px;height:48px;background:var(--t-surface);border-radius:3px;flex-shrink:0;"></div>';
+                return `<div style="display:flex;gap:10px;align-items:center;padding:8px 4px;border-bottom:1px solid var(--t-border);cursor:pointer;" onclick="linkMetadata('${escapeAttr(jobId)}','${escapeAttr(r.provider)}','${escapeAttr(r.provider_id)}','${escapeAttr(r.media_kind)}')">
+                    ${poster}
+                    <div style="min-width:0;">
+                        <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${title}${escapeHtml(year)}</div>
+                        <div style="font-size:11px;color:var(--t-ink-3);">${escapeHtml(r.provider.toUpperCase())}${escapeHtml(kind)}</div>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+        resultsEl.style.display = 'block';
+    } catch (e) {
+        resultsEl.innerHTML = '<div style="padding:8px;color:#ff6b6b;font-size:13px;">Search failed.</div>';
+        resultsEl.style.display = 'block';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Search';
+    }
+}
+
+async function linkMetadata(jobId, provider, providerId, mediaKind) {
+    const infoEl = document.getElementById('metaLinkedInfo');
+    infoEl.textContent = 'Linking…';
+    try {
+        const resp = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/metadata/link`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider, provider_id: providerId, media_kind: mediaKind }),
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+        infoEl.style.color = 'var(--t-accent)';
+        infoEl.textContent = '✓ Metadata linked. Reload page to see changes.';
+        document.getElementById('metaSearchResults').style.display = 'none';
+    } catch (e) {
+        infoEl.style.color = '#ff6b6b';
+        infoEl.textContent = `Failed: ${e.message}`;
+    }
 }
 
 function updateEditModalFields() {
@@ -674,6 +782,7 @@ async function saveEditModal() {
 // ─── Anime Community embed ────────────────────────────────────────────────────
 let _tacScriptLoaded = false;
 function renderAnimeCommunityComments(job) {
+    if (job.feature_flags && job.feature_flags.tac_comments_enabled === false) return;
     const isAnime = job.media_type === 'Anime TV' || job.media_type === 'Anime Film';
     if (!isAnime) return;
     const container = document.getElementById('animeCommunityComments');
@@ -721,4 +830,3 @@ window.addEventListener('message', function(event) {
         }
     }
 });
-

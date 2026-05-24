@@ -16,7 +16,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
-pub const LATEST_SCHEMA_REVISION: i64 = 23;
+pub const LATEST_SCHEMA_REVISION: i64 = 25;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 pub type DbConn = r2d2::PooledConnection<SqliteConnectionManager>;
@@ -203,6 +203,23 @@ mod tests {
         assert_eq!(busy_timeout, 5000);
         assert_eq!(temp_store, 2);
         assert_eq!(cache_size, -64000);
+    }
+
+    fn test_metadata(provider_id: &str, title: &str) -> NewExternalMetadata {
+        NewExternalMetadata {
+            provider: "tmdb".into(),
+            provider_id: provider_id.into(),
+            media_kind: "movie".into(),
+            title: title.into(),
+            original_title: title.into(),
+            overview: String::new(),
+            poster_url: String::new(),
+            backdrop_url: String::new(),
+            release_date: String::new(),
+            year: None,
+            rating: None,
+            raw_json: "{}".into(),
+        }
     }
 
     #[test]
@@ -527,6 +544,189 @@ mod tests {
                 .bot_index,
             0
         );
+    }
+
+    #[test]
+    fn save_external_metadata_returns_existing_id_on_upsert() {
+        let path = temp_db_path("metadata_upsert.db");
+        let conn = init_db(&path).unwrap();
+
+        let first = test_metadata("1", "Original");
+        let first_id = save_external_metadata(&conn, &first).unwrap();
+        let second_id = save_external_metadata(&conn, &test_metadata("2", "Other")).unwrap();
+        assert_ne!(first_id, second_id);
+
+        let mut updated = first;
+        updated.title = "Updated".into();
+        let returned_id = save_external_metadata(&conn, &updated).unwrap();
+        assert_eq!(returned_id, first_id);
+        assert_eq!(
+            get_external_metadata_by_id(&conn, first_id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "Updated"
+        );
+    }
+
+    #[test]
+    fn merge_from_export_remaps_metadata_and_preserves_marker_collisions() {
+        let source_path = temp_db_path("metadata_merge_source.db");
+        let mut source = init_db(&source_path).unwrap();
+        let mut source_job = NewJob::complete("source-job", "episode.mkv");
+        source_job.media_type = "Series".into();
+        source_job.series_name = "Shared Show".into();
+        source_job.is_series = true;
+        source_job.season_number = Some(1);
+        source_job.episode_number = Some(1);
+        save_job(&mut source, &source_job, &[], &[], &[]).unwrap();
+        let source_meta_id =
+            save_external_metadata(&source, &test_metadata("source", "Source")).unwrap();
+        link_job_metadata(&source, "source-job", source_meta_id, "primary").unwrap();
+        link_series_metadata(&source, "Series", "Shared Show", source_meta_id).unwrap();
+        save_media_markers(
+            &source,
+            "source-job",
+            &[NewMediaMarker {
+                marker_type: "intro".into(),
+                start_seconds: 10.0,
+                end_seconds: 70.0,
+                source: "chapter".into(),
+                confidence: 1.0,
+            }],
+        )
+        .unwrap();
+        let export = export_to_dict(&source).unwrap();
+
+        let target_path = temp_db_path("metadata_merge_target.db");
+        let mut target = init_db(&target_path).unwrap();
+        save_job(
+            &mut target,
+            &NewJob::complete("target-job", "other.mkv"),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let target_meta_id =
+            save_external_metadata(&target, &test_metadata("target", "Target")).unwrap();
+        save_media_markers(
+            &target,
+            "target-job",
+            &[NewMediaMarker {
+                marker_type: "intro".into(),
+                start_seconds: 5.0,
+                end_seconds: 30.0,
+                source: "chapter".into(),
+                confidence: 1.0,
+            }],
+        )
+        .unwrap();
+        let target_marker_id = get_media_markers(&target, "target-job", false).unwrap()[0].id;
+
+        merge_from_export(&mut target, &export, &std::collections::HashMap::new()).unwrap();
+
+        let links = get_job_metadata_links(&target, "source-job").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_ne!(links[0].0.metadata_id, target_meta_id);
+        assert_eq!(links[0].1.provider_id, "source");
+
+        let series_link = get_series_metadata_link(&target, "Series", "Shared Show")
+            .unwrap()
+            .unwrap();
+        assert_eq!(series_link.1.provider_id, "source");
+
+        let source_markers = get_media_markers(&target, "source-job", false).unwrap();
+        assert_eq!(source_markers.len(), 1);
+        assert_ne!(source_markers[0].id, target_marker_id);
+        assert_eq!(source_markers[0].marker_type, "intro");
+    }
+
+    #[test]
+    fn replace_auto_media_markers_preserves_manual_markers() {
+        let path = temp_db_path("replace_auto_markers.db");
+        let mut conn = init_db(&path).unwrap();
+        save_job(
+            &mut conn,
+            &NewJob::complete("marker-job", "episode.mkv"),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        save_media_markers(
+            &conn,
+            "marker-job",
+            &[
+                NewMediaMarker {
+                    marker_type: "intro".into(),
+                    start_seconds: 10.0,
+                    end_seconds: 70.0,
+                    source: "manual".into(),
+                    confidence: 1.0,
+                },
+                NewMediaMarker {
+                    marker_type: "intro".into(),
+                    start_seconds: 12.0,
+                    end_seconds: 72.0,
+                    source: "chromaprint".into(),
+                    confidence: 0.7,
+                },
+            ],
+        )
+        .unwrap();
+
+        replace_auto_media_markers(
+            &conn,
+            "marker-job",
+            &[NewMediaMarker {
+                marker_type: "outro".into(),
+                start_seconds: 900.0,
+                end_seconds: 960.0,
+                source: "chromaprint".into(),
+                confidence: 0.8,
+            }],
+        )
+        .unwrap();
+
+        let markers = get_media_markers(&conn, "marker-job", false).unwrap();
+        assert_eq!(markers.len(), 2);
+        assert!(markers.iter().any(|m| m.source == "manual"));
+        assert!(markers
+            .iter()
+            .any(|m| m.marker_type == "outro" && m.source == "chromaprint"));
+    }
+
+    #[test]
+    fn playback_progress_marks_completed_near_end() {
+        let path = temp_db_path("playback_progress.db");
+        let mut conn = init_db(&path).unwrap();
+        save_job(
+            &mut conn,
+            &NewJob::complete("progress-job", "episode.mkv"),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        save_playback_progress(
+            &conn,
+            &NewPlaybackProgress {
+                client_id: "client1".into(),
+                job_id: "progress-job".into(),
+                position_seconds: 960.0,
+                duration_seconds: 1000.0,
+            },
+        )
+        .unwrap();
+
+        let progress = get_playback_progress(&conn, "client1", "progress-job")
+            .unwrap()
+            .unwrap();
+        assert!(progress.completed);
+        assert_eq!(progress.progress_pct, 96);
+        assert!(list_playback_progress(&conn, "client1").unwrap().is_empty());
     }
 
     #[test]

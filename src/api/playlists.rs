@@ -603,6 +603,7 @@ mod tests {
             part_number: None,
             error: None,
             source_path: None,
+            episode_title: None,
         }
     }
 

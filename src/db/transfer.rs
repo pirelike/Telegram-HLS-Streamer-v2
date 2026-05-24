@@ -102,7 +102,7 @@ fn export_media_markers(conn: &Connection) -> Result<Vec<MediaMarkerRow>> {
 
 fn export_media_fingerprints(conn: &Connection) -> Result<Vec<MediaFingerprintRow>> {
     let mut stmt = conn.prepare(
-        "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at FROM media_fingerprints ORDER BY job_id ASC",
+        "SELECT job_id, media_type, series_name, season_number, window_type, window_start_seconds, window_duration_seconds, duration_seconds, fingerprint, fingerprint_source, created_at FROM media_fingerprints ORDER BY job_id ASC, window_type ASC",
     )?;
     let rows = stmt.query_map([], media_fingerprint_from_row)?;
     rows.map(|r| r.map_err(Into::into)).collect()
@@ -117,6 +117,7 @@ pub fn merge_from_export(
     let mut merged_jobs = 0;
     let mut merged_segments = 0;
     let mut merged_segment_parts = 0;
+    let mut metadata_id_map = HashMap::new();
     for job in &export.jobs {
         let mut new_job = NewJob {
             job_id: job.job_id.clone(),
@@ -229,38 +230,62 @@ pub fn merge_from_export(
         )?;
     }
     for meta in &export.external_metadata {
-        tx.execute(
-            "INSERT OR IGNORE INTO external_metadata(id, provider, provider_id, media_kind, title, original_title, overview, poster_url, backdrop_url, release_date, year, rating, raw_json, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![meta.id, meta.provider, meta.provider_id, meta.media_kind, meta.title, meta.original_title, meta.overview, meta.poster_url, meta.backdrop_url, meta.release_date, meta.year, meta.rating, meta.raw_json, meta.fetched_at],
+        let target_id: i64 = tx.query_row(
+            "INSERT INTO external_metadata(provider, provider_id, media_kind, title, original_title, overview, poster_url, backdrop_url, release_date, year, rating, raw_json, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(provider, provider_id, media_kind) DO UPDATE SET
+                title=excluded.title,
+                original_title=excluded.original_title,
+                overview=excluded.overview,
+                poster_url=excluded.poster_url,
+                backdrop_url=excluded.backdrop_url,
+                release_date=excluded.release_date,
+                year=excluded.year,
+                rating=excluded.rating,
+                raw_json=excluded.raw_json,
+                fetched_at=excluded.fetched_at
+             RETURNING id",
+            params![meta.provider, meta.provider_id, meta.media_kind, meta.title, meta.original_title, meta.overview, meta.poster_url, meta.backdrop_url, meta.release_date, meta.year, meta.rating, meta.raw_json, meta.fetched_at],
+            |row| row.get(0),
         )?;
+        metadata_id_map.insert(meta.id, target_id);
     }
     for link in &export.job_metadata_links {
+        let Some(metadata_id) = metadata_id_map.get(&link.metadata_id) else {
+            bail!("missing metadata_id map for {}", link.metadata_id);
+        };
         tx.execute(
             "INSERT OR IGNORE INTO job_metadata_links(job_id, metadata_id, role, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![link.job_id, link.metadata_id, link.role, link.created_at],
+            params![link.job_id, *metadata_id, link.role, link.created_at],
         )?;
     }
     for link in &export.series_metadata_links {
+        let Some(metadata_id) = metadata_id_map.get(&link.metadata_id) else {
+            bail!("missing metadata_id map for {}", link.metadata_id);
+        };
         tx.execute(
             "INSERT OR IGNORE INTO series_metadata_links(media_type, series_name, metadata_id, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![link.media_type, link.series_name, link.metadata_id, link.created_at],
+            params![link.media_type, link.series_name, *metadata_id, link.created_at],
         )?;
     }
     for marker in &export.media_markers {
         tx.execute(
-            "INSERT OR IGNORE INTO media_markers(id, job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![marker.id, marker.job_id, marker.marker_type, marker.start_seconds, marker.end_seconds, marker.source, marker.confidence, bool_to_i64(marker.enabled) as i64, marker.created_at, marker.updated_at],
+            "INSERT INTO media_markers(job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+             WHERE NOT EXISTS (
+                SELECT 1 FROM media_markers
+                WHERE job_id = ?1 AND marker_type = ?2 AND start_seconds = ?3 AND end_seconds = ?4 AND source = ?5
+             )",
+            params![marker.job_id, marker.marker_type, marker.start_seconds, marker.end_seconds, marker.source, marker.confidence, bool_to_i64(marker.enabled) as i64, marker.created_at, marker.updated_at],
         )?;
     }
     for fp in &export.media_fingerprints {
         tx.execute(
-            "INSERT OR IGNORE INTO media_fingerprints(job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![fp.job_id, fp.media_type, fp.series_name, fp.season_number, fp.duration_seconds, fp.fingerprint, fp.fingerprint_source, fp.created_at],
+            "INSERT OR IGNORE INTO media_fingerprints(job_id, media_type, series_name, season_number, window_type, window_start_seconds, window_duration_seconds, duration_seconds, fingerprint, fingerprint_source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![fp.job_id, fp.media_type, fp.series_name, fp.season_number, fp.window_type, fp.window_start_seconds, fp.window_duration_seconds, fp.duration_seconds, fp.fingerprint, fp.fingerprint_source, fp.created_at],
         )?;
     }
     tx.commit()?;

@@ -413,16 +413,16 @@ pub fn list_series_groups(
          grouped AS (
             SELECT series_name, COUNT(*) AS episode_count, MAX(created_at) AS last_updated
             FROM filtered
-            WHERE series_name != ''
+            WHERE COALESCE(series_name, '') != ''
             GROUP BY series_name
          ),
          reps AS (
-            SELECT f.series_name, f.job_id, f.has_thumbnail,
+            SELECT f.series_name, f.job_id, f.has_thumbnail, f.media_type,
                    ROW_NUMBER() OVER (PARTITION BY f.series_name ORDER BY f.created_at DESC, f.job_id ASC) AS rn
             FROM filtered f
-            WHERE f.series_name != ''
-         )
-         SELECT grouped.series_name, grouped.episode_count, grouped.last_updated, reps.job_id, reps.has_thumbnail
+            WHERE COALESCE(f.series_name, '') != ''
+          )
+          SELECT grouped.series_name, grouped.episode_count, grouped.last_updated, reps.job_id, reps.has_thumbnail, reps.media_type
          FROM grouped
          JOIN reps ON reps.series_name = grouped.series_name AND reps.rn = 1
          ORDER BY grouped.last_updated DESC
@@ -443,6 +443,7 @@ pub fn list_series_groups(
             last_updated: r.get(2)?,
             job_id: r.get(3)?,
             has_thumbnail: r.get::<_, i64>(4)? == 1,
+            media_type: r.get(5)?,
         })
     })?;
     rows.map(|r| r.map_err(Into::into)).collect()
@@ -451,10 +452,10 @@ pub fn list_series_groups(
 pub fn count_series_groups(conn: &Connection, filter: &JobListFilter) -> Result<i64> {
     let (where_sql, params) = job_filter_sql(filter);
     let sql = if where_sql.is_empty() {
-        "SELECT COUNT(*) FROM (SELECT series_name FROM jobs WHERE series_name != '' GROUP BY series_name)".to_string()
+        "SELECT COUNT(*) FROM (SELECT series_name FROM jobs WHERE COALESCE(series_name, '') != '' GROUP BY series_name)".to_string()
     } else {
         format!(
-            "SELECT COUNT(*) FROM (SELECT series_name FROM jobs {where_sql} AND series_name != '' GROUP BY series_name)"
+            "SELECT COUNT(*) FROM (SELECT series_name FROM jobs {where_sql} AND COALESCE(series_name, '') != '' GROUP BY series_name)"
         )
     };
     let refs: Vec<&dyn rusqlite::ToSql> =
@@ -475,7 +476,7 @@ pub fn list_season_groups(
          grouped AS (
             SELECT series_name, season_number, COUNT(*) AS episode_count, MAX(created_at) AS last_updated
             FROM filtered
-            WHERE series_name != ''
+            WHERE COALESCE(series_name, '') != ''
             GROUP BY series_name, season_number
          ),
          reps AS (
@@ -485,9 +486,9 @@ pub fn list_season_groups(
                     ORDER BY f.created_at DESC, f.job_id ASC
                    ) AS rn
             FROM filtered f
-            WHERE f.series_name != ''
-         )
-         SELECT grouped.series_name, grouped.season_number, grouped.episode_count,
+            WHERE COALESCE(f.series_name, '') != ''
+          )
+          SELECT grouped.series_name, grouped.season_number, grouped.episode_count,
                 grouped.last_updated, reps.job_id, reps.has_thumbnail
          FROM grouped
          JOIN reps ON reps.series_name = grouped.series_name
@@ -521,10 +522,10 @@ pub fn list_season_groups(
 pub fn count_season_groups(conn: &Connection, filter: &JobListFilter) -> Result<i64> {
     let (where_sql, params) = job_filter_sql(filter);
     let sql = if where_sql.is_empty() {
-        "SELECT COUNT(*) FROM (SELECT series_name, season_number FROM jobs WHERE series_name != '' GROUP BY series_name, season_number)".to_string()
+        "SELECT COUNT(*) FROM (SELECT series_name, season_number FROM jobs WHERE COALESCE(series_name, '') != '' GROUP BY series_name, season_number)".to_string()
     } else {
         format!(
-            "SELECT COUNT(*) FROM (SELECT series_name, season_number FROM jobs {where_sql} AND series_name != '' GROUP BY series_name, season_number)"
+            "SELECT COUNT(*) FROM (SELECT series_name, season_number FROM jobs {where_sql} AND COALESCE(series_name, '') != '' GROUP BY series_name, season_number)"
         )
     };
     let refs: Vec<&dyn rusqlite::ToSql> =
@@ -548,7 +549,7 @@ pub fn distinct_series_names(conn: &Connection, category: Option<&str>) -> Resul
         Some(category) => {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT series_name FROM jobs
-                 WHERE media_type = ?1 AND series_name != ''
+                 WHERE media_type = ?1 AND COALESCE(series_name, '') != ''
                  ORDER BY series_name ASC",
             )?;
             let rows = stmt.query_map(params![category], |r| r.get::<_, String>(0))?;
@@ -559,7 +560,7 @@ pub fn distinct_series_names(conn: &Connection, category: Option<&str>) -> Resul
         None => {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT series_name FROM jobs
-                 WHERE series_name != ''
+                 WHERE COALESCE(series_name, '') != ''
                  ORDER BY series_name ASC",
             )?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -850,7 +851,7 @@ pub fn record_db_sync_upload(
 // --- External metadata ---
 
 pub fn save_external_metadata(conn: &Connection, meta: &NewExternalMetadata) -> Result<i64> {
-    conn.execute(
+    conn.query_row(
         "INSERT INTO external_metadata(provider, provider_id, media_kind, title, original_title, overview, poster_url, backdrop_url, release_date, year, rating, raw_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(provider, provider_id, media_kind) DO UPDATE SET
@@ -863,7 +864,8 @@ pub fn save_external_metadata(conn: &Connection, meta: &NewExternalMetadata) -> 
             year=excluded.year,
             rating=excluded.rating,
             raw_json=excluded.raw_json,
-            fetched_at=CURRENT_TIMESTAMP",
+            fetched_at=CURRENT_TIMESTAMP
+         RETURNING id",
         params![
             meta.provider,
             meta.provider_id,
@@ -878,8 +880,9 @@ pub fn save_external_metadata(conn: &Connection, meta: &NewExternalMetadata) -> 
             meta.rating,
             meta.raw_json,
         ],
-    )?;
-    Ok(conn.last_insert_rowid())
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 pub fn get_external_metadata(
@@ -985,8 +988,9 @@ pub fn link_series_metadata(
     metadata_id: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO series_metadata_links(media_type, series_name, metadata_id)
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO series_metadata_links(media_type, series_name, metadata_id)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(media_type, series_name) DO UPDATE SET metadata_id = excluded.metadata_id",
         params![media_type, series_name, metadata_id],
     )?;
     Ok(())
@@ -1015,6 +1019,122 @@ pub fn get_series_metadata_link(
     )
     .optional()
     .map_err(Into::into)
+}
+
+pub fn get_job_poster_urls(
+    conn: &Connection,
+    job_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    if job_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = job_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT jml.job_id, em.poster_url \
+         FROM job_metadata_links jml \
+         JOIN external_metadata em ON em.id = jml.metadata_id \
+         WHERE jml.job_id IN ({}) AND jml.role = 'primary'",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(job_ids.iter()), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (job_id, poster_url) = row?;
+        if !poster_url.is_empty() {
+            map.insert(job_id, poster_url);
+        }
+    }
+    Ok(map)
+}
+
+pub fn get_series_poster_urls(
+    conn: &Connection,
+    series_names: &[String],
+) -> Result<HashMap<String, String>> {
+    if series_names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = series_names
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT sml.series_name, em.poster_url \
+         FROM series_metadata_links sml \
+         JOIN external_metadata em ON em.id = sml.metadata_id \
+         WHERE sml.series_name IN ({})",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(series_names.iter()), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (series_name, poster_url) = row?;
+        if !poster_url.is_empty() {
+            map.insert(series_name, poster_url);
+        }
+    }
+    Ok(map)
+}
+
+pub fn get_season_episode_job_ids(
+    conn: &Connection,
+    series_name: &str,
+) -> Result<Vec<(String, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_id, season_number, episode_number FROM jobs
+         WHERE series_name = ?1 AND season_number IS NOT NULL AND episode_number IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![series_name], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn rename_series(
+    conn: &Connection,
+    old_name: &str,
+    new_name: &str,
+    media_type: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET series_name = ?1 WHERE series_name = ?2 AND media_type = ?3",
+        params![new_name, old_name, media_type],
+    )?;
+    // If the new name already exists in series_metadata_links, delete the old entry
+    // rather than trying to rename it (the new link was already written by link_series_metadata).
+    conn.execute(
+        "DELETE FROM series_metadata_links WHERE series_name = ?1 AND media_type = ?2",
+        params![old_name, media_type],
+    )?;
+    conn.execute(
+        "UPDATE OR IGNORE media_fingerprints SET series_name = ?1 WHERE series_name = ?2",
+        params![new_name, old_name],
+    )?;
+    Ok(())
+}
+
+pub fn set_episode_titles(conn: &Connection, updates: &[(String, String)]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for (job_id, title) in updates {
+        tx.execute(
+            "UPDATE jobs SET episode_title = ?1 WHERE job_id = ?2",
+            params![title, job_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 // --- Playback progress ---
@@ -1107,6 +1227,34 @@ pub fn save_media_markers(
     Ok(())
 }
 
+pub fn replace_auto_media_markers(
+    conn: &Connection,
+    job_id: &str,
+    markers: &[NewMediaMarker],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM media_markers WHERE job_id = ?1 AND source != 'manual'",
+        params![job_id],
+    )?;
+    for marker in markers {
+        tx.execute(
+            "INSERT INTO media_markers(job_id, marker_type, start_seconds, end_seconds, source, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                job_id,
+                marker.marker_type,
+                marker.start_seconds,
+                marker.end_seconds,
+                marker.source,
+                marker.confidence,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn get_media_markers(
     conn: &Connection,
     job_id: &str,
@@ -1135,13 +1283,20 @@ pub fn delete_media_markers(conn: &Connection, job_id: &str) -> Result<usize> {
 
 pub fn save_media_fingerprint(conn: &Connection, fp: &NewMediaFingerprint) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO media_fingerprints(job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)",
+        "INSERT OR REPLACE INTO media_fingerprints(
+            job_id, media_type, series_name, season_number, window_type,
+            window_start_seconds, window_duration_seconds, duration_seconds,
+            fingerprint, fingerprint_source, created_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)",
         params![
             fp.job_id,
             fp.media_type,
             fp.series_name,
             fp.season_number,
+            fp.window_type,
+            fp.window_start_seconds,
+            fp.window_duration_seconds,
             fp.duration_seconds,
             fp.fingerprint,
             fp.fingerprint_source,
@@ -1155,8 +1310,8 @@ pub fn get_media_fingerprint(
     job_id: &str,
 ) -> Result<Option<MediaFingerprintRow>> {
     conn.query_row(
-        "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at
-         FROM media_fingerprints WHERE job_id = ?1",
+        "SELECT job_id, media_type, series_name, season_number, window_type, window_start_seconds, window_duration_seconds, duration_seconds, fingerprint, fingerprint_source, created_at
+         FROM media_fingerprints WHERE job_id = ?1 AND window_type = 'intro'",
         params![job_id],
         media_fingerprint_from_row,
     )
@@ -1170,22 +1325,35 @@ pub fn get_media_fingerprints_for_series(
     series_name: &str,
     season_number: Option<i64>,
 ) -> Result<Vec<MediaFingerprintRow>> {
+    get_media_fingerprints_for_series_window(conn, media_type, series_name, season_number, "intro")
+}
+
+pub fn get_media_fingerprints_for_series_window(
+    conn: &Connection,
+    media_type: &str,
+    series_name: &str,
+    season_number: Option<i64>,
+    window_type: &str,
+) -> Result<Vec<MediaFingerprintRow>> {
     let mut stmt = match season_number {
         Some(_) => conn.prepare(
-            "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at
-             FROM media_fingerprints WHERE media_type = ?1 AND series_name = ?2 AND season_number = ?3 ORDER BY created_at ASC",
+            "SELECT job_id, media_type, series_name, season_number, window_type, window_start_seconds, window_duration_seconds, duration_seconds, fingerprint, fingerprint_source, created_at
+             FROM media_fingerprints WHERE media_type = ?1 AND series_name = ?2 AND season_number = ?3 AND window_type = ?4 ORDER BY created_at ASC",
         )?,
         None => conn.prepare(
-            "SELECT job_id, media_type, series_name, season_number, duration_seconds, fingerprint, fingerprint_source, created_at
-             FROM media_fingerprints WHERE media_type = ?1 AND series_name = ?2 AND season_number IS NULL ORDER BY created_at ASC",
+            "SELECT job_id, media_type, series_name, season_number, window_type, window_start_seconds, window_duration_seconds, duration_seconds, fingerprint, fingerprint_source, created_at
+             FROM media_fingerprints WHERE media_type = ?1 AND series_name = ?2 AND season_number IS NULL AND window_type = ?3 ORDER BY created_at ASC",
         )?,
     };
     let rows = match season_number {
         Some(sn) => stmt.query_map(
-            params![media_type, series_name, sn],
+            params![media_type, series_name, sn, window_type],
             media_fingerprint_from_row,
         )?,
-        None => stmt.query_map(params![media_type, series_name], media_fingerprint_from_row)?,
+        None => stmt.query_map(
+            params![media_type, series_name, window_type],
+            media_fingerprint_from_row,
+        )?,
     };
     rows.map(|r| r.map_err(Into::into)).collect()
 }

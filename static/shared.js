@@ -127,3 +127,77 @@ function updateSidebar() {
     window.addEventListener('resize', updateSidebar);
     updateSidebar();
 })();
+
+// ─── Global active-jobs panel ────────────────────────────────────────────────
+(function () {
+    const panel = document.getElementById('jobsPanel');
+    const list = document.getElementById('jobsPanelList');
+    const pill = document.getElementById('thls-status-pill');
+    const pillText = document.getElementById('thls-status-text');
+    if (!panel || !list || !pill || !pillText) return;
+
+    let open = false;
+    let pollTimer = null;
+
+    window.__thls_toggle_jobs_panel = function () {
+        open = !open;
+        panel.classList.toggle('hidden', !open);
+        if (open) { pollActiveJobs(); startPolling(); }
+        else { stopPolling(); }
+    };
+
+    document.addEventListener('click', function (e) {
+        if (open && !panel.contains(e.target) && !pill.contains(e.target)) {
+            open = false;
+            panel.classList.add('hidden');
+            stopPolling();
+        }
+    });
+
+    function startPolling() { stopPolling(); pollTimer = setInterval(pollActiveJobs, 3000); }
+    function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+    async function pollActiveJobs() {
+        try {
+            const r = await fetch('/api/jobs/active');
+            if (!r.ok) return;
+            const d = await r.json();
+            const jobs = d.jobs || [];
+            updatePill(jobs);
+            updatePanel(jobs);
+        } catch {}
+    }
+
+    function updatePill(jobs) {
+        if (jobs.length > 0) {
+            pill.classList.add('t-livepill--processing');
+            pillText.textContent = 'Processing \u00b7 ' + jobs.length + ' job' + (jobs.length > 1 ? 's' : '');
+        } else {
+            pill.classList.remove('t-livepill--processing');
+            if (typeof window.__thls_update_status_pill !== 'function') {
+                pillText.textContent = 'Idle';
+            }
+        }
+        pill.style.display = '';
+    }
+
+    function updatePanel(jobs) {
+        if (!jobs.length) {
+            list.innerHTML = '<div class="jobs-panel__empty">No active jobs</div>';
+            return;
+        }
+        list.innerHTML = jobs.map(j => {
+            const pct = Math.round(j.progress || 0);
+            const statusLabel = j.status ? j.status.charAt(0).toUpperCase() + j.status.slice(1) : 'Unknown';
+            const desc = j.description || statusLabel;
+            return '<div class="jobs-panel__item">' +
+                '<div class="jobs-panel__filename" title="' + escapeAttr(j.filename || j.job_id) + '">' + escapeHtml(j.filename || j.job_id) + '</div>' +
+                '<div class="jobs-panel__status">' + escapeHtml(desc) + '</div>' +
+                '<div class="jobs-panel__bar-bg"><div class="jobs-panel__bar" style="width:' + pct + '%"></div></div>' +
+                '</div>';
+        }).join('');
+    }
+
+    pollActiveJobs();
+    setInterval(pollActiveJobs, 5000);
+})();

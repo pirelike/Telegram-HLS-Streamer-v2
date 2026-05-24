@@ -505,6 +505,7 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
     finish_job_complete(&state, &request.job_id).await;
 
     detect_and_save_markers(&state, &request, &analysis).await;
+    auto_fetch_metadata_if_enabled(&state, &request).await;
 
     super::super::playback::spawn_cache_warmup(state.clone(), request.job_id.clone());
     super::super::db_transfer::trigger_automatic_db_sync(
@@ -1291,7 +1292,13 @@ async fn detect_and_save_markers(
                 let sn = series_name.to_string();
                 let sn_copy = season_number;
                 match tokio::task::spawn_blocking(move || {
-                    db::get_media_fingerprints_for_series(&conn, &mt, &sn, sn_copy)
+                    let mut rows = db::get_media_fingerprints_for_series_window(
+                        &conn, &mt, &sn, sn_copy, "intro",
+                    )?;
+                    rows.extend(db::get_media_fingerprints_for_series_window(
+                        &conn, &mt, &sn, sn_copy, "outro",
+                    )?);
+                    Ok::<_, anyhow::Error>(rows)
                 })
                 .await
                 {
@@ -1308,28 +1315,26 @@ async fn detect_and_save_markers(
 
     let cancel = Arc::new(AtomicBool::new(false));
 
-    let new_fingerprint = if cfg.intro_chromaprint_enabled
+    let new_fingerprints = if cfg.intro_chromaprint_enabled
         && !series_name.is_empty()
         && media::chromaprint_available()
     {
-        match media::generate_fingerprint(&request.source_path, analysis.duration, &cancel).await {
-            Ok(fp) => Some(fp),
+        match media::generate_fingerprints(&request.source_path, analysis.duration, &cancel).await {
+            Ok(fp) => fp,
             Err(e) => {
                 tracing::debug!(job_id = %request.job_id, error = %e, "chromaprint fingerprint generation skipped");
-                None
+                Vec::new()
             }
         }
     } else {
-        None
+        Vec::new()
     };
 
     match media::detect_markers(
         analysis,
-        media_type,
-        series_name,
-        season_number,
         &fingerprints,
-        new_fingerprint.as_deref(),
+        &new_fingerprints,
+        Some(&request.source_path),
         &cancel,
     )
     .await
@@ -1340,24 +1345,33 @@ async fn detect_and_save_markers(
                 let markers_copy = result.markers.clone();
                 if let Ok(conn) = state.db_conn().await {
                     let _ = tokio::task::spawn_blocking(move || {
-                        db::save_media_markers(&conn, &jid, &markers_copy)
+                        db::replace_auto_media_markers(&conn, &jid, &markers_copy)
                     })
                     .await;
                 }
             }
-            if let Some(fp) = &new_fingerprint {
+            if !new_fingerprints.is_empty() {
                 if let Ok(conn) = state.db_conn().await {
-                    let fingerprint_entry = db::NewMediaFingerprint {
-                        job_id: request.job_id.clone(),
-                        media_type: media_type.to_string(),
-                        series_name: series_name.to_string(),
-                        season_number,
-                        duration_seconds: analysis.duration,
-                        fingerprint: fp.clone(),
-                        fingerprint_source: "chromaprint".to_string(),
-                    };
+                    let fingerprint_entries: Vec<_> = new_fingerprints
+                        .iter()
+                        .map(|fp| db::NewMediaFingerprint {
+                            job_id: request.job_id.clone(),
+                            media_type: media_type.to_string(),
+                            series_name: series_name.to_string(),
+                            season_number,
+                            window_type: fp.window_type.clone(),
+                            window_start_seconds: fp.window_start_seconds,
+                            window_duration_seconds: fp.window_duration_seconds,
+                            duration_seconds: analysis.duration,
+                            fingerprint: fp.fingerprint.clone(),
+                            fingerprint_source: "chromaprint".to_string(),
+                        })
+                        .collect();
                     let _ = tokio::task::spawn_blocking(move || {
-                        db::save_media_fingerprint(&conn, &fingerprint_entry)
+                        for entry in &fingerprint_entries {
+                            db::save_media_fingerprint(&conn, entry)?;
+                        }
+                        Ok::<_, anyhow::Error>(())
                     })
                     .await;
                 }
@@ -1367,4 +1381,43 @@ async fn detect_and_save_markers(
             tracing::warn!(job_id = %request.job_id, error = %e, "marker detection failed (non-fatal)");
         }
     }
+}
+
+async fn auto_fetch_metadata_if_enabled(state: &Arc<AppState>, request: &JobRequest) {
+    let cfg = state.config.read().await.clone();
+    if !cfg.metadata_auto_fetch_enabled {
+        return;
+    }
+
+    // Skip if already linked.
+    let conn = match state.db_conn().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let jid = request.job_id.clone();
+    let already_linked = tokio::task::spawn_blocking(move || {
+        db::get_job_metadata_links(&conn, &jid).map(|l| !l.is_empty())
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or(false);
+    if already_linked {
+        return;
+    }
+
+    let media_type = request.metadata.media_type.as_deref().unwrap_or("Film");
+    let search_term = request
+        .metadata
+        .series_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| request.metadata.title.as_deref().filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    if search_term.is_empty() {
+        return;
+    }
+
+    super::super::metadata::auto_fetch_and_link(state, &request.job_id, search_term, media_type)
+        .await;
 }

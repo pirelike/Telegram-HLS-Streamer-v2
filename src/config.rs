@@ -26,6 +26,9 @@ pub struct BotConfig {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub admin_user: String,
+    pub admin_pass: String,
+
     pub host: IpAddr,
     pub port: u16,
     pub force_https: bool,
@@ -107,6 +110,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            admin_user: String::new(),
+            admin_pass: String::new(),
             host: "0.0.0.0".parse().expect("default host"),
             port: 5050,
             force_https: false,
@@ -213,6 +218,8 @@ impl Config {
 
     fn setting_value(&self, key: &str) -> String {
         match key {
+            "ADMIN_USER" => self.admin_user.clone(),
+            "ADMIN_PASS" => self.admin_pass.clone(),
             "HOST" => self.host.to_string(),
             "PORT" => self.port.to_string(),
             "FORCE_HTTPS" => self.force_https.to_string(),
@@ -260,20 +267,7 @@ impl Config {
             "DB_AUTO_MERGE_FILE_ID" => self.db_auto_merge_file_id.clone(),
             "DB_AUTO_MERGE_BOT_INDEX" => self.db_auto_merge_bot_index.to_string(),
             "WEBHOOK_URL" => self.webhook_url.clone(),
-            "TMDB_API_KEY" => {
-                let masked = if self.tmdb_api_key.len() > 4 {
-                    format!(
-                        "{}...{}",
-                        &self.tmdb_api_key[..2],
-                        &self.tmdb_api_key[self.tmdb_api_key.len() - 2..]
-                    )
-                } else if self.tmdb_api_key.is_empty() {
-                    String::new()
-                } else {
-                    "***".to_string()
-                };
-                masked
-            }
+            "TMDB_API_KEY" => self.masked_tmdb_api_key(),
             "METADATA_AUTO_FETCH_ENABLED" => self.metadata_auto_fetch_enabled.to_string(),
             "METADATA_REFRESH_DAYS" => self.metadata_refresh_days.to_string(),
             "INTRO_DETECTION_ENABLED" => self.intro_detection_enabled.to_string(),
@@ -287,6 +281,24 @@ impl Config {
             "TIER0_BITRATE_DEFAULT" => self.tier0_bitrate_default.clone(),
             _ => String::new(),
         }
+    }
+
+    pub fn masked_tmdb_api_key(&self) -> String {
+        if self.tmdb_api_key.len() > 4 {
+            format!(
+                "{}...{}",
+                &self.tmdb_api_key[..2],
+                &self.tmdb_api_key[self.tmdb_api_key.len() - 2..]
+            )
+        } else if self.tmdb_api_key.is_empty() {
+            String::new()
+        } else {
+            "***".to_string()
+        }
+    }
+
+    pub fn is_unchanged_masked_tmdb_api_key(&self, value: &str) -> bool {
+        !self.tmdb_api_key.is_empty() && value == self.masked_tmdb_api_key()
     }
 }
 
@@ -358,6 +370,8 @@ pub fn effective_setting_values(conn: &Connection) -> Result<BTreeMap<&'static s
 fn apply_setting(cfg: &mut Config, key: &str, value: &str, source: &str) {
     let result: Result<(), String> = (|| -> Result<(), String> {
         match key {
+            "ADMIN_USER" => cfg.admin_user = value.to_string(),
+            "ADMIN_PASS" => cfg.admin_pass = value.to_string(),
             "HOST" => {
                 cfg.host = value
                     .parse()

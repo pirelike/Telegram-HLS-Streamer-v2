@@ -1102,7 +1102,7 @@ async fn probe_duration(path: &Path) -> Result<f64> {
         .arg("format=duration")
         .arg("-of")
         .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(fmp4_input_arg(path))
+        .arg(path.to_string_lossy().as_ref())
         .output()
         .await?;
     if !output.status.success() {

@@ -213,6 +213,7 @@ function rebuildMetadataTable() {
 
     let html = '<table class="metadata-table"><thead><tr><th>File</th>';
     for (const c of cols) html += `<th>${c.label}</th>`;
+    html += '<th>Metadata</th>';
     if (pendingFiles.length > 1) html += '<th>Status</th>';
     html += '</tr></thead><tbody>';
 
@@ -222,6 +223,18 @@ function rebuildMetadataTable() {
             const val = pf.metadata[c.key] != null ? pf.metadata[c.key] : '';
             html += `<td><input class="meta-input" type="${c.type||'text'}" data-key="${c.key}" data-idx="${i}" value="${escapeAttr(String(val))}" placeholder="${c.label}"></td>`;
         }
+        const provider = selectedCategory.startsWith('Anime') ? 'anilist' : 'tmdb';
+        html += `<td class="upload-meta-link-cell">
+            <div style="display:flex;gap:6px;align-items:center;min-width:260px;">
+                <select class="form-input upload-meta-provider" data-idx="${i}" style="width:88px;">
+                    <option value="tmdb"${provider === 'tmdb' ? ' selected' : ''}>TMDB</option>
+                    <option value="anilist"${provider === 'anilist' ? ' selected' : ''}>AniList</option>
+                </select>
+                <input class="form-input upload-meta-query" data-idx="${i}" type="text" value="${escapeAttr(defaultMetadataQuery(pf.metadata))}" style="min-width:120px;" placeholder="Search">
+                <button type="button" class="action-btn" onclick="searchUploadMetadata(${i})">Search</button>
+            </div>
+            <div class="upload-meta-results" id="upload-meta-results-${i}" style="margin-top:6px;"></div>
+        </td>`;
         if (pendingFiles.length > 1) html += `<td><span class="file-row-status" id="row-status-${i}"></span></td>`;
         html += '</tr>';
     });
@@ -237,6 +250,57 @@ function rebuildMetadataTable() {
         pendingFiles[idx].metadata[key] = input.type === 'number' ? (val === '' ? null : parseInt(val, 10)) : val;
         validateMetadata();
     });
+}
+
+function defaultMetadataQuery(metadata) {
+    return metadata.series_name || metadata.title || '';
+}
+
+async function searchUploadMetadata(idx) {
+    const pf = pendingFiles[idx];
+    if (!pf) return;
+    const providerEl = document.querySelector(`.upload-meta-provider[data-idx="${idx}"]`);
+    const queryEl = document.querySelector(`.upload-meta-query[data-idx="${idx}"]`);
+    const resultsEl = document.getElementById(`upload-meta-results-${idx}`);
+    const provider = providerEl ? providerEl.value : 'tmdb';
+    const q = queryEl ? queryEl.value.trim() : '';
+    if (!q || !resultsEl) return;
+    resultsEl.innerHTML = '<span style="font-size:12px;color:var(--t-ink-3);">Searching...</span>';
+    try {
+        const resp = await fetch(`/api/metadata/search?provider=${encodeURIComponent(provider)}&q=${encodeURIComponent(q)}`);
+        const data = await resp.json();
+        const items = (data.results || []).slice(0, 5);
+        if (!resp.ok) throw new Error(data.message || data.error || 'Search failed');
+        if (!items.length) {
+            resultsEl.innerHTML = '<span style="font-size:12px;color:var(--t-ink-3);">No results</span>';
+            return;
+        }
+        resultsEl.innerHTML = items.map((item, itemIdx) => {
+            const title = escapeHtml(item.title || item.original_title || 'Untitled');
+            const year = item.year ? ` (${item.year})` : '';
+            return `<button type="button" class="action-btn" style="margin:0 4px 4px 0;padding:5px 8px;font-size:12px;" onclick="selectUploadMetadata(${idx}, ${itemIdx})">${title}${escapeHtml(year)}</button>`;
+        }).join('');
+        pf.metadata._metadata_results = items;
+    } catch (e) {
+        resultsEl.innerHTML = `<span style="font-size:12px;color:#ff6b6b;">${escapeHtml(e.message || 'Search failed')}</span>`;
+    }
+}
+
+function selectUploadMetadata(idx, itemIdx) {
+    const pf = pendingFiles[idx];
+    if (!pf || !pf.metadata._metadata_results) return;
+    const item = pf.metadata._metadata_results[itemIdx];
+    if (!item) return;
+    pf.metadata.external_metadata = {
+        provider: item.provider,
+        provider_id: item.provider_id,
+        media_kind: item.media_kind,
+    };
+    const resultsEl = document.getElementById(`upload-meta-results-${idx}`);
+    if (resultsEl) {
+        const title = escapeHtml(item.title || item.original_title || item.provider_id);
+        resultsEl.innerHTML = `<span style="font-size:12px;color:var(--t-accent);">Linked: ${title}</span>`;
+    }
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -272,11 +336,11 @@ document.getElementById('startUploadBtn').addEventListener('click', async () => 
     document.getElementById('metadataSection').classList.add('hidden');
     uploadArea.classList.add('disabled');
     isCancelled = false;
-    errorMsg.classList.remove('active');
-    resultCard.classList.remove('active');
-    analysisCard.classList.remove('active');
-    resumeBanner.classList.remove('active');
-    progressContainer.classList.add('active');
+    errorMsg.classList.add('hidden');
+    resultCard.classList.add('hidden');
+    analysisCard.classList.add('hidden');
+    resumeBanner.classList.add('hidden');
+    progressContainer.classList.remove('hidden');
     clearActivityLog();
     addActivity('Upload started');
 
@@ -345,11 +409,11 @@ function getPendingUpload() {
     catch { return null; }
 }
 function clearPendingUpload() { localStorage.removeItem(PENDING_UPLOAD_KEY); }
-function dismissResume() { clearPendingUpload(); resumeBanner.classList.remove('active'); }
+function dismissResume() { clearPendingUpload(); resumeBanner.classList.add('hidden'); }
 
 function checkResume() {
     const pending = getPendingUpload();
-    if (!pending) { resumeBanner.classList.remove('active'); return; }
+    if (!pending) { resumeBanner.classList.add('hidden'); return; }
     const age = Math.round((Date.now() - (pending.timestamp || Date.now())) / 1000);
     let ageStr = age < 60 ? 'just now' : `${Math.round(age/60)}m ago`;
     if (age > 3600) ageStr = `${Math.round(age/3600)}h ago`;
@@ -357,7 +421,7 @@ function checkResume() {
     const pct = pending.totalChunks > 0 ? Math.round(pending.nextChunk / pending.totalChunks * 100) : 0;
     resumeBannerText.textContent =
         `Incomplete upload: "${pending.filename}" (~${pct}%). Last activity: ${ageStr}. Re-select the same file to resume.`;
-    resumeBanner.classList.add('active');
+    resumeBanner.classList.remove('hidden');
 }
 
 // ─── Cancel ───────────────────────────────────────────────────────────────────
@@ -501,10 +565,28 @@ async function uploadSingleFile(file, metadata, dbFields) {
     const {job_id} = await finalResp.json();
     currentJobId = job_id;
     clearPendingUpload();
+    if (metadata.external_metadata) {
+        await linkUploadedMetadata(job_id, metadata.external_metadata);
+    }
 
     statusText.textContent = 'Processing...';
     addActivity(`Server job queued: ${job_id}`);
     return pollStatus(job_id);
+}
+
+async function linkUploadedMetadata(jobId, externalMetadata) {
+    try {
+        const resp = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/metadata/link`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+                provider: externalMetadata.provider,
+                provider_id: externalMetadata.provider_id,
+                media_kind: externalMetadata.media_kind,
+            }),
+        });
+        if (resp.ok) addActivity('External metadata linked');
+    } catch {}
 }
 
 function receivedSetFromStatus(status, totalChunks, fallbackNextChunk) {
@@ -548,6 +630,13 @@ async function sendChunkWithRetry(uploadId, chunkIndex, chunkBlob, signal) {
                 signal,
             });
             if (resp.ok) return;
+            if (resp.status === 429) {
+                const wait = 60_000;
+                speedText.textContent = `Rate limited, waiting ${wait/1000}s for window to reset...`;
+                await new Promise(r => setTimeout(r, wait));
+                attempt--;
+                continue;
+            }
             const e = await resp.json();
             throw new Error(e.message || e.error || `HTTP ${resp.status}`);
         } catch (err) {
@@ -610,7 +699,7 @@ function pollStatus(jobId) {
 }
 
 function showAnalysis(analysis) {
-    analysisCard.classList.add('active');
+    analysisCard.classList.remove('hidden');
     streamBadges.innerHTML = '';
     if (analysis.video_tracks > 0) streamBadges.innerHTML += `<span class="badge badge-video"><i class="material-icons-round">videocam</i> Video: ${analysis.video_tracks} track(s)</span>`;
     if (analysis.audio_tracks > 0) streamBadges.innerHTML += `<span class="badge badge-audio"><i class="material-icons-round">audiotrack</i> Audio: ${analysis.audio_tracks} track(s)</span>`;
@@ -621,13 +710,13 @@ function showResultCard(jobId) {
     const url = `${window.location.origin}/hls/${jobId}/master.m3u8`;
     masterUrl.textContent = url;
     if (watchLink) watchLink.href = `/watch/${jobId}`;
-    resultCard.classList.add('active');
+    resultCard.classList.remove('hidden');
 }
 
 function showError(msg) {
     errorMsg.textContent = msg;
-    errorMsg.classList.add('active');
-    progressContainer.classList.remove('active');
+    errorMsg.classList.remove('hidden');
+    progressContainer.classList.add('hidden');
 }
 
 function copyUrl() {

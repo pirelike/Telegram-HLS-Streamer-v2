@@ -58,6 +58,16 @@ pub(super) async fn handle_post_settings(
             Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_setting", e),
         }
     }
+    let mut new_cfg = {
+        let guard = state.config.write().await;
+        guard.as_ref().clone()
+    };
+    if normalized
+        .get("TMDB_API_KEY")
+        .is_some_and(|value| new_cfg.is_unchanged_masked_tmdb_api_key(value))
+    {
+        normalized.remove("TMDB_API_KEY");
+    }
 
     {
         let mut conn = match state.db_conn().await {
@@ -84,7 +94,6 @@ pub(super) async fn handle_post_settings(
             format!("settings applied to database but not persisted to .env: {e}. Changes will be lost on restart."),
         );
     }
-    let mut new_cfg = state.config.read().await.as_ref().clone();
     config::apply_normalized_settings(&mut new_cfg, &normalized);
     let response = settings_response(&new_cfg);
     store_config(&state, new_cfg, updates_encoder_settings(&normalized)).await;
