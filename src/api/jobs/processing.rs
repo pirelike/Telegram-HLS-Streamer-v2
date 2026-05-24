@@ -520,7 +520,12 @@ async fn upload_outputs(
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<(Vec<telegram::UploadedFile>, Option<i64>)> {
     // cfg.telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
-    let files = prepare_upload_files(&result.output_dir, cfg.telegram_max_file_size).await?;
+    let files = prepare_upload_files(
+        &result.output_dir,
+        cfg.telegram_max_file_size,
+        cfg.telegram_encryption_key.is_some(),
+    )
+    .await?;
     if files.is_empty() {
         bail!("no uploadable HLS output files found");
     }
@@ -551,6 +556,7 @@ async fn upload_outputs(
         let base_url = state.telegram_base_url.clone();
         let client = state.http.clone();
         let max_file_size = cfg.telegram_max_file_size;
+        let encryption_key = cfg.telegram_encryption_key.clone();
         let cancel_flag_clone = cancel_flag.clone();
         tasks.spawn(async move {
             let _permit = permit;
@@ -565,6 +571,7 @@ async fn upload_outputs(
                 bot_index,
                 &path,
                 segment_key,
+                encryption_key.as_ref(),
                 max_file_size,
             )
             .await
@@ -611,7 +618,7 @@ async fn update_upload_progress(state: &AppState, job_id: &str, current: usize, 
 async fn split_file_for_upload(
     path: &PathBuf,
     segment_key: &str,
-    max_size: u64,
+    max_plaintext_size: u64,
     temp_dir: &FsPath,
 ) -> Result<Vec<(String, PathBuf)>> {
     let file_size = tokio::fs::metadata(path)
@@ -619,11 +626,11 @@ async fn split_file_for_upload(
         .with_context(|| format!("stat {}", path.display()))?
         .len();
 
-    if file_size <= max_size {
+    if file_size <= max_plaintext_size {
         return Ok(vec![(segment_key.to_string(), path.clone())]);
     }
 
-    let chunk_size = (max_size.saturating_mul(95) / 100).max(1);
+    let chunk_size = (max_plaintext_size.saturating_mul(95) / 100).max(1);
     let total_parts = ((file_size - 1) / chunk_size + 1) as i64;
     let mut file = tokio::fs::File::open(path)
         .await
@@ -698,15 +705,17 @@ pub(super) async fn collect_upload_files(output_dir: &FsPath) -> Result<Vec<(Str
     Ok(out)
 }
 
-async fn prepare_upload_files(
+pub(super) async fn prepare_upload_files(
     output_dir: &FsPath,
     // User-configurable; matches cfg.telegram_max_file_size. Raise if Telegram changes limits.
     max_file_size: u64,
+    encrypted: bool,
 ) -> Result<Vec<(String, PathBuf)>> {
     let files = collect_upload_files(output_dir).await?;
     if files.is_empty() {
         return Ok(files);
     }
+    let max_plaintext_size = crate::crypto::max_plaintext_size(max_file_size, encrypted)?;
 
     let temp_dir = output_dir.join("temp_parts");
     tokio::fs::create_dir_all(&temp_dir)
@@ -720,7 +729,7 @@ async fn prepare_upload_files(
             .with_context(|| format!("stat {}", path.display()))?
             .len();
 
-        if file_size <= max_file_size {
+        if file_size <= max_plaintext_size {
             result.push((segment_key, path));
         } else {
             let parts_dir = temp_dir.join(segment_key.replace('/', "_"));
@@ -728,7 +737,7 @@ async fn prepare_upload_files(
                 .await
                 .with_context(|| format!("create parts dir {}", parts_dir.display()))?;
             let parts =
-                split_file_for_upload(&path, &segment_key, max_file_size, &parts_dir).await?;
+                split_file_for_upload(&path, &segment_key, max_plaintext_size, &parts_dir).await?;
             result.extend(parts);
         }
     }
@@ -889,6 +898,7 @@ pub(super) fn build_db_rows(
                     file_id: uploaded.file_id,
                     bot_index: uploaded.bot_index,
                     file_size: uploaded.file_size as i64,
+                    encryption_nonce: uploaded.encryption_nonce,
                 });
             }
         } else {
@@ -904,6 +914,7 @@ pub(super) fn build_db_rows(
                 file_size: uploaded.file_size as i64,
                 duration,
                 is_split: false,
+                encryption_nonce: uploaded.encryption_nonce,
             });
         }
     }
@@ -916,6 +927,7 @@ pub(super) fn build_db_rows(
             bot_index,
             file_size,
             is_split: true,
+            encryption_nonce: None,
         });
     }
 

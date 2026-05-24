@@ -1,6 +1,7 @@
 mod api;
 mod cloudflared;
 mod config;
+mod crypto;
 mod db;
 mod env_writer;
 mod media;

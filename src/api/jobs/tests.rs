@@ -96,24 +96,28 @@ fn build_db_rows_registers_uploaded_outputs() {
             file_id: "file-init".into(),
             bot_index: 0,
             file_size: 10,
+            encryption_nonce: None,
         },
         telegram::UploadedFile {
             segment_key: "video_0/video_0001.m4s".into(),
             file_id: "file-video".into(),
             bot_index: 1,
             file_size: 20,
+            encryption_nonce: None,
         },
         telegram::UploadedFile {
             segment_key: "audio_0/audio_0001.ts".into(),
             file_id: "file-audio".into(),
             bot_index: 0,
             file_size: 30,
+            encryption_nonce: None,
         },
         telegram::UploadedFile {
             segment_key: "thumbnail/thumbnail.jpg".into(),
             file_id: "file-thumb".into(),
             bot_index: 1,
             file_size: 40,
+            encryption_nonce: None,
         },
     ];
 
@@ -198,12 +202,14 @@ fn build_db_rows_keeps_split_segment_parent_for_playlists() {
             file_id: "file-part-0".into(),
             bot_index: 2,
             file_size: 20,
+            encryption_nonce: Some("nonce-0".into()),
         },
         telegram::UploadedFile {
             segment_key: "video_0/video_0001.m4s/part_1".into(),
             file_id: "file-part-1".into(),
             bot_index: 3,
             file_size: 30,
+            encryption_nonce: Some("nonce-1".into()),
         },
     ];
 
@@ -211,6 +217,14 @@ fn build_db_rows_keeps_split_segment_parent_for_playlists() {
         processing::build_db_rows(&request, &analysis, &result, uploads);
 
     assert_eq!(segment_parts.len(), 2);
+    assert_eq!(
+        segment_parts[0].encryption_nonce.as_deref(),
+        Some("nonce-0")
+    );
+    assert_eq!(
+        segment_parts[1].encryption_nonce.as_deref(),
+        Some("nonce-1")
+    );
     assert!(segments.iter().any(|s| {
         s.segment_key == "video_0/video_0001.m4s"
             && s.is_split
@@ -258,6 +272,33 @@ async fn collect_upload_files_includes_media_and_skips_playlists() {
             "video_0/video_0001.m4s".to_string()
         ]
     );
+    let _ = tokio::fs::remove_dir_all(base).await;
+}
+
+#[tokio::test]
+async fn encrypted_prepare_upload_files_reserves_aead_tag_space() {
+    let base = std::env::temp_dir().join(format!(
+        "thls_job_encrypt_parts_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    tokio::fs::create_dir_all(base.join("video_0"))
+        .await
+        .unwrap();
+    tokio::fs::write(base.join("video_0/video_0001.m4s"), b"0123456789")
+        .await
+        .unwrap();
+
+    let files = processing::prepare_upload_files(&base, 20, true)
+        .await
+        .unwrap();
+    assert!(files.len() > 1);
+    assert!(files.iter().all(|(key, path)| {
+        key.starts_with("video_0/video_0001.m4s/part_")
+            && std::fs::metadata(path).unwrap().len() <= 4
+    }));
     let _ = tokio::fs::remove_dir_all(base).await;
 }
 

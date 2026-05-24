@@ -8,6 +8,7 @@ Start here before editing code under `src/`. This file is the top-level map; the
 |---|---|---|
 | `main.rs` | file | Entry point: loads config, initializes SQLite, builds `AppState`, starts the Axum server. |
 | `config.rs` | file | Effective runtime config loaded from DB settings plus env-var overrides. |
+| `crypto.rs` | file | Env-key parsing plus AEAD encrypt/decrypt helpers for Telegram-bound payloads. |
 | `settings_registry.rs` | file | Setting key definitions, defaults, validation rules, and public-key allowlist. |
 | `telegram.rs` | file | Telegram Bot API client/runtime: upload, download, bot pool management, metrics, retry behavior. |
 | `api/` | dir | HTTP layer: router, handlers, upload flow, job processing, segment serving, pages. See `src/api/guide.md`. |
@@ -18,13 +19,14 @@ Start here before editing code under `src/`. This file is the top-level map; the
 
 ```text
 main.rs
-  └─ api/ ──► {config, db, media, telegram}
-       ├─ jobs/ ──► {db, media, telegram}
-       └─ playback/ ──► {db, telegram, media helpers}
+  └─ api/ ──► {config, crypto, db, media, telegram}
+       ├─ jobs/ ──► {crypto, db, media, telegram}
+       └─ playback/ ──► {crypto, db, telegram, media helpers}
 
 db/ ──► {rusqlite, settings_registry}
 media/ ──► config
 telegram.rs ──► reqwest
+crypto.rs ──► ring
 ```
 
 Keep this direction acyclic. `api` orchestrates application flows; `db`, `media`, and `telegram` stay focused support modules.
@@ -41,6 +43,7 @@ Keep this direction acyclic. `api` orchestrates application flows; `db`, `media`
 | SQLite schema/query/export behavior | `db/`. Do not write SQL in unrelated modules unless it is a test setup. |
 | FFprobe/FFmpeg media processing | `media/`. Do not put HTTP, DB, or Telegram logic here. |
 | Telegram Bot API behavior | `telegram.rs`. |
+| Telegram payload encryption/decryption primitives | `crypto.rs`; orchestration stays in API/job/db-transfer code. |
 | Runtime setting key/default/validation | `settings_registry.rs` and, if needed, `config.rs`. |
 
 ## What does not belong here

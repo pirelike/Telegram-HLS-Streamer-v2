@@ -78,7 +78,7 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
     }
 
     // Normal segment (no parts)
-    let (file_id, bot_index) = {
+    let (file_id, bot_index, encryption_nonce) = {
         let conn = match state.db_conn().await {
             Ok(conn) => conn,
             Err(e) => return db_unavailable(e),
@@ -90,7 +90,7 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
         })
         .await
         {
-            Ok(Ok(Some(s))) => (s.file_id, s.bot_index),
+            Ok(Ok(Some(s))) => (s.file_id, s.bot_index, s.encryption_nonce),
             Ok(Ok(None)) => {
                 return api_error(StatusCode::NOT_FOUND, "not_found", "segment not found");
             }
@@ -103,9 +103,16 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
         }
     };
 
-    if key.ends_with(".vtt") {
+    if key.ends_with(".vtt") || encryption_nonce.is_some() {
         return match fetch_real_with_singleflight(
-            &state, &cfg, &cache_key, &file_id, bot_index, &key,
+            &state,
+            &cfg,
+            &cache_key,
+            &job_id,
+            &file_id,
+            bot_index,
+            &key,
+            encryption_nonce.as_deref(),
         )
         .await
         {
@@ -157,12 +164,15 @@ pub async fn serve_real_segment(state: Arc<AppState>, job_id: String, key: Strin
     {
         Ok(r) => r,
         Err(fetch_err) => {
-            match try_re_upload_and_retry(
-                &state, &cfg, &job_id, &key, &file_id, bot_index, &fetch_err,
-            )
-            .await
+            match reupload_from_cache_or_source(&state, &cfg, &job_id, &key, bot_index, &fetch_err)
+                .await
             {
-                Some(Ok(r)) => r,
+                Some(Ok(entry)) => {
+                    finish_inflight(&state, &cache_key, inflight, &Ok(entry.clone())).await;
+                    mark_segment_played_and_cleanup(&state, &job_id, &key).await;
+                    spawn_prefetch_real(state, job_id, key);
+                    return super::cache_response(entry);
+                }
                 Some(Err(recover_err)) => {
                     finish_inflight(
                         &state,
@@ -479,9 +489,9 @@ async fn bytes_for_re_upload(
     job_id: &str,
     key: &str,
     cache_key: &str,
-) -> Result<Arc<Vec<u8>>> {
-    if let Some(bytes) = state.cache.get_bytes(cache_key).await {
-        return Ok(bytes);
+) -> Result<CacheEntry> {
+    if let Some(entry) = state.cache.get(cache_key).await {
+        return Ok(entry);
     }
 
     let Some(bytes) = extract_recovery_segment_from_source(state, cfg, job_id, key).await? else {
@@ -502,7 +512,7 @@ async fn bytes_for_re_upload(
             Some((cfg.segment_cache_size_mb as u64) * 1024 * 1024),
         )
         .await;
-    Ok(entry.bytes)
+    Ok(entry)
 }
 
 async fn extract_recovery_segment_from_source(
@@ -592,13 +602,19 @@ fn recovery_segment_path(key: &str) -> Option<PathBuf> {
     }
 }
 
+pub(super) fn segment_part_aad(segment_key: &str, part_index: i64) -> String {
+    format!("{segment_key}/part_{part_index}")
+}
+
 pub(super) async fn fetch_real_with_singleflight(
     state: &Arc<AppState>,
     cfg: &Config,
     cache_key: &str,
+    job_id: &str,
     file_id: &str,
     bot_index: i64,
     key: &str,
+    encryption_nonce: Option<&str>,
 ) -> Result<CacheEntry> {
     let (inflight, is_leader) = claim_inflight(state, cache_key).await;
     if !is_leader {
@@ -614,7 +630,17 @@ pub(super) async fn fetch_real_with_singleflight(
             Err(e) => bail!(e),
         }
     }
-    let result = real_fetch_into_cache(state, cfg, cache_key, file_id, bot_index, key).await;
+    let result = real_fetch_into_cache(
+        state,
+        cfg,
+        cache_key,
+        job_id,
+        file_id,
+        bot_index,
+        key,
+        encryption_nonce,
+    )
+    .await;
     finish_inflight(state, cache_key, inflight, &result).await;
     result
 }
@@ -623,11 +649,13 @@ async fn real_fetch_into_cache(
     state: &AppState,
     cfg: &Config,
     cache_key: &str,
+    job_id: &str,
     file_id: &str,
     bot_index: i64,
     key: &str,
+    encryption_nonce: Option<&str>,
 ) -> Result<CacheEntry> {
-    let bytes = telegram::get_file_bytes(
+    let bytes = match telegram::get_file_bytes(
         &state.http,
         &state.telegram,
         &state.telegram_base_url,
@@ -636,7 +664,23 @@ async fn real_fetch_into_cache(
         bot_index,
     )
     .await
-    .with_context(|| format!("fetching {key} from Telegram"))?;
+    {
+        Ok(bytes) => bytes,
+        Err(fetch_err) => {
+            if let Some(recovered) =
+                reupload_from_cache_or_source(state, cfg, job_id, key, bot_index, &fetch_err).await
+            {
+                return recovered;
+            }
+            return Err(fetch_err).with_context(|| format!("fetching {key} from Telegram"));
+        }
+    };
+    let bytes = crate::crypto::decrypt_optional(
+        cfg.telegram_encryption_key.as_ref(),
+        encryption_nonce,
+        key,
+        bytes,
+    )?;
     let entry = super::cache_entry_for_bytes(cfg, cache_key, key, bytes).await?;
     state
         .cache
@@ -688,6 +732,7 @@ async fn reconstructed_fetch_into_cache(
         let state = state.clone();
         let bots = bots.clone();
         let key = key.to_string();
+        let encryption_key = cfg.telegram_encryption_key.clone();
         tasks.spawn(async move {
             let bytes = telegram::get_file_bytes(
                 &state.http,
@@ -699,6 +744,13 @@ async fn reconstructed_fetch_into_cache(
             )
             .await
             .with_context(|| format!("fetching part {i} of {key}"))?;
+            let aad = segment_part_aad(&key, part.part_index);
+            let bytes = crate::crypto::decrypt_optional(
+                encryption_key.as_ref(),
+                part.encryption_nonce.as_deref(),
+                &aad,
+                bytes,
+            )?;
             Ok::<_, anyhow::Error>((i, bytes))
         });
     }
@@ -726,32 +778,30 @@ async fn reconstructed_fetch_into_cache(
     Ok(entry)
 }
 
-async fn try_re_upload_and_retry(
-    state: &Arc<AppState>,
+async fn reupload_from_cache_or_source(
+    state: &AppState,
     cfg: &Config,
     job_id: &str,
     key: &str,
-    stale_file_id: &str,
     stale_bot_index: i64,
     fetch_err: &anyhow::Error,
-) -> Option<Result<reqwest::Response>> {
+) -> Option<Result<CacheEntry>> {
     if !telegram_error_suggests_stale_file_id(fetch_err) {
         tracing::debug!(job_id, key, error = %fetch_err, "not a permanent Telegram error, skipping recovery");
         return None;
     }
 
     let cache_key = format!("{job_id}/{key}");
-    let cached_bytes = match bytes_for_re_upload(state, cfg, job_id, key, &cache_key).await {
-        Ok(bytes) => bytes,
+    let entry = match bytes_for_re_upload(state, cfg, job_id, key, &cache_key).await {
+        Ok(entry) => entry,
         Err(e) => return Some(Err(e)),
     };
 
     tracing::warn!(
         job_id,
         key,
-        stale_file_id,
         stale_bot_index,
-        bytes = cached_bytes.len(),
+        bytes = entry.bytes.len(),
         "attempting segment re-upload recovery"
     );
 
@@ -768,7 +818,7 @@ async fn try_re_upload_and_retry(
         let tmp_path = state
             .processing_dir
             .join(format!("reupload_{}", uuid::Uuid::new_v4().simple()));
-        if let Err(e) = tokio::fs::write(&tmp_path, cached_bytes.as_slice()).await {
+        if let Err(e) = tokio::fs::write(&tmp_path, entry.bytes.as_slice()).await {
             tracing::warn!(error = %e, "failed to write temp file for re-upload");
             continue;
         }
@@ -782,6 +832,7 @@ async fn try_re_upload_and_retry(
             *bot_idx,
             &tmp_path,
             segment_key_for_upload.to_string(),
+            cfg.telegram_encryption_key.as_ref(),
             // User-configurable; raise if Telegram increases Bot API limits.
             cfg.telegram_max_file_size,
         )
@@ -804,18 +855,10 @@ async fn try_re_upload_and_retry(
                         key,
                         &uploaded.file_id,
                         uploaded.bot_index,
+                        uploaded.encryption_nonce.as_deref(),
                     );
                 }
-                let retry_resp = telegram::get_file_response(
-                    &state.http,
-                    &state.telegram,
-                    &state.telegram_base_url,
-                    bots,
-                    &uploaded.file_id,
-                    uploaded.bot_index,
-                )
-                .await;
-                return Some(retry_resp);
+                return Some(Ok(entry));
             }
             Err(e) => {
                 tracing::warn!(
@@ -915,9 +958,11 @@ pub(super) fn spawn_prefetch_real(state: Arc<AppState>, job_id: String, key: Str
                     &state,
                     &cfg,
                     &cache_key,
+                    &job_id,
                     &next.file_id,
                     next.bot_index,
                     &next.segment_key,
+                    next.encryption_nonce.as_deref(),
                 )
                 .await
             };
@@ -1001,9 +1046,11 @@ pub(crate) fn spawn_cache_warmup(state: Arc<AppState>, job_id: String) {
                     &state,
                     &cfg,
                     &cache_key,
+                    &job_id,
                     &seg.file_id,
                     seg.bot_index,
                     &seg.segment_key,
+                    seg.encryption_nonce.as_deref(),
                 )
                 .await
             };

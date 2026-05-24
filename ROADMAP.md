@@ -147,28 +147,28 @@ Priorities: bug > guard > perf > feature.
 
 ## P3 — Data Model
 
-- [ ] **DB export/import loses split segment parts**
+- [x] **DB export/import loses split segment parts**
   `src/db/models.rs:247-253` defines `DbExport` with only jobs/tracks/segments; `src/db/transfer.rs:16-42` never exports `segment_parts`, and `src/db/transfer.rs:125-135` never imports them. Imported split segments keep `is_split=true` but lose all part `file_id`s, breaking playback/download. Include `segment_parts` in export/import and add a round-trip test.
 
-- [ ] **Segment prefix lookup uses unescaped SQL `LIKE`**
+- [x] **Segment prefix lookup uses unescaped SQL `LIKE`**
   `src/db/queries.rs:337-348` builds `LIKE "{prefix}/%"`, so `_` and `%` in prefixes match unrelated rows. Migration 18 added exact `prefix` columns; use `WHERE prefix = ?` or escape LIKE wildcards. Add a test with `video_0` and `videoA0`.
 
-- [ ] **Legacy rev-18 detection can miss `segment_parts` columns**
+- [x] **Legacy rev-18 detection can miss `segment_parts` columns**
   `src/db/migrations.rs:471-478` marks a legacy DB as revision 18 when `tracks`, `jobs`, and `segments` rev-18 columns exist, but does not require `segment_parts.prefix/name`. Bootstrapping can stamp a partially migrated DB as current, then later `save_job()` fails on split-part inserts. Require all rev-18 columns in detection.
 
-- [ ] **`count_series_groups`/`count_season_groups` WHERE contradiction produces wrong pagination counts**
+- [x] **`count_series_groups`/`count_season_groups` WHERE contradiction produces wrong pagination counts**
   `src/db/queries.rs:452,522` — Tracked above under P2 (reliability impact); also a data-model invariant violation since the filter logic is part of the query contract.
 
-- [ ] **`output_audio_channels` exact-string match misses `"5.1(side)"` surround layout**
+- [x] **`output_audio_channels` exact-string match misses `"5.1(side)"` surround layout**
   `src/media/process.rs:1001-1010` — FFprobe often reports 5.1 surround as `"5.1(side)"`. The guard `layout == "5.1"` is an exact match; `"5.1(side)"` falls through to the 2-channel stereo downmix, silently discarding surround audio. Match on `layout.starts_with("5.1")` and `layout.starts_with("3.1")`, or check `audio.channels == 6` / `== 4` directly.
 
-- [ ] **`select_video_tiers_with` ignores `cfg.abr_enabled`**
+- [x] **`select_video_tiers_with` ignores `cfg.abr_enabled`**
   `src/media/tiers.rs:60` — `select_video_tiers` gates multi-tier ABR on `cfg.abr_enabled && !cfg.virtual_abr_tiers`. `select_video_tiers_with` (the per-job override variant) checks only `!cfg.virtual_abr_tiers`, ignoring `abr_enabled`. A job submitted with an explicit `abr_tiers_override` on a system with `abr_enabled = false` will silently encode multiple tiers against the operator's intent. Gate on `cfg.abr_enabled` in `select_video_tiers_with` as well, or document the override as intentionally bypassing the global toggle.
 
-- [ ] **`X-TIMESTAMP-MAP` injection silently skipped for WebVTT files with non-standard header**
+- [x] **`X-TIMESTAMP-MAP` injection silently skipped for WebVTT files with non-standard header**
   `src/api/playback/mod.rs:187-197` — Injection only triggers on bytes starting exactly with `b"WEBVTT\r\n"` or `b"WEBVTT\n"`. A WebVTT file with a BOM, or a header like `WEBVTT NOTE something\n` (valid per spec), silently skips injection. HLS players receive no `X-TIMESTAMP-MAP` and subtitle sync drifts. Match on `starts_with(b"WEBVTT")` and find the first newline rather than requiring an exact header terminator.
 
-- [ ] **`double_bitrate` silently misparses multi-character unit suffixes**
+- [x] **`double_bitrate` silently misparses multi-character unit suffixes**
   `src/media/process.rs:1048-1079` — The function checks only `last_char.is_ascii_alphabetic()` and takes one character as the unit suffix. Input like `"128kbps"` has last char `'s'`; `"128kbp"` fails to parse as `f64`, so the function returns the original string unchanged. The returned value is passed to FFmpeg which rejects it. In the current call-graph `double_bitrate` receives only `"Nk"` and `"Nk"` format strings, so this is not triggered today, but the function is incorrect and silently wrong for any multi-char suffix. Apply the same suffix-stripping logic used in `bitrate_bits`.
 
 ---

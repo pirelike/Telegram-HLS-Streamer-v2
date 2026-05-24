@@ -113,6 +113,8 @@ pub struct SegmentRow {
     pub duration: Option<f64>,
     #[serde(default)]
     pub is_split: bool,
+    #[serde(default)]
+    pub encryption_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,6 +126,8 @@ pub struct NewSegment {
     pub duration: Option<f64>,
     #[serde(default)]
     pub is_split: bool,
+    #[serde(default)]
+    pub encryption_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,6 +136,8 @@ pub struct SegmentLookup {
     pub bot_index: i64,
     #[serde(default)]
     pub is_split: bool,
+    #[serde(default)]
+    pub encryption_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,6 +149,8 @@ pub struct SegmentPartRow {
     pub file_id: String,
     pub bot_index: i64,
     pub file_size: i64,
+    #[serde(default)]
+    pub encryption_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -153,6 +161,8 @@ pub struct NewSegmentPart {
     pub file_id: String,
     pub bot_index: i64,
     pub file_size: i64,
+    #[serde(default)]
+    pub encryption_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -160,6 +170,9 @@ pub struct SegmentPartLookup {
     pub file_id: String,
     pub bot_index: i64,
     pub file_size: i64,
+    pub part_index: i64,
+    #[serde(default)]
+    pub encryption_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -171,6 +184,8 @@ pub struct SegmentPartExportRow {
     pub file_id: String,
     pub bot_index: i64,
     pub file_size: i64,
+    #[serde(default)]
+    pub encryption_nonce: Option<String>,
 }
 
 fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
@@ -314,9 +329,9 @@ pub struct DbSyncSnapshotRow {
 pub(super) const JOB_SELECT_SQL: &str = "SELECT job_id, filename, duration, file_size, video_codec, video_width, video_height, status, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number, error, source_path, episode_title FROM jobs";
 pub(super) const TRACK_SELECT_SQL: &str = "SELECT id, job_id, track_type, track_index, codec, language, title, channels, width, height, bitrate, original_stream_index FROM tracks";
 pub(super) const SEGMENT_SELECT_SQL: &str =
-    "SELECT id, job_id, segment_key, file_id, bot_index, file_size, duration, is_split FROM segments";
+    "SELECT id, job_id, segment_key, file_id, bot_index, file_size, duration, is_split, encryption_nonce FROM segments";
 pub(super) const SEGMENT_PART_SELECT_SQL: &str =
-    "SELECT id, job_id, segment_key, part_index, file_id, bot_index, file_size FROM segment_parts";
+    "SELECT id, job_id, segment_key, part_index, file_id, bot_index, file_size, encryption_nonce FROM segment_parts";
 
 // --- Row mappers ---
 
@@ -371,6 +386,7 @@ pub(super) fn segment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Segm
         file_size: row.get(5)?,
         duration: row.get(6)?,
         is_split: row.get::<_, i64>(7)? == 1,
+        encryption_nonce: row.get(8)?,
     })
 }
 
@@ -385,6 +401,7 @@ pub(super) fn segment_part_export_from_row(
         file_id: row.get(4)?,
         bot_index: row.get(5)?,
         file_size: row.get(6)?,
+        encryption_nonce: row.get(7)?,
     })
 }
 

@@ -5,6 +5,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::crypto::EncryptionKey;
 use crate::db;
 use crate::settings_registry;
 
@@ -84,6 +85,7 @@ pub struct Config {
     pub watch_ignore_suffixes: Vec<String>,
 
     pub bots: Vec<BotConfig>,
+    pub telegram_encryption_key: Option<EncryptionKey>,
     pub upload_parallelism: u32,
     pub db_sync_enabled: bool,
     pub db_sync_bootstrap: String,
@@ -166,6 +168,7 @@ impl Default for Config {
                 ".partial".into(),
             ],
             bots: Vec::new(),
+            telegram_encryption_key: None,
             upload_parallelism: 12,
             db_sync_enabled: true,
             db_sync_bootstrap: String::new(),
@@ -203,6 +206,7 @@ impl Config {
         }
 
         cfg.bots = build_bot_pool(conn)?;
+        cfg.telegram_encryption_key = load_telegram_encryption_key()?;
 
         enforce_invariants(&mut cfg);
 
@@ -330,6 +334,17 @@ pub fn env_or_default_value(key: &str) -> Option<String> {
             Some(default)
         }
     }
+}
+
+fn load_telegram_encryption_key() -> Result<Option<EncryptionKey>> {
+    let Ok(raw) = std::env::var("TELEGRAM_ENCRYPTION_KEY") else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    EncryptionKey::from_hex(raw).map(Some)
 }
 
 pub fn effective_setting_values(conn: &Connection) -> Result<BTreeMap<&'static str, String>> {

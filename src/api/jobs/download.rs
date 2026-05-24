@@ -294,6 +294,8 @@ struct ReconstructDownload {
     bot_index: i64,
     offset: u64,
     expected_size: u64,
+    encryption_nonce: Option<String>,
+    aad: String,
 }
 
 async fn reconstruct_downloads(
@@ -324,6 +326,8 @@ async fn reconstruct_downloads(
                         bot_index: part.bot_index,
                         offset,
                         expected_size,
+                        encryption_nonce: part.encryption_nonce,
+                        aad: segment_part_aad(&segment.segment_key, part.part_index),
                     });
                     offset = offset
                         .checked_add(expected_size)
@@ -338,6 +342,8 @@ async fn reconstruct_downloads(
                     bot_index: segment.bot_index,
                     offset,
                     expected_size,
+                    encryption_nonce: segment.encryption_nonce.clone(),
+                    aad: segment.segment_key.clone(),
                 });
                 offset = offset
                     .checked_add(expected_size)
@@ -349,6 +355,10 @@ async fn reconstruct_downloads(
     .await?
 }
 
+fn segment_part_aad(segment_key: &str, part_index: i64) -> String {
+    format!("{segment_key}/part_{part_index}")
+}
+
 async fn stream_download_to_path_at(
     state: Arc<AppState>,
     bots: Arc<Vec<BotConfig>>,
@@ -356,6 +366,50 @@ async fn stream_download_to_path_at(
     item: ReconstructDownload,
 ) -> Result<()> {
     let started = std::time::Instant::now();
+    if item.encryption_nonce.is_some() {
+        let cfg = state.config.read().await.clone();
+        let bytes = telegram::get_file_bytes(
+            &state.http,
+            &state.telegram,
+            &state.telegram_base_url,
+            &bots,
+            &item.file_id,
+            item.bot_index,
+        )
+        .await
+        .with_context(|| format!("fetching {}", item.label))?;
+        let bytes = crate::crypto::decrypt_optional(
+            cfg.telegram_encryption_key.as_ref(),
+            item.encryption_nonce.as_deref(),
+            &item.aad,
+            bytes,
+        )
+        .with_context(|| format!("decrypting {}", item.label))?;
+        if bytes.len() as u64 != item.expected_size {
+            bail!(
+                "download_size_mismatch: {} expected={} wrote={}",
+                item.label,
+                item.expected_size,
+                bytes.len()
+            );
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("open {}", path.display()))?;
+        file.seek(SeekFrom::Start(item.offset))
+            .await
+            .with_context(|| format!("seek {}", path.display()))?;
+        file.write_all(&bytes)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("flush {}", path.display()))?;
+        return Ok(());
+    }
+
     let resp = telegram::get_file_response(
         &state.http,
         &state.telegram,

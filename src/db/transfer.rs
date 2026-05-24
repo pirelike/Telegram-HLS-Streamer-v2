@@ -196,9 +196,9 @@ pub fn merge_from_export(
         };
         let (prefix, name) = split_segment_key(&segment.segment_key);
         merged_segments += tx.execute(
-            "INSERT OR IGNORE INTO segments(job_id, segment_key, file_id, bot_index, file_size, duration, is_split, prefix, name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![segment.job_id, segment.segment_key, segment.file_id, *bot_index, segment.file_size, segment.duration, bool_to_i64(segment.is_split), prefix, name],
+            "INSERT OR IGNORE INTO segments(job_id, segment_key, file_id, bot_index, file_size, duration, is_split, prefix, name, encryption_nonce)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![segment.job_id, segment.segment_key, segment.file_id, *bot_index, segment.file_size, segment.duration, bool_to_i64(segment.is_split), prefix, name, segment.encryption_nonce],
         )?;
     }
     for part in &export.segment_parts {
@@ -208,8 +208,8 @@ pub fn merge_from_export(
         let (prefix, name) = split_segment_key(&part.segment_key);
         merged_segment_parts += tx.execute(
             "INSERT OR IGNORE INTO segment_parts(
-                job_id, segment_key, part_index, file_id, bot_index, file_size, prefix, name
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                job_id, segment_key, part_index, file_id, bot_index, file_size, prefix, name, encryption_nonce
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 part.job_id,
                 part.segment_key,
@@ -218,7 +218,8 @@ pub fn merge_from_export(
                 *bot_index,
                 part.file_size,
                 prefix,
-                name
+                name,
+                part.encryption_nonce
             ],
         )?;
     }

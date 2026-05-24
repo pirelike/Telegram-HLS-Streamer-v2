@@ -634,6 +634,7 @@ mod tests {
             file_size: 1000,
             duration,
             is_split: false,
+            encryption_nonce: None,
         }
     }
 

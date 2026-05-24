@@ -20,6 +20,7 @@ fn segment_row(key: &str) -> SegmentRow {
         file_size: 1,
         duration: Some(4.0),
         is_split: false,
+        encryption_nonce: None,
     }
 }
 
