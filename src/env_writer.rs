@@ -4,11 +4,21 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 static WRITE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
+fn contains_control_chars(value: &str) -> bool {
+    value.chars().any(|c| c == '\n' || c == '\r' || c == '\0')
+}
+
 pub fn write_env_values(env_path: &Path, env_map: &HashMap<&str, String>) -> Result<()> {
+    for (key, value) in env_map {
+        if contains_control_chars(value) {
+            bail!("setting {} contains control characters", key);
+        }
+    }
+
     let mutex = WRITE_MUTEX.get_or_init(|| Mutex::new(()));
     let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -73,6 +83,51 @@ pub fn write_env_values(env_path: &Path, env_map: &HashMap<&str, String>) -> Res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn rejects_newline_in_value() {
+        let mut map = HashMap::new();
+        map.insert("TEST_KEY", "value\nINJECTED=key".to_string());
+        let result = write_env_values(std::path::Path::new("/dev/null"), &map);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("control characters"), "error: {err}");
+    }
+
+    #[test]
+    fn rejects_carriage_return_in_value() {
+        let mut map = HashMap::new();
+        map.insert("TEST_KEY", "value\rINJECTED".to_string());
+        let result = write_env_values(std::path::Path::new("/dev/null"), &map);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_null_byte_in_value() {
+        let mut map = HashMap::new();
+        map.insert("TEST_KEY", "value\0injected".to_string());
+        let result = write_env_values(std::path::Path::new("/dev/null"), &map);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_clean_value() {
+        let mut map = HashMap::new();
+        map.insert("TEST_KEY", "normal_value".to_string());
+        // Use a temp dir to avoid writing to real .env
+        let dir = std::env::temp_dir().join(format!("thls_env_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join(".env.test");
+        let result = write_env_values(&path, &map);
+        assert!(result.is_ok(), "should accept clean value: {:?}", result);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 fn find_inline_comment(rest: &str) -> String {

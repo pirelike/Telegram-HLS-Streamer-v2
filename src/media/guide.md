@@ -6,13 +6,17 @@ FFprobe/FFmpeg-based media analysis and HLS processing. This module turns an inp
 
 | File | Responsibility | ~Lines |
 |---|---|---|
-| `mod.rs` | Module root, public re-exports, media tests. | 314 |
-| `models.rs` | `MediaAnalysis`, stream structs, `ProcessingResult`, playlist descriptors, tier/encoder structs. | 98 |
-| `analysis.rs` | FFprobe invocation and JSON output parsing. | 108 |
+| `mod.rs` | Module root, public re-exports, media tests. | 448 |
+| `models.rs` | `MediaAnalysis`, stream structs, `ProcessingResult`, playlist descriptors, tier/encoder structs. | 101 |
+| `analysis.rs` | FFprobe invocation and JSON output parsing. | 116 |
 | `tiers.rs` | ABR tier parsing and source-aware tier selection. | 113 |
-| `encoder.rs` | Encoder selection/probing, hardware-device args, video filter construction. | 113 |
-| `process.rs` | Core FFmpeg pipeline for video/audio/subtitle/thumbnail outputs and segment-duration collection. | 769 |
-| `markers.rs` | Intro/outro marker detection: chapter parsing and Chromaprint fingerprint comparison. | 200 |
+| `encoder.rs` | Encoder selection/probing, hardware-device args, video filter construction. | 120 |
+| `process.rs` | `process_media()` orchestrator, segment-duration doctrine, subtitle extraction, shared small helpers. | 372 |
+| `process_video.rs` | Video tier encode/remux and oversized segment repair helpers. | 463 |
+| `process_audio.rs` | Audio encode/copy path and audio bitrate/channel helpers. | 178 |
+| `ffmpeg.rs` | Cancellation-aware FFmpeg process runner and encode semaphore helper. | 145 |
+| `process_probe.rs` | Thumbnail extraction, segment duration collection, playlist duration parsing, and duration probe helpers. | 157 |
+| `markers.rs` | Intro/outro marker detection: chapter parsing and Chromaprint fingerprint comparison. | 629 |
 
 ## Public API surface
 
@@ -63,7 +67,8 @@ media/ ──► config
 | Parse new FFprobe fields | `analysis.rs` and `models.rs`. |
 | Change ABR tier selection | `tiers.rs`. |
 | Add/change encoder probing or filter args | `encoder.rs`. |
-| Change video/audio/subtitle output commands | `process.rs`. |
-| Change thumbnail behavior | `process.rs`. |
+| Change video/subtitle output commands | `process.rs` and `process_video.rs`. |
+| Change audio output commands | `process_audio.rs`. |
+| Change thumbnail behavior | `process_probe.rs`. |
 | Add/change intro/outro detection | `markers.rs`. |
 | Change fingerprint matching | `markers.rs` and `src/db/`. |

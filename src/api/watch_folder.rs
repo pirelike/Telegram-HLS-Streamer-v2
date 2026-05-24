@@ -348,6 +348,78 @@ async fn claim_and_enqueue(
         Ok::<(PathBuf, PathBuf), anyhow::Error>((source, target))
     })
     .await??;
+
+    // Check if target already exists — protect against overwriting higher-quality files
+    let target_exists = tokio::task::spawn_blocking({
+        let target = target.clone();
+        move || target.exists()
+    })
+    .await?;
+
+    if target_exists {
+        // Run ffprobe on the new source to get its video bitrate
+        let source_path = source.clone();
+        let new_analysis = crate::media::analyze_media(&source_path).await;
+        let new_bitrate = match &new_analysis {
+            Ok(a) => a
+                .video_streams
+                .first()
+                .map(|v| v.bit_rate.trim().parse::<i64>().unwrap_or(0))
+                .unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to probe watch file; refusing to overwrite existing done file");
+                anyhow::bail!(
+                    "watch file '{}' already exists and new file probe failed; refusing to overwrite",
+                    target.display()
+                );
+            }
+        };
+
+        // Look up the existing job's source bitrate from DB
+        let conn = state.db_conn().await?;
+        let filename_for_db = target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("watch-file")
+            .to_string();
+        let existing_bitrate =
+            crate::db::get_job_source_bitrate_by_filename(&conn, &filename_for_db)?;
+
+        match existing_bitrate {
+            None => {
+                anyhow::bail!(
+                    "watch file '{}' already exists and no previous job found in DB; refusing to overwrite",
+                    target.display()
+                );
+            }
+            Some(0) => {
+                anyhow::bail!(
+                    "watch file '{}' already exists and previous job has no bitrate data; refusing to overwrite",
+                    target.display()
+                );
+            }
+            Some(existing) if new_bitrate > existing => {
+                tracing::info!(
+                    filename = %filename_for_db,
+                    new_bitrate,
+                    existing_bitrate = existing,
+                    "watch file: new source has higher bitrate; overwriting existing done file"
+                );
+                // Remove old done file so rename can proceed
+                let target = target.clone();
+                tokio::task::spawn_blocking(move || std::fs::remove_file(&target)).await??;
+            }
+            Some(existing) => {
+                anyhow::bail!(
+                    "watch file '{}' already exists with equal or higher bitrate ({} >= {} bps); refusing to overwrite",
+                    target.display(),
+                    existing,
+                    new_bitrate
+                );
+            }
+        }
+    }
+
     let filename = target
         .file_name()
         .and_then(|s| s.to_str())

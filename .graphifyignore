@@ -1,0 +1,31 @@
+# Generated graph/tool state
+.understand-anything/
+.agents/
+.codex/
+.claude/
+.opencode/
+.antigravitycli/
+graphify-out/
+
+# Dependency/vendor output
+node_modules/
+static/shaka-player.ui.js
+skills/
+docs/
+
+# Runtime/build artifacts that should not become graph nodes
+target/
+uploads/
+processing/
+cache/
+streamer.db
+streamer.db-*
+TEST_FILE.mkv
+
+# Media and Python byproducts
+*.mkv
+*.mp4
+*.avi
+__pycache__/
+*.py[cod]
+*$py.class

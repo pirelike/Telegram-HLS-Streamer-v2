@@ -6,9 +6,15 @@ pub const NONCE_LEN: usize = 12;
 pub const KEY_LEN: usize = 32;
 pub const TAG_LEN: u64 = 16;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptionKey {
     bytes: [u8; KEY_LEN],
+}
+
+impl std::fmt::Debug for EncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EncryptionKey(***)")
+    }
 }
 
 impl EncryptionKey {

@@ -1188,7 +1188,17 @@ input, select, textarea { font: inherit; color: inherit; }
 
 /* small screen tweaks */
 @media (max-width: 900px) {
-  .t-tabs { display: none; }
+  .navbar-left { overflow: hidden; min-width: 0; }
+  .t-tabs {
+    display: flex;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    min-width: 0;
+  }
+  .t-tabs::-webkit-scrollbar { display: none; }
+  .t-tab { flex-shrink: 0; }
   .navbar { padding: 10px 16px; gap: 12px; }
   .search-bar, .search-trigger { min-width: 0; flex: 1; }
   .search-trigger-text { display: none; }

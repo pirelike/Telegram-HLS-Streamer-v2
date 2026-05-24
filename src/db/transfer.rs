@@ -7,12 +7,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection};
 
 use super::models::{
-    bool_to_i64, external_metadata_from_row, job_from_row, job_metadata_link_from_row,
-    media_fingerprint_from_row, media_marker_from_row, normalize_job_metadata,
-    playback_progress_from_row, segment_from_row, segment_part_export_from_row,
-    series_metadata_link_from_row, track_from_row, DatabaseBackupResult, DbExport,
-    ExternalMetadataRow, JobMetadataLinkRow, MediaFingerprintRow, MediaMarkerRow, MergeResult,
-    NewJob, PlaybackProgressRow, ReplaceDatabaseResult, SeriesMetadataLinkRow,
+    bool_to_i64, normalize_job_metadata, DatabaseBackupResult, DbExport, ExternalMetadataRow,
+    JobMetadataLinkRow, MediaFingerprintRow, MediaMarkerRow, MergeResult, NewJob,
+    PlaybackProgressRow, ReplaceDatabaseResult, SeriesMetadataLinkRow,
+};
+use super::row_mapping::{
+    external_metadata_from_row, job_from_row, job_metadata_link_from_row,
+    media_fingerprint_from_row, media_marker_from_row, playback_progress_from_row,
+    segment_from_row, segment_part_export_from_row, series_metadata_link_from_row, track_from_row,
     EXTERNAL_METADATA_SELECT_SQL, JOB_SELECT_SQL, SEGMENT_PART_SELECT_SQL, SEGMENT_SELECT_SQL,
     TRACK_SELECT_SQL,
 };
@@ -136,14 +138,15 @@ pub fn merge_from_export(
             episode_number: job.episode_number,
             part_number: job.part_number,
             source_path: job.source_path.clone(),
+            source_bitrate: job.source_bitrate,
         };
         normalize_job_metadata(&mut new_job);
         merged_jobs += tx.execute(
             "INSERT OR IGNORE INTO jobs(
                 job_id, filename, duration, file_size, video_codec, video_width, video_height, status,
                 error, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number,
-                source_path
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                source_path, source_bitrate
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 new_job.job_id,
                 new_job.filename,
@@ -163,6 +166,7 @@ pub fn merge_from_export(
                 new_job.episode_number,
                 new_job.part_number,
                 new_job.source_path,
+                new_job.source_bitrate,
             ],
         )?;
     }

@@ -2,6 +2,9 @@ mod download;
 mod handlers;
 mod json;
 pub(crate) mod processing;
+mod processing_lifecycle;
+mod processing_markers;
+mod processing_upload;
 mod types;
 
 pub(crate) use processing::{enqueue_existing_job, enqueue_job, start_background_tasks};

@@ -140,7 +140,7 @@ pub fn normalize_json(key: &str, value: &Value) -> Result<String, String> {
         }
         _ => return Err(format!("{key} has unsupported JSON value")),
     };
-    normalize_str(spec, &raw)
+    normalize_str_inner(spec, &raw, false)
 }
 
 pub fn normalize_str_for_key(key: &str, value: &str) -> Result<String, String> {
@@ -182,8 +182,16 @@ pub fn parse_list(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn normalize_str(spec: &SettingSpec, value: &str) -> Result<String, String> {
-    let value = strip_inline_comment(value);
+fn normalize_str_inner(
+    spec: &SettingSpec,
+    value: &str,
+    strip_comments: bool,
+) -> Result<String, String> {
+    let value = if strip_comments {
+        strip_inline_comment(value)
+    } else {
+        value.trim().to_string()
+    };
     let value = value.as_str();
     match spec.setting_type {
         SettingType::Int => normalize_int(spec, value),
@@ -192,6 +200,10 @@ fn normalize_str(spec: &SettingSpec, value: &str) -> Result<String, String> {
         SettingType::List => normalize_list(spec.key, value),
         SettingType::Tiers => normalize_tiers(value),
     }
+}
+
+fn normalize_str(spec: &SettingSpec, value: &str) -> Result<String, String> {
+    normalize_str_inner(spec, value, true)
 }
 
 fn strip_inline_comment(value: &str) -> String {
@@ -479,6 +491,25 @@ mod tests {
         assert_eq!(
             normalize_str_for_key("VAAPI_DEVICE", "/dev/dri/renderD129 # AMD").unwrap(),
             "/dev/dri/renderD129"
+        );
+    }
+
+    #[test]
+    fn json_api_preserves_hash_in_values() {
+        // JSON API path must not strip # from URL fragments
+        let url = "https://x.com/hook#frag";
+        assert_eq!(
+            normalize_json("WEBHOOK_URL", &Value::String(url.to_string())).unwrap(),
+            url
+        );
+    }
+
+    #[test]
+    fn env_path_strips_hash_comment() {
+        // env/DB path must still strip # comments
+        assert_eq!(
+            normalize_str_for_key("WEBHOOK_URL", "https://x.com/hook#frag").unwrap(),
+            "https://x.com/hook"
         );
     }
 }

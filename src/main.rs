@@ -246,18 +246,34 @@ fn cache_cleanup_allowed(cache_dir: &Path, uploads_dir: &Path, processing_dir: &
 }
 
 async fn probe_ffmpeg_tools(cfg: &config::Config) -> (bool, bool, media::SelectedEncoder) {
-    let ffmpeg_ok = tokio::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let ffprobe_ok = tokio::process::Command::new("ffprobe")
-        .arg("-version")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let ffmpeg_ok = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output.status.success(),
+        _ => {
+            tracing::warn!("ffmpeg -version probe timed out or failed after 10s");
+            false
+        }
+    };
+    let ffprobe_ok = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("ffprobe")
+            .arg("-version")
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output.status.success(),
+        _ => {
+            tracing::warn!("ffprobe -version probe timed out or failed after 10s");
+            false
+        }
+    };
 
     let encoder = media::select_encoder(cfg).await;
     let encoder_info = encoder.name.clone();
