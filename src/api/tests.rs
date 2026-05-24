@@ -64,6 +64,7 @@ fn app_state_with_telegram_base(telegram_base_url: String) -> Arc<AppState> {
         selected_encoder: RwLock::new(crate::media::cpu_encoder()),
         last_bot_index: std::sync::atomic::AtomicI64::new(0),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        ingest_download_semaphore: Arc::new(tokio::sync::Semaphore::new(5)),
     });
     start_background_tasks(state.clone(), job_receiver);
     state
@@ -427,6 +428,82 @@ async fn url_ingest_rejects_non_http_and_local_urls() {
 }
 
 #[tokio::test]
+async fn url_ingest_busy_does_not_create_job_marker() {
+    let state = app_state();
+    let mut permits = Vec::new();
+    for _ in 0..5 {
+        permits.push(
+            state
+                .ingest_download_semaphore
+                .clone()
+                .try_acquire_owned()
+                .unwrap(),
+        );
+    }
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/api/ingest/url")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"http://93.184.216.34/movie.mp4"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(state.jobs.lock().await.is_empty());
+
+    let conn = state.db_conn().await.unwrap();
+    let jobs = crate::db::list_jobs(
+        &conn,
+        &crate::db::JobListFilter {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(jobs.is_empty());
+
+    drop(permits);
+}
+
+#[tokio::test]
+async fn upload_rate_limit_counts_first_request() {
+    let state = app_state();
+    {
+        let mut cfg = state.config.read().await.as_ref().clone();
+        cfg.upload_rate_limit_max_requests = 2;
+        cfg.max_pending_uploads_per_ip = 10;
+        *state.config.write().await = Arc::new(cfg);
+    }
+
+    for i in 0..2 {
+        let body = format!(r#"{{"filename":"limited{i}.mp4","total_size":4}}"#);
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/api/upload/init")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = router(state)
+        .oneshot(
+            Request::post("/api/upload/init")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filename":"limited2.mp4","total_size":4}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn sixth_pending_upload_from_same_ip_is_rejected() {
     let state = app_state();
     for i in 0..5 {
@@ -763,8 +840,8 @@ async fn settings_update_does_not_reload_bot_pool() {
     assert_eq!(response.status(), StatusCode::OK);
     let cfg = state.config.read().await;
     assert_eq!(cfg.max_concurrent_jobs, 3);
-    // Settings update does not reload bot pool — count stays the same
-    assert_eq!(cfg.bots.len(), env_bot_count);
+    // Settings update reloads from DB — picks up any bot changes since last load
+    assert_eq!(cfg.bots.len(), env_bot_count + 1);
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ mod uploads;
 mod watch_folder;
 
 pub(crate) use jobs::start_background_tasks;
+pub(crate) use uploads::cleanup_orphaned_uploads;
 pub(crate) use watch_folder::load_watch_settings;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -85,6 +86,7 @@ pub struct AppState {
     pub selected_encoder: RwLock<media::SelectedEncoder>,
     pub last_bot_index: std::sync::atomic::AtomicI64,
     pub shutdown_token: CancellationToken,
+    pub ingest_download_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {

@@ -235,6 +235,7 @@ async fn job_dispatcher(state: Arc<AppState>, mut receiver: mpsc::Receiver<JobRe
     }
 }
 
+#[tracing::instrument(name = "job", skip_all, fields(job_id = %request.job_id))]
 async fn process_job(state: Arc<AppState>, request: JobRequest) {
     let processing_path = state.processing_dir.join(&request.job_id);
     let job_started = Instant::now();
@@ -460,9 +461,6 @@ async fn process_job(state: Arc<AppState>, request: JobRequest) {
             cleanup_request_paths(&request, &processing_path).await;
             return;
         }
-        state
-            .last_bot_index
-            .store(last_bot_index, std::sync::atomic::Ordering::Relaxed);
     }
     if job_cancelled(&state, &request.job_id).await {
         cleanup_request_paths(&request, &processing_path).await;
@@ -743,13 +741,32 @@ async fn assign_upload_bots(state: &AppState, file_count: usize) -> Result<Vec<(
     if cfg.bots.is_empty() {
         bail!("no Telegram bots configured");
     }
+
+    // Collect unhealthy bot indices
+    let unhealthy: HashSet<i64> = {
+        let mut set = HashSet::new();
+        for i in 0..cfg.bots.len() as i64 {
+            if !state.telegram.is_bot_healthy(i).await {
+                set.insert(i);
+            }
+        }
+        set
+    };
+    let all_unhealthy = unhealthy.len() == cfg.bots.len();
+
     let last = state
         .last_bot_index
-        .load(std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(file_count as i64, std::sync::atomic::Ordering::Relaxed);
     let mut assignments = Vec::with_capacity(file_count);
     let bot_count = cfg.bots.len() as i64;
     for offset in 0..file_count {
-        let index = (last + 1 + offset as i64).rem_euclid(bot_count);
+        let mut index = (last + 1 + offset as i64).rem_euclid(bot_count);
+        // Skip unhealthy bots unless all bots are unhealthy (avoid deadlock)
+        if !all_unhealthy {
+            while unhealthy.contains(&index) {
+                index = (index + 1).rem_euclid(bot_count);
+            }
+        }
         assignments.push((index, cfg.bots[index as usize].clone()));
     }
     Ok(assignments)

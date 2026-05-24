@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&uploads_dir)
         .await
         .context("creating uploads directory")?;
+    api::cleanup_orphaned_uploads(&uploads_dir).await;
     tokio::fs::create_dir_all(&processing_dir)
         .await
         .context("creating processing directory")?;
@@ -100,6 +101,7 @@ async fn main() -> Result<()> {
         selected_encoder: RwLock::new(selected_encoder),
         last_bot_index: std::sync::atomic::AtomicI64::new(last_bot_index),
         shutdown_token: shutdown_token.clone(),
+        ingest_download_semaphore: Arc::new(tokio::sync::Semaphore::new(5)),
     });
     api::db_transfer::bootstrap_db_sync_if_configured(state.clone()).await;
     api::start_background_tasks(state.clone(), job_receiver);

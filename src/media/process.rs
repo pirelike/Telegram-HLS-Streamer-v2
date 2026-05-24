@@ -15,6 +15,9 @@ use super::models::*;
 use super::tiers::{select_video_tiers_with, tier0_bitrate};
 use crate::config::Config;
 
+#[cfg(unix)]
+const SIGTERM_GRACE_SECS: u64 = 10;
+
 // ============================================================================
 // Per-job HLS segment duration — DO NOT REGRESS TO A GLOBAL SETTING
 // ============================================================================
@@ -305,6 +308,7 @@ pub async fn process_media(
                 .arg("webvtt")
                 .arg(&vtt_path),
             cancel,
+            cfg.job_timeout_seconds as u64,
         )
         .await
         .with_context(|| format!("extracting subtitle stream {}", sub.index))?;
@@ -324,7 +328,8 @@ pub async fn process_media(
         });
     }
 
-    let thumbnail_path = extract_thumbnail(analysis, output_dir).await;
+    let thumbnail_path =
+        extract_thumbnail(analysis, output_dir, cancel, cfg.job_timeout_seconds as u64).await;
     let segment_durations = collect_segment_durations(output_dir).await?;
     tracing::info!(
         job_id,
@@ -531,7 +536,7 @@ async fn encode_video_tier_ts(
         .arg("-hls_list_size")
         .arg("0")
         .arg(dir.join("playlist.m3u8"));
-    run_ffmpeg_cancellable(&mut cmd, cancel)
+    run_ffmpeg_cancellable(&mut cmd, cancel, cfg.job_timeout_seconds as u64)
         .await
         .with_context(|| format!("encoding video tier {}", tier.index))
 }
@@ -702,7 +707,7 @@ async fn repair_oversized_segment_max_bitrate(
         cmd.arg("-f").arg("mpegts");
     }
     cmd.arg(&tmp);
-    run_ffmpeg_cancellable(&mut cmd, cancel)
+    run_ffmpeg_cancellable(&mut cmd, cancel, cfg.job_timeout_seconds as u64)
         .await
         .with_context(|| {
             format!(
@@ -785,7 +790,7 @@ async fn remux_video_ts_to_fmp4(
         .arg("-hls_list_size")
         .arg("0")
         .arg(out_dir.join("playlist.m3u8"));
-    run_ffmpeg_cancellable(&mut cmd, cancel)
+    run_ffmpeg_cancellable(&mut cmd, cancel, cfg.job_timeout_seconds as u64)
         .await
         .context("remuxing repaired video TS sequence to fMP4 HLS")
 }
@@ -836,7 +841,7 @@ async fn encode_audio_track(
                 .arg("-hls_list_size")
                 .arg("0")
                 .arg(dir.join("playlist.m3u8"));
-            return run_ffmpeg_cancellable(&mut cmd, cancel)
+            return run_ffmpeg_cancellable(&mut cmd, cancel, cfg.job_timeout_seconds as u64)
                 .await
                 .with_context(|| format!("encoding audio stream {}", audio.index));
         }
@@ -874,20 +879,9 @@ async fn encode_audio_track(
         .arg("-hls_list_size")
         .arg("0")
         .arg(dir.join("playlist.m3u8"));
-    run_ffmpeg_cancellable(&mut cmd, cancel)
+    run_ffmpeg_cancellable(&mut cmd, cancel, cfg.job_timeout_seconds as u64)
         .await
         .with_context(|| format!("encoding audio stream {}", audio.index))
-}
-
-async fn run_ffmpeg(cmd: &mut Command) -> Result<()> {
-    let output = cmd.output().await.context("running ffmpeg")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    bail!(
-        "ffmpeg failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
 }
 
 async fn acquire_ffmpeg_permit(
@@ -907,7 +901,47 @@ async fn acquire_ffmpeg_permit(
     }
 }
 
-async fn run_ffmpeg_cancellable(cmd: &mut Command, cancel: &Arc<AtomicBool>) -> Result<()> {
+#[cfg(unix)]
+async fn graceful_kill(child: &mut tokio::process::Child) {
+    let pid = match child.id() {
+        Some(id) => id as i32,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return;
+        }
+    };
+    // Send SIGTERM first for graceful shutdown
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    // Wait up to SIGTERM_GRACE_SECS for the process to exit
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(SIGTERM_GRACE_SECS),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(_)) => return, // exited gracefully
+        _ => {
+            tracing::warn!(pid, "ffmpeg did not exit after SIGTERM; sending SIGKILL");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn graceful_kill(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn run_ffmpeg_cancellable(
+    cmd: &mut Command,
+    cancel: &Arc<AtomicBool>,
+    timeout_secs: u64,
+) -> Result<()> {
     tracing::debug!(cmd = ?cmd, "ffmpeg spawn");
     let started = Instant::now();
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
@@ -935,13 +969,23 @@ async fn run_ffmpeg_cancellable(cmd: &mut Command, cancel: &Arc<AtomicBool>) -> 
         })
     });
 
+    let timeout_secs = timeout_secs.max(1);
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+
     let exit_status = loop {
         tokio::select! {
             status = child.wait() => break status,
+            _ = &mut timeout => {
+                tracing::warn!("ffmpeg per-process timeout reached; sending SIGTERM");
+                graceful_kill(&mut child).await;
+                if let Some(h) = stderr_task { h.abort(); }
+                bail!("ffmpeg timed out after {} seconds", timeout_secs);
+            }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    tracing::warn!("ffmpeg cancelled; sending SIGTERM");
+                    graceful_kill(&mut child).await;
                     if let Some(h) = stderr_task { h.abort(); }
                     bail!("cancelled");
                 }
@@ -973,7 +1017,12 @@ async fn run_ffmpeg_cancellable(cmd: &mut Command, cancel: &Arc<AtomicBool>) -> 
     )
 }
 
-async fn extract_thumbnail(analysis: &MediaAnalysis, output_dir: &Path) -> Option<PathBuf> {
+async fn extract_thumbnail(
+    analysis: &MediaAnalysis,
+    output_dir: &Path,
+    cancel: &Arc<AtomicBool>,
+    timeout_secs: u64,
+) -> Option<PathBuf> {
     let dir = output_dir.join("thumbnail");
     if tokio::fs::create_dir_all(&dir).await.is_err() {
         return None;
@@ -982,6 +1031,7 @@ async fn extract_thumbnail(analysis: &MediaAnalysis, output_dir: &Path) -> Optio
     let seek = analysis.duration.mul_add(0.10, 0.0).max(2.0).to_string();
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
+        .arg("-nostdin")
         .arg("-ss")
         .arg(seek)
         .arg("-i")
@@ -993,7 +1043,7 @@ async fn extract_thumbnail(analysis: &MediaAnalysis, output_dir: &Path) -> Optio
         .arg("-vf")
         .arg("scale='min(640,iw)':-2")
         .arg(&path);
-    match run_ffmpeg(&mut cmd).await {
+    match run_ffmpeg_cancellable(&mut cmd, cancel, timeout_secs).await {
         Ok(()) => Some(path),
         Err(e) => {
             tracing::warn!(error = %e, "thumbnail extraction failed");
@@ -1102,7 +1152,7 @@ async fn probe_duration(path: &Path) -> Result<f64> {
         .arg("format=duration")
         .arg("-of")
         .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(path.to_string_lossy().as_ref())
+        .arg(&fmp4_input_arg(path))
         .output()
         .await?;
     if !output.status.success() {

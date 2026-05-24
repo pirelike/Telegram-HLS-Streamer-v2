@@ -34,11 +34,27 @@ pub fn save_job(
     let mut job = job.clone();
     normalize_job_metadata(&mut job);
     tx.execute(
-        "INSERT OR REPLACE INTO jobs(
+        "INSERT INTO jobs(
             job_id, filename, duration, file_size, video_codec, video_width, video_height, status,
             media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number,
             source_path
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+         ON CONFLICT(job_id) DO UPDATE SET
+            filename = excluded.filename,
+            duration = excluded.duration,
+            file_size = excluded.file_size,
+            video_codec = excluded.video_codec,
+            video_width = excluded.video_width,
+            video_height = excluded.video_height,
+            status = excluded.status,
+            media_type = excluded.media_type,
+            series_name = excluded.series_name,
+            has_thumbnail = excluded.has_thumbnail,
+            is_series = excluded.is_series,
+            season_number = excluded.season_number,
+            episode_number = excluded.episode_number,
+            part_number = excluded.part_number,
+            source_path = excluded.source_path",
         params![
             job.job_id,
             job.filename,
@@ -741,6 +757,15 @@ pub fn insert_job_marker(
         rusqlite::params![job_id, filename, status],
     )?;
     Ok(())
+}
+
+pub fn job_exists_active_by_filename(conn: &Connection, filename: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE filename = ?1 AND status IN ('queued','downloading','analyzing','processing','uploading')",
+        params![filename],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 pub fn get_stuck_processing_jobs(conn: &Connection) -> Result<Vec<String>> {

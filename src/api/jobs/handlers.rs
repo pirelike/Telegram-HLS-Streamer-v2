@@ -45,7 +45,12 @@ pub async fn handle_job_status(
         Ok(Ok(Some(job))) => {
             let (progress, step, total_steps, description) = match job.status.as_str() {
                 "complete" => (100.0, 5, 5, "complete".to_string()),
-                "error" => (100.0, 5, 5, "error".to_string()),
+                "error" => (
+                    100.0,
+                    5,
+                    5,
+                    job.error.clone().unwrap_or_else(|| "error".to_string()),
+                ),
                 "cancelled" => (100.0, 5, 5, "cancelled".to_string()),
                 _ => (0.0, 0, 5, job.status.clone()),
             };

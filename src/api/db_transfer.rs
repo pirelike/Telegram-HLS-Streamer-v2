@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, db_unavailable, AppState};
-use crate::{config::Config, db, env_writer, telegram};
+use crate::{config::Config, db, env_writer, media, telegram};
 
 #[derive(Debug, Deserialize)]
 struct ExportRequest {
@@ -335,6 +335,8 @@ async fn merge_database_path(state: &Arc<AppState>, source: PathBuf) -> Response
 async fn reload_runtime_config(state: &AppState) -> anyhow::Result<()> {
     let conn = state.db_conn().await?;
     let cfg = tokio::task::spawn_blocking(move || Config::load(&conn)).await??;
+    let encoder = media::select_encoder(&cfg).await;
+    *state.selected_encoder.write().await = encoder;
     *state.config.write().await = Arc::new(cfg);
     Ok(())
 }
@@ -730,6 +732,8 @@ async fn replace_live_database(
     let old_pool = std::mem::replace(&mut *guard, new_pool);
     drop(guard);
     drop(old_pool);
+    let encoder = media::select_encoder(&cfg).await;
+    *state.selected_encoder.write().await = encoder;
     *state.config.write().await = Arc::new(cfg);
     Ok(result)
 }

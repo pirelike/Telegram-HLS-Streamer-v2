@@ -65,31 +65,31 @@ Priorities: bug > guard > perf > feature.
 - [x] **Crash recovery only catches `processing` state, not `queued`/`uploading`/`analyzing`**
   `recover_stuck_processing_jobs` at `src/api/jobs/processing.rs:935-956` and `src/db/queries.rs:686-697` queries `status='processing'`. Jobs that crashed before the processing marker was written (see `src/api/jobs/processing.rs:172-177`) stay as `queued`/`uploading`/`analyzing` in the DB with no in-memory state and no heartbeat. Add a `jobs.lease_expires_at` column, treat any non-terminal row whose lease lapsed as stuck, and either re-enqueue from `source_path` or mark as failed.
 
-- [ ] **Telegram retries have no jitter, no max-sleep cap, and no per-bot circuit breaker**
+- [x] **Telegram retries have no jitter, no max-sleep cap, and no per-bot circuit breaker**
   `src/telegram.rs:205-282,297-330` hardcodes `MAX_ATTEMPTS=3`, backs off as `2^attempt` seconds with no jitter (concurrent uploads thunder-herd), and honors `RetryAfter` but won't sleep past the attempt budget — a single 60s flood-wait permanently fails the job. No per-bot failure counter means `assign_upload_bots` keeps round-robining to banned or blocked bots. Parametrize retries from config, add full jitter, cap individual sleep duration, and track per-bot rolling error rates to skip unhealthy bots.
 
-- [ ] **FFmpeg has no per-process timeout and SIGKILL is sent with no SIGTERM grace**
+- [x] **FFmpeg has no per-process timeout and SIGKILL is sent with no SIGTERM grace**
   `run_ffmpeg_cancellable` at `src/media/process.rs:794-858` reacts to `cancel_flag` but has no wall-clock timeout; a hung encoder only stops when the global `job_timeout_watcher` flips the flag (`src/api/jobs/processing.rs:783-840`). `child.kill()` sends SIGKILL directly, leaking hwaccel state. The stderr ring buffer keeps only the last 8 KB (`src/media/process.rs:810-813`), truncating real error lines on long encodes. Add a configurable per-tier timeout, SIGTERM-then-SIGKILL with a grace period, and keep head + tail of stderr (or stream lines through `tracing` on Debug).
 
-- [ ] **`save_job` races with concurrent reads because SQLite pragmas are missing**
+- [x] **`save_job` races with concurrent reads because SQLite pragmas are missing**
   `src/db/queries.rs:13-110` runs `DELETE` + bulk `INSERT` inside one transaction; without `busy_timeout` or `synchronous=NORMAL` (`src/db/mod.rs:28-30,75-78` only set WAL + foreign_keys), concurrent playback readers hit `SQLITE_BUSY` and surface as 500s. The `INSERT OR REPLACE` on the `jobs` row also fires `ON DELETE CASCADE`, which is exactly what the explicit deletes are working around — fragile. Set `PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL` and replace `INSERT OR REPLACE` with `INSERT … ON CONFLICT … DO UPDATE`.
 
-- [ ] **Watch-folder re-enqueues files after restart because dedup is in-memory only**
+- [x] **Watch-folder re-enqueues files after restart because dedup is in-memory only**
   `src/api/watch_folder.rs:127-177` keeps `watch_seen` in a runtime `HashMap`; on restart it's empty (`src/main.rs:86`), so any file still in `watch_root` (not yet moved to `done/`) is re-stat'd, marked stable, and re-enqueued — duplicating a job that may already be in the DB. `seen.clear()` also runs on every settings save (`src/api/watch_folder.rs:102`). Persist watch claims (e.g., a `watch_claims` table keyed by canonical inode/path + size + mtime) and consult it before enqueue.
 
-- [ ] **Orphaned pending-upload files survive restarts and accumulate**
+- [x] **Orphaned pending-upload files survive restarts and accumulate**
   `src/api/uploads.rs:233-239,394-426` relies on an in-memory `Mutex<HashMap>` for TTL tracking. On restart the map is empty, so partial files in `uploads/` preallocated to `total_size` via `set_len` (`src/api/uploads.rs:163-166`) are never reconciled; `uploads/` accumulates orphaned ~100 GB sparse files. At startup, scan `uploads/` and delete files whose `upload_id` has no matching pending state and no completed job; persist pending uploads to a `pending_uploads` table.
 
-- [ ] **Round-robin upload-bot counter is unfair under partial failure**
+- [x] **Round-robin upload-bot counter is unfair under partial failure**
   `src/api/jobs/processing.rs:556-574` calls `set_last_bot_index` before uploads run; if `upload_outputs` fails, the counter has already advanced. The `round_robin` mutex is also held only across `get_last_bot_index` + `set_last_bot_index`, so concurrent jobs interleave bot assignments after the lock drops, defeating fairness. Persist the new counter only after the last upload succeeds, or atomically reserve a range in the DB via `UPDATE … RETURNING`.
 
-- [ ] **Terminal jobs evicted from memory after 5 min, losing status responses and log correlation**
+- [x] **Terminal jobs evicted from memory after 5 min, losing status responses and log correlation**
   `cleanup_old_terminal_jobs` at `src/api/jobs/processing.rs:842-852` drops terminal jobs from `state.jobs` after 300s; subsequent status/poll requests cannot return the error message even though the DB has it. There is also no per-job `tracing` span, so concurrent jobs interleave logs unreadably. Wrap every per-job task in `tracing::info_span!("job", job_id)` and have the status handler fall back to a DB read for terminal jobs after in-memory eviction.
 
-- [ ] **URL ingest can spawn unbounded background downloads**
+- [x] **URL ingest can spawn unbounded background downloads**
   `src/api/ingest.rs:24-70` accepts each URL and immediately `tokio::spawn`s a downloader. A client can start many remote downloads that consume disk, outbound sockets, and queue slots before normal upload limits apply. Add a small in-memory semaphore for URL ingest, clear status/cancel behavior while waiting, and reuse the existing upload/job limits where practical.
 
-- [ ] **Remote download has no explicit wall-clock or idle timeout**
+- [x] **Remote download has no explicit wall-clock or idle timeout**
   `src/api/ingest.rs:72-282` builds a fresh reqwest client and streams chunks until completion, but there is no per-download deadline or per-read idle timeout. A slow or stalled origin can keep a job in `downloading` indefinitely until broader job timeout logic notices. Add bounded timeout behavior and surface `download_timed_out` as a clear job error.
 
 - [x] **Ingest download task ignores `job_timeout_watcher` cancellation**
@@ -104,16 +104,16 @@ Priorities: bug > guard > perf > feature.
 - [x] **`handle_cancel_job` deletes processing directory while FFmpeg may still be writing to it**
   `src/api/jobs/handlers.rs:461` — The cancel handler sets `cancel_flag`, then immediately calls `cleanup_job_paths` (which deletes source + processing dir). `process_job` polls `cancel_flag` asynchronously at specific checkpoints; between flag set and FFmpeg noticing the cancellation, the processing directory is deleted from under the encoder. Intermediate files are corrupted and FFmpeg emits confusing errors. Restrict `cleanup_job_paths` to the `process_job` task; the cancel handler should only set the flag and update in-memory status.
 
-- [ ] **Missing `spawn_blocking` for blocking rusqlite calls in DB transfer and frontend handlers**
+- [x] **Missing `spawn_blocking` for blocking rusqlite calls in DB transfer and frontend handlers**
   `src/api/db_transfer.rs:56,142,371`, `src/api/frontend.rs:192` — `db::export_to_dict`, `db::backup_database_file`, `db::merge_from_export`, and `db::distinct_series_names` are invoked directly on Tokio async task threads. A DB export or import on a large database blocks the runtime thread for seconds to minutes, starving other requests. Wrap each call in `tokio::task::spawn_blocking` as is done throughout the rest of the API layer.
 
-- [ ] **`selected_encoder` not refreshed when encoder-related settings change**
+- [x] **`selected_encoder` not refreshed when encoder-related settings change**
   `src/api/playback/virtual_.rs:37` — `serve_virtual_segment` reads `state.selected_encoder.read().await.clone()` at request time. The encoder was cached correctly per P1, but cache invalidation on settings change may not be wired: if the user changes `preferred_encoder` or GPU path via the settings API, virtual ABR transcodes silently continue using the stale selection (e.g. old VAAPI device path, or CPU encoder after enabling NVENC). Verify that `media::encoder::select_encoder` is called and written to `state.selected_encoder` on any encoder-relevant settings save, and confirm it ends up in the same code path as the initial probe in `main.rs`.
 
-- [ ] **Stale Telegram `file_id` recovery triggers full source re-encode for a single segment**
+- [x] **Stale Telegram `file_id` recovery triggers full source re-encode for a single segment**
   `src/api/playback/real.rs:464-518` — `extract_recovery_segment_from_source` calls `media::process_media` on the full source file when recovering from a stale `file_id`. This produces all segments and tiers in `work_dir`; only the one needed segment is read back, and the rest are discarded with `remove_dir_all`. For a 2-hour film this triggers a multi-hour full re-encode consuming tens of GB of disk, just to recover one segment. Add a targeted extraction path (e.g., seek-based single-segment encode, or byte-range extraction from the original `.ts`/`.m4s`) or cap this recovery path to init segments only.
 
-- [ ] **`transcode_segment` leaks FFmpeg output file when `tokio::fs::read` fails after encode**
+- [x] **`transcode_segment` leaks FFmpeg output file when `tokio::fs::read` fails after encode**
   `src/api/playback/virtual_.rs:401` — The output file `out_path` is only removed via `let _ = remove_file(&out_path).await` on the success path. If `tokio::fs::read(&out_path).await?` returns an error (disk full, I/O error), the `?` propagates and the `out_path` removal is never reached. The encoded `.mp4` sits in `temp_dir()` permanently. Clean up `out_path` unconditionally (e.g. via defer pattern or an explicit `remove_file` in the error arm).
 
 - [x] **`env_writer` `Mutex` not poison-safe; subsequent writes panic after any rewrite failure**
@@ -122,22 +122,22 @@ Priorities: bug > guard > perf > feature.
 - [x] **`env_writer` missing `fsync` before rename; power loss can corrupt `.env`**
   `src/env_writer.rs:58-62` — `std::fs::write(&tmp, &content)` followed by `std::fs::rename(&tmp, env_path)`. On Linux, `rename(2)` is atomic at the directory-entry level but does not flush the file's data to disk. A power loss after rename but before the OS flushes dirty pages produces a zero-byte or partial `.env`. Add `File::open`+ `write`+ `sync_all` + `rename` so the data is durable before the directory entry changes.
 
-- [ ] **`handle_post_settings` has a TOCTOU race under concurrent modification**
+- [x] **`handle_post_settings` has a TOCTOU race under concurrent modification**
   `src/api/bots_settings.rs:83-86` — The handler reads `state.config` under a read-lock, clones it, applies changes, drops the lock, does DB work, then re-acquires a write-lock to store the result. Two concurrent POST requests reading the same base snapshot will each overwrite the other's changes. The last writer wins, silently dropping the other request's settings. Read, apply, and store inside a single `write()` lock acquisition, or use a DB-level compare-and-swap keyed on a settings version counter.
 
-- [ ] **`count_series_groups` and `count_season_groups` produce wrong counts when `series_name IS NULL` filter is active**
+- [x] **`count_series_groups` and `count_season_groups` produce wrong counts when `series_name IS NULL` filter is active**
   `src/db/queries.rs:452,522` — Both functions append `AND series_name != ''` to the caller-supplied `where_sql`. When `where_sql` already contains `WHERE season_number IS NULL`, the compound clause is `WHERE season_number IS NULL AND series_name != ''`, which is contradictory (IS NULL rows cannot satisfy `!= ''`). The query returns 0 instead of the real group count, silently breaking series-grouped pagination. Fold the `series_name != ''` condition into the filter-building logic so it is compatible with other WHERE clauses.
 
-- [ ] **`upload_rate_limits` `HashMap` grows unboundedly with rotating source IPs**
+- [x] **`upload_rate_limits` `HashMap` grows unboundedly with rotating source IPs**
   `src/api/uploads.rs:532-550` — Each unique client IP creates an entry in `state.upload_rate_limits`. Per-IP deque timestamps are pruned on access, but the `HashMap` entry itself is never removed when its deque empties. With `behind_proxy = true` and large NAT pools or CDN forwarding IPs, this is a slow permanent memory leak. After pruning a deque to empty, call `limits.remove(&ip)`, or run a periodic `limits.retain(|_, q| !q.is_empty())` sweep.
 
-- [ ] **Ingest disk-space pre-check is silently skipped when remote server omits `Content-Length`**
+- [x] **Ingest disk-space pre-check is silently skipped when remote server omits `Content-Length`**
   `src/api/ingest.rs:197-213` — The `check_disk_space` call is inside `if let Some(len) = resp.content_length()`. When the origin omits the header, no space check occurs; `stream_to_file` streams up to `max_upload_size` (default 100 GB) before the per-chunk byte counter catches it. Multiple concurrent header-less downloads can exhaust disk. Move the space check to before the response body read using available free space vs. `max_upload_size` as a conservative bound, regardless of whether `Content-Length` is present.
 
-- [ ] **`analysis_from_ffprobe` silently accepts zero-duration media, causing downstream FFmpeg failures**
+- [x] **`analysis_from_ffprobe` silently accepts zero-duration media, causing downstream FFmpeg failures**
   `src/media/analysis.rs:41-44` — `duration` defaults to `0.0` when the JSON field is absent or unparseable. Zero-duration analysis is accepted without error. `max_bitrate_for_segment` clamps to a 0.1 s minimum to avoid division by zero, but `encode_video_tier_ts` produces no segments for a zero-duration source, causing `remux_video_ts_to_fmp4` to fail with "no video TS segments produced" — a confusing error that hides the root cause. Add `if duration <= 0.0 { bail!("file reports zero or unknown duration") }` in `analysis_from_ffprobe` to surface the problem immediately.
 
-- [ ] **`probe_duration` uses FFprobe with `concat:` URL which FFprobe does not support as a bare filename**
+- [x] **`probe_duration` uses FFprobe with `concat:` URL which FFprobe does not support as a bare filename**
   `src/media/process.rs:989` — `fmp4_input_arg(path)` formats `concat:/path/init.mp4|/path/video_N.m4s` and passes it as a filename argument to FFprobe. FFmpeg's `concat:` demuxer works via a bare filename; FFprobe does not honour it the same way and will fail to probe `.m4s` segments, silently falling back to `cfg.hls_segment_duration as f64`. This produces inaccurate per-segment duration data used for Telegram split-size calculations. Probe `.m4s` segments directly without the `concat:` wrapper, or derive durations from the HLS playlist instead.
 
 - [x] **Settings persistence returns success when `.env` write fails, causing config to diverge on restart**
