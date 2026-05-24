@@ -125,6 +125,16 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         name: "add_media_markers_tables",
         run: run_migration_23,
     },
+    Migration {
+        revision: 24,
+        name: "add_episode_title_column",
+        run: run_migration_24,
+    },
+    Migration {
+        revision: 25,
+        name: "add_marker_fingerprint_windows",
+        run: run_migration_25,
+    },
 ];
 
 // Public wrappers for test access
@@ -196,6 +206,12 @@ pub(crate) fn run_migration_22(conn: &Connection) -> Result<()> {
 }
 pub(crate) fn run_migration_23(conn: &Connection) -> Result<()> {
     migration_23_add_media_markers_tables(conn)
+}
+pub(crate) fn run_migration_24(conn: &Connection) -> Result<()> {
+    migration_24_add_episode_title_column(conn)
+}
+pub(crate) fn run_migration_25(conn: &Connection) -> Result<()> {
+    migration_25_add_marker_fingerprint_windows(conn)
 }
 
 fn table_sql_contains(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
@@ -389,7 +405,8 @@ fn validate_column_name(column: &str) -> Result<&str> {
         | "bitrate_bps"
         | "mode"
         | "created_at_unix"
-        | "prefix" => Ok(column),
+        | "prefix"
+        | "episode_title" => Ok(column),
         _ => bail!("unknown sqlite column: {column}"),
     }
 }
@@ -1152,6 +1169,66 @@ fn migration_23_add_media_markers_tables(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_media_fingerprints_series
         ON media_fingerprints(media_type, series_name, season_number);",
+    )?;
+    Ok(())
+}
+
+fn migration_24_add_episode_title_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "jobs", "episode_title")? {
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN episode_title TEXT DEFAULT NULL;")?;
+    }
+    Ok(())
+}
+
+fn migration_25_add_marker_fingerprint_windows(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE media_markers RENAME TO media_markers_old;
+         CREATE TABLE media_markers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            marker_type TEXT NOT NULL CHECK (marker_type IN ('intro','outro','recap','preview','credits')),
+            start_seconds REAL NOT NULL CHECK (start_seconds >= 0),
+            end_seconds REAL NOT NULL CHECK (end_seconds > start_seconds),
+            source TEXT NOT NULL CHECK (source IN ('chapter','chromaprint','silence','blackframe','manual')),
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK (confidence >= 0 AND confidence <= 1),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         INSERT INTO media_markers(id, job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at)
+            SELECT id, job_id, marker_type, start_seconds, end_seconds, source, confidence, enabled, created_at, updated_at
+            FROM media_markers_old;
+         DROP TABLE media_markers_old;
+         CREATE INDEX IF NOT EXISTS idx_media_markers_job_type
+            ON media_markers(job_id, marker_type);
+
+         ALTER TABLE media_fingerprints RENAME TO media_fingerprints_old;
+         CREATE TABLE media_fingerprints (
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            media_type TEXT NOT NULL,
+            series_name TEXT NOT NULL,
+            season_number INTEGER,
+            window_type TEXT NOT NULL DEFAULT 'intro' CHECK (window_type IN ('intro','outro')),
+            window_start_seconds REAL NOT NULL DEFAULT 0,
+            window_duration_seconds REAL NOT NULL DEFAULT 0,
+            duration_seconds REAL NOT NULL,
+            fingerprint TEXT NOT NULL,
+            fingerprint_source TEXT NOT NULL DEFAULT 'chromaprint',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(job_id, window_type)
+         );
+         INSERT OR IGNORE INTO media_fingerprints(
+            job_id, media_type, series_name, season_number, window_type,
+            window_start_seconds, window_duration_seconds, duration_seconds,
+            fingerprint, fingerprint_source, created_at
+         )
+            SELECT job_id, media_type, series_name, season_number, 'intro',
+                   0, duration_seconds, duration_seconds,
+                   fingerprint, fingerprint_source, created_at
+            FROM media_fingerprints_old;
+         DROP TABLE media_fingerprints_old;
+         CREATE INDEX IF NOT EXISTS idx_media_fingerprints_series
+            ON media_fingerprints(media_type, series_name, season_number, window_type);",
     )?;
     Ok(())
 }

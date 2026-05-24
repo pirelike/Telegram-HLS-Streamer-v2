@@ -116,15 +116,15 @@ The watch page saves playback position to the server and resumes on next visit. 
 
 ### External Metadata
 
-Set `TMDB_API_KEY` to enable TMDB search and metadata enrichment for movies and TV shows. Anime metadata uses the free AniList GraphQL API. Once linked, poster images, backdrops, descriptions, and external IDs are cached in SQLite and shown on browse and watch pages.
+Set `TMDB_API_KEY` to enable TMDB search and metadata enrichment for movies and TV shows. Anime metadata uses the free AniList GraphQL API. Once linked from upload or the watch-page edit modal, poster images, backdrops, descriptions, and external IDs are cached in SQLite and shown on browse and watch pages.
 
 ### Intro/Outro Markers
 
-When enabled, the server extracts chapter markers from source files and can detect recurring intro/outro audio patterns across episodes using Chromaprint fingerprinting. Markers are stored in the database and available via the markers API for player skip UI.
+When enabled, the server extracts chapter markers from source files and detects recurring intro/outro audio patterns across episodes using Chromaprint fingerprints for separate intro and outro windows. FFmpeg silence and black-frame scans are used as best-effort boundary hints. Markers are stored in the database and shown as skip controls in the Shaka player.
 
 ### Anime Community Comments
 
-Anime TV and Anime Film watch pages embed the official Anime Community comment section when an AniList or MAL ID is linked to the job. Clicking a timestamp in the comments seeks the player to that time.
+Anime TV and Anime Film watch pages embed the official Anime Community comment section when `TAC_COMMENTS_ENABLED=true` and an AniList or MAL ID is linked to the job. Clicking a timestamp in the comments seeks the player to that time.
 
 ### Bot Management
 

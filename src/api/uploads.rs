@@ -586,6 +586,10 @@ async fn check_upload_rate_limit(state: &AppState, ip: std::net::IpAddr) -> Opti
     {
         requests.pop_front();
     }
+    if requests.is_empty() {
+        limits.remove(&ip);
+        return None;
+    }
     if requests.len() >= max {
         return Some(api_error(
             StatusCode::TOO_MANY_REQUESTS,

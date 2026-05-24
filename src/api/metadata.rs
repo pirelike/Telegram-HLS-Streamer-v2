@@ -136,6 +136,20 @@ pub async fn handle_link_job(
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
         let meta_id = db::save_external_metadata(&conn, &new_meta)?;
         db::link_job_metadata(&conn, &jid, meta_id, "primary")?;
+
+        // If this job belongs to a series, also create the series-level link
+        // and rename the series to the metadata title.
+        if let Ok(Some(job)) = db::get_job(&conn, &jid) {
+            if !job.series_name.is_empty() {
+                let new_title = new_meta.title.clone();
+                if !new_title.is_empty() && new_title != job.series_name {
+                    db::rename_series(&conn, &job.series_name, &new_title, &job.media_type)?;
+                    db::link_series_metadata(&conn, &job.media_type, &new_title, meta_id)?;
+                } else {
+                    db::link_series_metadata(&conn, &job.media_type, &job.series_name, meta_id)?;
+                }
+            }
+        }
         Ok(meta_id)
     })
     .await;
@@ -225,9 +239,27 @@ pub async fn handle_link_series(
     .await;
 
     match result {
-        Ok(Ok(meta_id)) => Json(json!({ "linked": true, "media_type": media_type, "series_name": series_name, "metadata_id": meta_id })).into_response(),
-        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "link_failed", e.to_string()),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "link_failed", e.to_string()),
+        Ok(Ok(meta_id)) => {
+            if provider == "tmdb" && matches!(media_kind.as_str(), "tv" | "anime") {
+                let state2 = state.clone();
+                let pid = provider_id.clone();
+                let sn = series_name.clone();
+                tokio::spawn(async move {
+                    backfill_tmdb_episode_titles(&state2, &pid, &sn).await;
+                });
+            }
+            Json(json!({ "linked": true, "media_type": media_type, "series_name": series_name, "metadata_id": meta_id })).into_response()
+        }
+        Ok(Err(e)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "link_failed",
+            e.to_string(),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "link_failed",
+            e.to_string(),
+        ),
     }
 }
 
@@ -288,7 +320,7 @@ pub async fn handle_refresh(
     }
 }
 
-async fn fetch_metadata(
+pub(crate) async fn fetch_metadata(
     client: &reqwest::Client,
     cfg: &crate::config::Config,
     provider: &str,
@@ -441,7 +473,7 @@ async fn fetch_anilist(
     })
 }
 
-async fn search_tmdb(
+pub(crate) async fn search_tmdb(
     client: &reqwest::Client,
     api_key: &str,
     query: &str,
@@ -482,7 +514,10 @@ async fn search_tmdb(
     Ok(results)
 }
 
-async fn search_anilist(client: &reqwest::Client, query: &str) -> Result<Vec<Value>, String> {
+pub(crate) async fn search_anilist(
+    client: &reqwest::Client,
+    query: &str,
+) -> Result<Vec<Value>, String> {
     let gql = json!({
         "query": "query ($q: String) { Page(page: 1, perPage: 20) { media(search: $q, type: ANIME, sort: SEARCH_MATCH) { id title { romaji english } description coverImage { large extraLarge } bannerImage startDate { year month day } format } } }",
         "variables": { "q": query }
@@ -522,6 +557,144 @@ async fn search_anilist(client: &reqwest::Client, query: &str) -> Result<Vec<Val
         })
         .collect();
     Ok(results)
+}
+
+pub(crate) async fn auto_fetch_and_link(
+    state: &std::sync::Arc<AppState>,
+    job_id: &str,
+    search_term: &str,
+    media_type: &str,
+) {
+    let cfg = state.config.read().await.clone();
+    let provider = if media_type.starts_with("Anime") {
+        "anilist"
+    } else {
+        "tmdb"
+    };
+    if provider == "tmdb" && cfg.tmdb_api_key.is_empty() {
+        return;
+    }
+
+    let results = match provider {
+        "anilist" => search_anilist(&state.http, search_term).await,
+        _ => search_tmdb(&state.http, &cfg.tmdb_api_key, search_term).await,
+    };
+    let results = match results {
+        Ok(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let first = &results[0];
+    let prov = first["provider"].as_str().unwrap_or(provider).to_string();
+    let prov_id = match first["provider_id"].as_str().filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+    let media_kind = first["media_kind"].as_str().unwrap_or("movie").to_string();
+
+    let new_meta = match fetch_metadata(&state.http, &cfg, &prov, &prov_id, &media_kind).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(job_id, error = %e, "auto-fetch metadata skipped");
+            return;
+        }
+    };
+
+    let conn = match state.db_conn().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let jid = job_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let meta_id = db::save_external_metadata(&conn, &new_meta)?;
+        db::link_job_metadata(&conn, &jid, meta_id, "primary")?;
+        Ok(())
+    })
+    .await;
+    tracing::info!(job_id, provider = %prov, "auto-fetched and linked metadata");
+}
+
+pub(crate) async fn backfill_tmdb_episode_titles(
+    state: &Arc<AppState>,
+    tmdb_series_id: &str,
+    series_name: &str,
+) {
+    let cfg = state.config.read().await.clone();
+    if cfg.tmdb_api_key.is_empty() {
+        return;
+    }
+    let client = &state.http;
+    let api_key = cfg.tmdb_api_key.clone();
+    let series_id = tmdb_series_id.to_string();
+
+    // Fetch the TV show to get its seasons list
+    let show_url = format!("https://api.themoviedb.org/3/tv/{series_id}?api_key={api_key}");
+    let show: Value = match client.get(&show_url).send().await {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        _ => return,
+    };
+
+    let seasons = match show["seasons"].as_array() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+
+    // Build season_num -> { ep_num -> title } map
+    let mut ep_titles: std::collections::HashMap<(i64, i64), String> =
+        std::collections::HashMap::new();
+    for season in &seasons {
+        let sn = match season["season_number"].as_i64() {
+            Some(n) if n > 0 => n,
+            _ => continue,
+        };
+        let season_url =
+            format!("https://api.themoviedb.org/3/tv/{series_id}/season/{sn}?api_key={api_key}");
+        let season_data: Value = match client.get(&season_url).send().await {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        if let Some(episodes) = season_data["episodes"].as_array() {
+            for ep in episodes {
+                if let (Some(en), Some(name)) = (ep["episode_number"].as_i64(), ep["name"].as_str())
+                {
+                    if !name.is_empty() {
+                        ep_titles.insert((sn, en), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if ep_titles.is_empty() {
+        return;
+    }
+
+    let conn = match state.db_conn().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let sn = series_name.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let jobs = db::get_season_episode_job_ids(&conn, &sn)?;
+        let updates: Vec<(String, String)> = jobs
+            .into_iter()
+            .filter_map(|(job_id, season, ep)| {
+                ep_titles.get(&(season, ep)).map(|t| (job_id, t.clone()))
+            })
+            .collect();
+        if !updates.is_empty() {
+            db::set_episode_titles(&conn, &updates)?;
+        }
+        Ok(())
+    })
+    .await;
+    tracing::info!(series_name, "backfilled TMDB episode titles");
 }
 
 fn tmdb_image(path: Option<&str>, size: &str) -> String {

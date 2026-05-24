@@ -19,6 +19,7 @@ use crate::config::BotConfig;
 use crate::{db, telegram};
 
 pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Response {
+    let cfg = state.config.read().await.clone();
     let conn = match state.db_conn().await {
         Ok(conn) => conn,
         Err(e) => return db_unavailable(e),
@@ -28,15 +29,29 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
         let job = db::get_job(&conn, &job_id_clone)?;
         let tracks = db::get_job_tracks(&conn, &job_id_clone, None)?;
         let segment_count = db::count_job_segments(&conn, &job_id_clone)?;
-        Ok::<(Option<db::JobRow>, Vec<db::TrackRow>, i64), anyhow::Error>((
-            job,
-            tracks,
-            segment_count,
-        ))
+        let ext_meta = if let Some(ref j) = job {
+            let links = db::get_job_metadata_links(&conn, &job_id_clone)?;
+            let primary = links
+                .into_iter()
+                .find(|(l, _)| l.role == "primary")
+                .map(|(_, m)| m);
+            if primary.is_some() {
+                primary
+            } else if j.is_series {
+                let mt = j.media_type.as_str();
+                let sn = j.series_name.as_str();
+                db::get_series_metadata_link(&conn, mt, sn)?.map(|(_, m)| m)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok::<_, anyhow::Error>((job, tracks, segment_count, ext_meta))
     })
     .await;
 
-    let (job_opt, tracks, segment_count) = match db_result {
+    let (job_opt, tracks, segment_count, ext_meta) = match db_result {
         Ok(Ok(val)) => val,
         Ok(Err(e)) => {
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
@@ -56,6 +71,41 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
 
     let audio_count = tracks.iter().filter(|t| t.track_type == "audio").count();
     let subtitle_count = tracks.iter().filter(|t| t.track_type == "subtitle").count();
+
+    let external_metadata = match &ext_meta {
+        Some(m) => json!({
+            "provider": m.provider,
+            "provider_id": m.provider_id,
+            "title": m.title,
+            "original_title": m.original_title,
+            "overview": m.overview,
+            "poster_url": m.poster_url,
+            "backdrop_url": m.backdrop_url,
+            "year": m.year,
+            "rating": m.rating,
+        }),
+        None => serde_json::Value::Null,
+    };
+    let external_ids = match &ext_meta {
+        Some(m) => {
+            let mut ids = serde_json::Map::new();
+            match m.provider.as_str() {
+                "anilist" => {
+                    ids.insert("anilist".into(), json!(m.provider_id));
+                }
+                "tmdb" => {
+                    ids.insert("tmdb".into(), json!(m.provider_id));
+                }
+                "mal" => {
+                    ids.insert("mal".into(), json!(m.provider_id));
+                }
+                _ => {}
+            }
+            serde_json::Value::Object(ids)
+        }
+        None => json!({}),
+    };
+
     Json(json!({
         "job_id": job.job_id,
         "filename": job.filename,
@@ -77,6 +127,11 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
         "subtitle_count": subtitle_count,
         "segment_count": segment_count,
         "tracks": tracks,
+        "external_metadata": external_metadata,
+        "external_ids": external_ids,
+        "feature_flags": {
+            "tac_comments_enabled": cfg.tac_comments_enabled,
+        },
     }))
     .into_response()
 }

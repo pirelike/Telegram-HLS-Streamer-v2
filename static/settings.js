@@ -38,6 +38,7 @@ const CATEGORY_TO_SECTION = {
     watch_folder:      'settings-watch',
     telegram:          'settings-bots',
     cloudflared:       'settings-cloudflared',
+    metadata:          'settings-metadata',
 };
 
 function renderAllSettings(data) {
@@ -89,6 +90,7 @@ function sectionDescription(sectionId) {
     if (sectionId === 'settings-cache')       return 'Segment cache and disk-backed cache.';
     if (sectionId === 'settings-system')      return 'Reliability, rate limiting, and hardware acceleration.';
     if (sectionId === 'settings-cloudflared') return 'Cloudflared tunnel configuration.';
+    if (sectionId === 'settings-metadata')   return 'External metadata providers (TMDB for movies/TV, AniList for anime — AniList needs no key), intro/outro detection, and community comments.';
     return 'Configure server behaviour. Changes save per section.';
 }
 

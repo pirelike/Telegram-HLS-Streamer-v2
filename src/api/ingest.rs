@@ -211,6 +211,11 @@ async fn download_and_enqueue(
                 let _ = download_failed(&state, &job_id, &path, e.0, e.1, e.2).await;
                 break;
             }
+        } else if let Err(e) = check_disk_space(&state, max_upload_size) {
+            // No Content-Length header; check that at least max_upload_size bytes of free space exist
+            // before starting the download.
+            let _ = download_failed(&state, &job_id, &path, e.0, e.1, e.2).await;
+            break;
         }
         if let Some(content_type) = resp
             .headers()

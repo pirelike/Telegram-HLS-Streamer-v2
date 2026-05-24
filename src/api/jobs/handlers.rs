@@ -152,17 +152,47 @@ pub async fn handle_list_jobs(
             Some("series") => {
                 let rows = db::list_series_groups(&conn, &filter)?;
                 let total = db::count_series_groups(&conn, &filter)?;
-                Ok((rows.into_iter().map(series_group_json).collect(), total))
+                let names: Vec<String> = rows.iter().map(|r| r.series_name.clone()).collect();
+                let posters = db::get_series_poster_urls(&conn, &names)?;
+                Ok((
+                    rows.into_iter()
+                        .map(|r| {
+                            let p = posters.get(&r.series_name).map(String::as_str);
+                            series_group_json(r, p)
+                        })
+                        .collect(),
+                    total,
+                ))
             }
             Some("season") => {
                 let rows = db::list_season_groups(&conn, &filter)?;
                 let total = db::count_season_groups(&conn, &filter)?;
-                Ok((rows.into_iter().map(season_group_json).collect(), total))
+                let names: Vec<String> = rows.iter().map(|r| r.series_name.clone()).collect();
+                let posters = db::get_series_poster_urls(&conn, &names)?;
+                Ok((
+                    rows.into_iter()
+                        .map(|r| {
+                            let p = posters.get(&r.series_name).map(String::as_str);
+                            season_group_json(r, p)
+                        })
+                        .collect(),
+                    total,
+                ))
             }
             _ => {
                 let rows = db::list_jobs(&conn, &filter)?;
                 let total = db::count_jobs(&conn, &filter)?;
-                Ok((rows.into_iter().map(job_json).collect(), total))
+                let ids: Vec<String> = rows.iter().map(|r| r.job_id.clone()).collect();
+                let posters = db::get_job_poster_urls(&conn, &ids)?;
+                Ok((
+                    rows.into_iter()
+                        .map(|r| {
+                            let p = posters.get(&r.job_id).map(String::as_str);
+                            job_json(r, p)
+                        })
+                        .collect(),
+                    total,
+                ))
             }
         }
     })
@@ -304,7 +334,7 @@ pub async fn handle_patch_job(
             )
         }
     };
-    Json(job_json(updated)).into_response()
+    Json(job_json(updated, None)).into_response()
 }
 
 pub async fn handle_delete_job(

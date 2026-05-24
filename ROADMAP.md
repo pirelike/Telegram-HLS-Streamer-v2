@@ -226,16 +226,16 @@ Priorities: bug > guard > perf > feature.
   `/api/metadata/search` supports TMDB and AniList. Metadata can be linked to individual jobs or series. Poster images, backdrops, overviews, and external IDs are cached in `external_metadata`. Requires `TMDB_API_KEY` for TMDB; AniList is keyless. See `src/api/metadata.rs`.
 
 - [x] **Intro/outro marker detection**
-  Chapter-based detection parses FFprobe chapters for intro/opening/ending/credits markers. Chromaprint-based fingerprint comparison detects recurring audio across episodes in the same series/season. Markers stored in `media_markers`, fingerprints in `media_fingerprints`. Detection runs after job completion, non-fatal on failure. API at `/api/jobs/:job_id/markers`.
+  Chapter-based detection parses FFprobe chapters for intro/opening/ending/credits markers. Chromaprint-based fingerprint comparison now stores separate intro/outro window fingerprints and compares recurring audio across episodes in the same series/season. FFmpeg silence and black-frame scans are used as best-effort boundary hints. Markers stored in `media_markers`, fingerprints in `media_fingerprints`. Detection runs after job completion, non-fatal on failure. API at `/api/jobs/:job_id/markers`.
 
 - [x] **Anime Community comment embed**
-  Watch pages for `Anime TV` and `Anime Film` embed the official `https://theanimecommunity.com/embed.js` widget when an AniList or MAL ID is linked. Timestamp clicks seek the Shaka player. Controlled by `TAC_COMMENTS_ENABLED`. Film episodes use `episodeChapterNumber=0` for overview comments.
+  Watch pages for `Anime TV` and `Anime Film` embed the official `https://theanimecommunity.com/embed.js` widget when `TAC_COMMENTS_ENABLED=true` and an AniList or MAL ID is linked. Timestamp clicks seek the Shaka player. Film episodes use `episodeChapterNumber=0` for overview comments.
 
-- [ ] **Skip intro/outro button in Shaka player**
-  The markers API is ready. Add a "Skip intro" overlay button in `static/watch.js` when `currentTime` falls within an enabled intro marker. Seek to `marker.end_seconds` on click. Same pattern for outro/credits markers.
+- [x] **Skip intro/outro button in Shaka player**
+  `static/watch.js` loads enabled markers from `/api/jobs/:job_id/markers`, shows a skip overlay while playback is inside an intro/outro marker, and seeks to `marker.end_seconds` on click.
 
-- [ ] **Metadata search/link UI on upload/edit**
-  Backend metadata search/link APIs are ready. Add a search field in the upload metadata table and edit modal that lets the user pick a TMDB/AniList result and link it to the job.
+- [x] **Metadata search/link UI on upload/edit**
+  The upload metadata table and watch-page edit modal both expose TMDB/AniList search. Upload selections are linked after job creation; edit-modal selections link directly to the existing job.
 
 - [ ] **Remote URL ingest UI**
   `POST /api/ingest/url` exists, but `/upload` has no form for it. Add a small URL input on the upload page that submits a remote URL, shows the existing `downloading` job progress through `/api/status/:job_id`, and then reuses the normal processing/result UI.
@@ -243,7 +243,7 @@ Priorities: bug > guard > perf > feature.
 - [ ] **Operations panel on settings**
   Add a compact read-only panel on `/settings` that fetches `/health` and `/api/metrics`: DB health, disk free, queue depth, cache usage/hit rate, Telegram bot session stats, FFmpeg encoder, and cloudflared status. Keep it simple and refresh manually or on a slow interval.
 
-- [ ] **Continue watching**
+- [x] **Continue watching**
   Store last playback position in browser localStorage keyed by job id from `static/watch.js`. Resume near the saved time on next open, ignore positions near the end, and show recent in-progress jobs on the home page.
 
 - [ ] **Auto-play next episode**

@@ -123,7 +123,10 @@ pub(super) async fn handle_db_backup(State(state): State<Arc<AppState>>) -> Resp
             Ok(conn) => conn,
             Err(e) => return db_unavailable(e),
         };
-        db::backup_database_file(&conn, &state.db_path)
+        let db_path = state.db_path.clone();
+        tokio::task::spawn_blocking(move || db::backup_database_file(&conn, &db_path))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
     };
     match result {
         Ok(result) => Json(json!({

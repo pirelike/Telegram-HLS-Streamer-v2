@@ -46,6 +46,9 @@ pub(crate) async fn analysis_from_ffprobe(path: &Path, value: &Value) -> Result<
         .as_str()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
+    if duration <= 0.0 {
+        bail!("file reports zero or unknown duration");
+    }
     let mut video_streams = Vec::new();
     let mut audio_streams = Vec::new();
     let mut subtitle_streams = Vec::new();

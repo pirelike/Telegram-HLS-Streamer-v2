@@ -657,6 +657,46 @@ async fn settings_get_post_and_reset_update_runtime_config() {
 }
 
 #[tokio::test]
+async fn settings_save_treats_masked_tmdb_api_key_as_unchanged() {
+    let state = app_state();
+    {
+        let conn = state.db_conn().await.unwrap();
+        db::set_setting(&conn, "TMDB_API_KEY", "abcdefghijklmnopqrstuvwxyz").unwrap();
+        *state.config.write().await = Arc::new(Config::load(&conn).unwrap());
+    }
+
+    assert_eq!(state.config.read().await.masked_tmdb_api_key(), "ab...yz");
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"TMDB_API_KEY":"ab...yz","MAX_CONCURRENT_JOBS":4}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cfg = state.config.read().await;
+    assert_eq!(cfg.tmdb_api_key, "abcdefghijklmnopqrstuvwxyz");
+    assert_eq!(cfg.max_concurrent_jobs, 4);
+    drop(cfg);
+
+    let conn = state.db_conn().await.unwrap();
+    assert_eq!(
+        db::get_all_settings(&conn)
+            .unwrap()
+            .get("TMDB_API_KEY")
+            .unwrap(),
+        "abcdefghijklmnopqrstuvwxyz"
+    );
+    let env = std::fs::read_to_string(&state.env_path).unwrap();
+    assert!(env.contains("MAX_CONCURRENT_JOBS=4"));
+    assert!(!env.contains("TMDB_API_KEY=ab...yz"));
+}
+
+#[tokio::test]
 async fn settings_reject_invalid_values() {
     let state = app_state();
     let response = router(state)

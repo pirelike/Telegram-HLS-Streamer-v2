@@ -156,10 +156,11 @@ function renderJobs() {
 function renderCard(j, type) {
     const ctx = window.BROWSE_CTX;
     const safeId = escapeAttr(j.job_id);
-    const thumbSrc = j.has_thumbnail ? `/thumbnail/${safeId}` : null;
+    const isAnimeCat = ctx.category === 'Anime TV' || ctx.category === 'Anime Film';
+    const thumbSrc = (isAnimeCat ? j.poster_url : null) || (j.has_thumbnail ? `/thumbnail/${safeId}` : null);
     const gradient = jobIdToGradient(j.job_id);
     const thumbHtml = thumbSrc
-        ? `<img class="thumb-img" src="${thumbSrc}" alt="" loading="lazy" onload="this.classList.add('loaded')" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+        ? `<img class="thumb-img" src="${escapeAttr(thumbSrc)}" alt="" loading="lazy" onload="this.classList.add('loaded')" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
         : '';
     const placeholderStyle = thumbSrc ? 'display:none' : '';
 
@@ -388,7 +389,7 @@ function renderSeasonEpisodeList(episodes, seasonNumber) {
 function renderEpisodeRow(j) {
     const safeId = escapeAttr(j.job_id);
     const dur    = formatDuration(j.duration);
-    const title  = escapeHtml(cleanTitle(j.filename || j.job_id));
+    const title  = escapeHtml(j.episode_title || cleanTitle(j.filename || j.job_id));
     const s = j.season_number, e = j.episode_number;
     const epCode = (s != null && e != null)
         ? `S${String(s).padStart(2,'0')}·E${String(e).padStart(2,'0')}`

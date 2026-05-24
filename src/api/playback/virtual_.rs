@@ -373,6 +373,7 @@ async fn transcode_segment(
         Err(err) => Err(err),
     };
     let _ = tokio::fs::remove_file(&in_path).await;
+    let _ = tokio::fs::remove_file(&out_path).await;
     result
 }
 
@@ -444,11 +445,9 @@ async fn transcode_segment_with_encoder(
         .await
         .context("running ffmpeg for virtual transcode")?;
     if !status.success() {
-        let _ = tokio::fs::remove_file(&out_path).await;
         bail!("ffmpeg virtual transcode exited with {status}");
     }
     let bytes = tokio::fs::read(&out_path).await?;
-    let _ = tokio::fs::remove_file(&out_path).await;
     validate_fmp4(&bytes)?;
     tracing::info!(
         target_height,

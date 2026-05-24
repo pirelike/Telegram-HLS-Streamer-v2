@@ -116,7 +116,7 @@ pub(super) async fn handle_settings_page() -> Html<String> {
         "settings",
         settings_body(),
         "",
-        r#"<script src="/static/settings.js?v=5"></script>"#,
+        r#"<script src="/static/settings.js?v=6"></script>"#,
     )
 }
 
@@ -129,7 +129,7 @@ pub(super) async fn handle_watch_page(Path(job_id): Path<String>) -> Response {
         "",
         watch_body(),
         r#"<link rel="stylesheet" href="/static/shaka-controls.css">"#,
-        r#"<script src="/static/shaka-player.ui.js"></script><script src="/static/watch.js?v=5"></script>"#,
+        r#"<script src="/static/shaka-player.ui.js"></script><script src="/static/watch.js?v=7"></script>"#,
     )
     .into_response()
 }
@@ -208,8 +208,13 @@ async fn resolve_series_slug(
     slug: &str,
 ) -> Result<Option<String>, Response> {
     let conn = state.db_conn().await.map_err(db_unavailable)?;
-    let names = db::distinct_series_names(&conn, Some(category))
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()))?;
+    let category_owned = category.to_string();
+    let names = tokio::task::spawn_blocking(move || {
+        db::distinct_series_names(&conn, Some(&category_owned))
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()))?;
     Ok(names.into_iter().find(|name| slugify(name) == slug))
 }
 
@@ -487,6 +492,7 @@ fn settings_body() -> &'static str {
     <a class="t-side__item" data-section="settings-abr"><i class="material-icons-round">auto_awesome</i> ABR tiers</a>
     <a class="t-side__item" data-section="settings-cache"><i class="material-icons-round">memory</i> Storage</a>
     <div class="t-side__group">System</div>
+    <a class="t-side__item" data-section="settings-metadata"><i class="material-icons-round">info</i> Metadata</a>
     <a class="t-side__item" data-section="settings-system"><i class="material-icons-round">tune</i> System</a>
     <a class="t-side__item" data-section="settings-cloudflared"><i class="material-icons-round">cloud</i> Cloudflared</a>
   </aside>
@@ -625,6 +631,7 @@ fn settings_body() -> &'static str {
     <section class="settings-section" id="settings-media" hidden></section>
     <section class="settings-section" id="settings-abr" hidden></section>
     <section class="settings-section" id="settings-cache" hidden></section>
+    <section class="settings-section" id="settings-metadata" hidden></section>
     <section class="settings-section" id="settings-system" hidden></section>
     <section class="settings-section" id="settings-cloudflared" hidden></section>
   </main>
@@ -699,7 +706,7 @@ fn watch_body() -> &'static str {
         <div id="episodeNav"></div>
         <div class="player-info" id="playerInfo" hidden></div>
         <section class="t-section t-watch-more" id="watchMoreLikeThis"></section>
-        <section id="animeCommunityComments" style="margin-top:32px"></section>
+        <section id="animeCommunityComments" style="max-width:1200px;margin:32px auto 0;border-radius:12px;overflow:hidden"></section>
     </div>
 </main>
 <div class="modal-overlay" id="editModal">
@@ -749,6 +756,19 @@ fn watch_body() -> &'static str {
                 <button class="modal-btn" onclick="closeEditModal()">Cancel</button>
                 <button class="modal-btn primary" id="saveEditBtn" onclick="saveEditModal()">Save Changes</button>
             </div>
+        </div>
+        <div class="modal-body" style="padding:0 1rem 1rem; border-top:1px solid var(--t-border);">
+            <div style="margin:1rem 0 0.75rem; font-size:12px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--t-ink-3);">Link External Metadata</div>
+            <div style="display:flex; gap:0.5rem; margin-bottom:0.75rem;">
+                <select id="metaProvider" class="form-input" style="width:110px; flex-shrink:0;">
+                    <option value="tmdb">TMDB</option>
+                    <option value="anilist">AniList</option>
+                </select>
+                <input type="text" id="metaSearchQuery" class="form-input" style="flex:1;" placeholder="Search title…" onkeydown="if(event.key==='Enter')searchExternalMetadata()">
+                <button class="modal-btn" onclick="searchExternalMetadata()" id="metaSearchBtn">Search</button>
+            </div>
+            <div id="metaSearchResults" style="max-height:220px; overflow-y:auto; display:none;"></div>
+            <div id="metaLinkedInfo" style="font-size:13px; color:var(--t-ink-2); margin-top:0.5rem;"></div>
         </div>
     </div>
 </div>"#

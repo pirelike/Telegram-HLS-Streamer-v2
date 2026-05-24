@@ -1,3 +1,4 @@
+mod auth;
 mod bots_settings;
 pub(crate) mod db_transfer;
 mod frontend;
@@ -109,7 +110,6 @@ pub(super) fn valid_job_id(value: &str) -> bool {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/health", get(handle_health))
         .route("/", get(frontend::handle_home))
         .route("/films", get(frontend::handle_films))
         .route("/series", get(frontend::handle_series_root))
@@ -218,6 +218,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/segment/:job_id/*key", get(playback::handle_segment))
         .route("/thumbnail/:job_id", get(playlists::handle_thumbnail))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
+        .route("/health", get(handle_health))
         .with_state(state)
 }
 

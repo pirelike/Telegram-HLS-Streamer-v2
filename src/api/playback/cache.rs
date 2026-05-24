@@ -41,12 +41,19 @@ pub(super) struct Inflight {
 
 impl Inflight {
     pub(super) async fn wait_for_outcome(&self) -> std::result::Result<Option<CacheEntry>, String> {
-        loop {
-            let notified = self.notify.notified();
-            if let Some(outcome) = self.outcome.lock().await.clone() {
-                return outcome;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            loop {
+                let notified = self.notify.notified();
+                if let Some(outcome) = self.outcome.lock().await.clone() {
+                    return outcome;
+                }
+                notified.await;
             }
-            notified.await;
+        })
+        .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(_) => Err("single-flight wait timed out after 300s".to_string()),
         }
     }
 }
@@ -198,6 +205,9 @@ pub(super) async fn finish_inflight(
     inflight: Arc<Inflight>,
     result: &Result<CacheEntry>,
 ) {
+    // Remove from map first to prevent new claimants from finding a stale entry.
+    // Existing waiters hold Arc<Inflight> clones and can still read the outcome.
+    state.cache.inflight.lock().await.remove(cache_key);
     {
         let mut outcome = inflight.outcome.lock().await;
         *outcome = Some(match result {
@@ -206,5 +216,4 @@ pub(super) async fn finish_inflight(
         });
     }
     inflight.notify.notify_waiters();
-    state.cache.inflight.lock().await.remove(cache_key);
 }

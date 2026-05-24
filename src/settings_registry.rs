@@ -41,6 +41,8 @@ macro_rules! setting {
 
 #[rustfmt::skip]
 pub const SETTINGS: &[SettingSpec] = &[
+    setting!("ADMIN_USER", "ADMIN_USER", "server", SettingType::Str, "", "Admin username for HTTP Basic Auth. Leave empty to disable.", None, None),
+    setting!("ADMIN_PASS", "ADMIN_PASS", "server", SettingType::Str, "", "Admin password for HTTP Basic Auth.", None, None),
     setting!("HOST", "LOCAL_HOST", "server", SettingType::Str, "0.0.0.0", "Bind address.", None, None),
     setting!("PORT", "LOCAL_PORT", "server", SettingType::Int, "5050", "Bind port.", Some(1), Some(65535)),
     setting!("FORCE_HTTPS", "FORCE_HTTPS", "server", SettingType::Bool, "false", "Redirect HTTP to HTTPS.", None, None),

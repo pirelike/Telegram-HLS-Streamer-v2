@@ -65,7 +65,7 @@ pub(super) fn normalize_category(value: Option<&str>) -> Result<Option<String>, 
     }
 }
 
-pub fn job_json(job: db::JobRow) -> Value {
+pub fn job_json(job: db::JobRow, poster_url: Option<&str>) -> Value {
     json!({
         "job_id": job.job_id,
         "filename": job.filename,
@@ -83,20 +83,24 @@ pub fn job_json(job: db::JobRow) -> Value {
         "season_number": job.season_number,
         "episode_number": job.episode_number,
         "part_number": job.part_number,
+        "episode_title": job.episode_title,
+        "poster_url": poster_url.filter(|s| !s.is_empty()),
     })
 }
 
-pub fn series_group_json(row: db::SeriesGroupRow) -> Value {
+pub fn series_group_json(row: db::SeriesGroupRow, poster_url: Option<&str>) -> Value {
     json!({
         "series_name": row.series_name,
+        "media_type": row.media_type,
         "episode_count": row.episode_count,
         "last_updated": row.last_updated,
         "job_id": row.job_id,
         "has_thumbnail": row.has_thumbnail,
+        "poster_url": poster_url.filter(|s| !s.is_empty()),
     })
 }
 
-pub fn season_group_json(row: db::SeasonGroupRow) -> Value {
+pub fn season_group_json(row: db::SeasonGroupRow, poster_url: Option<&str>) -> Value {
     json!({
         "series_name": row.series_name,
         "season_number": row.season_number,
@@ -104,6 +108,7 @@ pub fn season_group_json(row: db::SeasonGroupRow) -> Value {
         "last_updated": row.last_updated,
         "job_id": row.job_id,
         "has_thumbnail": row.has_thumbnail,
+        "poster_url": poster_url.filter(|s| !s.is_empty()),
     })
 }
 

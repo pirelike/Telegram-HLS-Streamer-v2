@@ -58,8 +58,9 @@
     const spots        = [...withThumb, ...withoutThumb].slice(0, 3);
 
     const artDivs = spots.map((j, i) => {
-      const bg = j.has_thumbnail
-        ? 'background-image:url(\'/thumbnail/' + escAttr(j.job_id) + '\');background-size:cover;background-position:center'
+      const heroImg = j.has_thumbnail ? '/thumbnail/' + escAttr(j.job_id) : null;
+      const bg = heroImg
+        ? 'background-image:url(\'' + escAttr(heroImg) + '\');background-size:cover;background-position:center'
         : 'background:' + gradient(j.job_id);
       return '<div class="t-hero__art" style="' + bg + ';opacity:' + (i === 0 ? 1 : 0) + ';transition:opacity 1.2s ease"></div>';
     }).join('');
@@ -195,7 +196,7 @@
     if (recent.length) rows.push(rowHtml('Recently Added',    annotated, 'video'));
     if (films.length)  rows.push(rowHtml('Films',  films,  'video',  '/films'));
     if (series.length) rows.push(rowHtml('Series', series, 'series', '/series'));
-    if (anime.length)  rows.push(rowHtml('Anime',  anime,  'mixed'));
+    if (anime.length)  rows.push(rowHtml('Anime',  anime,  'mixed', null, true));
 
     container.innerHTML = rows.length
       ? rows.join('')
@@ -204,8 +205,8 @@
     wireRows();
   }
 
-  function rowHtml(title, items, type, seeHref) {
-    const cards = items.map(j => cardHtml(j, type)).join('');
+  function rowHtml(title, items, type, seeHref, usePoster) {
+    const cards = items.map(j => cardHtml(j, type, usePoster)).join('');
     return '<section class="t-section">' +
              '<div class="t-section-head">' +
                '<div><h2 class="t-section-title">' + esc(title) + '</h2></div>' +
@@ -215,9 +216,9 @@
            '</section>';
   }
 
-  function cardHtml(j, type) {
+  function cardHtml(j, type, usePoster) {
     const isSeries = type === 'series' || (type === 'mixed' && (j.episode_count || j.series_name));
-    if (isSeries) return seriesCardHtml(j);
+    if (isSeries) return seriesCardHtml(j, usePoster);
 
     const safeId = escAttr(j.job_id);
     const dur    = fmtDur(j.duration);
@@ -229,8 +230,9 @@
                    ].filter(Boolean).map(esc);
     const subHtml = sub.map((s, i) => (i === 0 ? s : '<span class="sep">·</span> ' + s)).join(' ');
     const grad    = gradient(j.job_id);
-    const thumb   = j.has_thumbnail
-      ? '<img class="thumb-img" src="/thumbnail/' + safeId + '" alt="" loading="lazy" onload="this.classList.add(\'loaded\')">'
+    const thumbSrc = (usePoster ? j.poster_url : null) || (j.has_thumbnail ? '/thumbnail/' + safeId : null);
+    const thumb   = thumbSrc
+      ? '<img class="thumb-img" src="' + escAttr(thumbSrc) + '" alt="" loading="lazy" onload="this.classList.add(\'loaded\')">'
       : '<div class="thumb-placeholder"><i class="material-icons-round">play_circle_filled</i></div>';
     const progress = j.progress_pct && j.progress_pct > 0 && j.progress_pct < 100
       ? '<div style="position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,.18)">' +
@@ -251,14 +253,15 @@
            '</a>';
   }
 
-  function seriesCardHtml(j) {
+  function seriesCardHtml(j, usePoster) {
     const name  = j.series_name || cleanTitle(j.filename || j.job_id);
     const count = j.episode_count || 0;
     const cat   = j.media_type === 'Anime TV' ? '/anime-tv' : '/series';
     const href  = cat + '/' + slugify(name);
     const grad  = gradient(j.job_id || name);
-    const thumb = j.has_thumbnail
-      ? '<img class="thumb-img" src="/thumbnail/' + escAttr(j.job_id) + '" alt="" loading="lazy" onload="this.classList.add(\'loaded\')">'
+    const seriesThumbSrc = (usePoster ? j.poster_url : null) || (j.has_thumbnail ? '/thumbnail/' + escAttr(j.job_id) : null);
+    const thumb = seriesThumbSrc
+      ? '<img class="thumb-img" src="' + escAttr(seriesThumbSrc) + '" alt="" loading="lazy" onload="this.classList.add(\'loaded\')">'
       : '<div class="thumb-placeholder"><i class="material-icons-round">library_books</i></div>';
     return '<a class="video-card" href="' + href + '">' +
              '<div class="thumb-wrap" style="background:' + grad + '">' +
