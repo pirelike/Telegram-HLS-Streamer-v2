@@ -1,8 +1,11 @@
 use crate::db::{MediaFingerprintRow, NewMediaMarker};
 use crate::media::MediaAnalysis;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct MarkerDetectionResult {
@@ -127,21 +130,15 @@ fn parse_time(s: &str) -> Option<f64> {
 
 pub fn chromaprint_available() -> bool {
     std::process::Command::new("ffmpeg")
-        .args([
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=r=44100:cl=mono",
-            "-t",
-            "0.001",
-            "-f",
-            "chromaprint",
-            "-fp_format",
-            "raw",
-            "-",
-        ])
+        .arg("-version")
         .output()
-        .is_ok()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+        && std::process::Command::new("fpcalc")
+            .arg("-version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
 }
 
 pub fn fingerprint_windows(duration: f64) -> Vec<(String, f64, f64)> {
@@ -174,7 +171,7 @@ pub async fn generate_fingerprints(
                 window_duration_seconds: window_duration,
                 fingerprint,
             }),
-            Err(e) => tracing::debug!(
+            Err(e) => tracing::warn!(
                 window_type,
                 error = %e,
                 "chromaprint window generation skipped"
@@ -189,8 +186,10 @@ async fn generate_fingerprint_window(
     start_seconds: f64,
     duration_seconds: f64,
 ) -> anyhow::Result<String> {
-    let output = tokio::process::Command::new("ffmpeg")
-        .arg("-y")
+    let audio = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
         .arg("-ss")
         .arg(format!("{start_seconds:.3}"))
         .arg("-t")
@@ -199,27 +198,76 @@ async fn generate_fingerprint_window(
         .arg(source_path)
         .arg("-map")
         .arg("0:a:0")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("11025")
         .arg("-f")
-        .arg("chromaprint")
-        .arg("-fp_format")
-        .arg("raw")
-        .arg("-")
+        .arg("wav")
+        .arg("pipe:1")
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("chromaprint ffmpeg: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("extracting audio for chromaprint: {e}"))?;
 
-    if !output.status.success() {
+    if !audio.status.success() {
         anyhow::bail!(
-            "chromaprint failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "audio extraction for chromaprint failed: {}",
+            String::from_utf8_lossy(&audio.stderr)
         );
     }
 
-    let fp = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut child = Command::new("fpcalc")
+        .arg("-raw")
+        .arg("-plain")
+        .arg("-length")
+        .arg(format!("{:.0}", duration_seconds.ceil()))
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("starting fpcalc: {e}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("opening fpcalc stdin"))?;
+    stdin
+        .write_all(&audio.stdout)
+        .await
+        .map_err(|e| anyhow::anyhow!("writing audio to fpcalc: {e}"))?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow::anyhow!("waiting for fpcalc: {e}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!("fpcalc failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let fp = normalize_fingerprint_output(&String::from_utf8_lossy(&output.stdout));
     if fp.is_empty() || fp.len() < 10 {
         anyhow::bail!("chromaprint fingerprint empty or too short");
     }
     Ok(fp)
+}
+
+fn normalize_fingerprint_output(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                None
+            } else if let Some(fp) = trimmed.strip_prefix("FINGERPRINT=") {
+                Some(fp.trim().to_string())
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_default()
 }
 
 // Chromaprint emits one 32-bit int per ~0.1238 seconds.
@@ -571,5 +619,11 @@ mod tests {
             .collect();
 
         assert!(compare_fingerprints(&generated, &filtered).is_empty());
+    }
+
+    #[test]
+    fn normalize_fingerprint_output_accepts_plain_and_keyed_output() {
+        assert_eq!(normalize_fingerprint_output("1,2,3\n"), "1,2,3");
+        assert_eq!(normalize_fingerprint_output("FINGERPRINT=4,5,6\n"), "4,5,6");
     }
 }

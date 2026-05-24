@@ -1,8 +1,12 @@
 mod analysis;
 mod encoder;
+mod ffmpeg;
 mod markers;
 mod models;
 mod process;
+mod process_audio;
+mod process_probe;
+mod process_video;
 mod tiers;
 
 pub use analysis::*;

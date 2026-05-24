@@ -6,13 +6,16 @@ Full job lifecycle: enqueue → analyze → process → upload to Telegram → s
 
 | File | Responsibility | ~Lines |
 |---|---|---|
-| `mod.rs` | Module root and re-exports used by `api/mod.rs`, uploads, tests. | 16 |
-| `types.rs` | `JobMetadata`, `JobStatus`, `JobState`, `JobRequest`, `JobsQuery`. | 83 |
-| `handlers.rs` | HTTP handlers (`handle_*`) and `queue_metrics`. | 388 |
-| `json.rs` | JSON serialization helpers, queue position, field/category validators. | 139 |
-| `download.rs` | Original-source download, DB-complete lookup, segment reconstruction, response streaming. | 267 |
-| `processing.rs` | Enqueue, dispatcher, `process_job`, uploads, DB row construction, timeouts, cleanup, webhooks. | 807 |
-| `tests.rs` | Focused jobs tests for DB row building, upload-file collection, integrity handling. | 262 |
+| `mod.rs` | Module root and re-exports used by `api/mod.rs`, uploads, tests. | 21 |
+| `types.rs` | `JobMetadata`, `JobStatus`, `JobState`, `JobRequest`, `JobsQuery`. | 87 |
+| `handlers.rs` | HTTP handlers (`handle_*`) and `queue_metrics`. | 539 |
+| `json.rs` | JSON serialization helpers, queue position, field/category validators. | 161 |
+| `download.rs` | Original-source download, DB-complete lookup, segment reconstruction, response streaming. | 540 |
+| `processing.rs` | Enqueue, dispatcher, `process_job` orchestrator, and processing re-exports. | 554 |
+| `processing_upload.rs` | Upload file collection/splitting, Telegram upload fanout, and DB row construction. | 446 |
+| `processing_lifecycle.rs` | Cancellation, completion/error transitions, timeout cleanup, webhooks, and startup recovery. | 376 |
+| `processing_markers.rs` | Intro/outro marker detection preparation, marker save, and metadata auto-fetch trigger. | 208 |
+| `tests.rs` | Focused jobs tests for DB row building, upload-file collection, integrity handling. | 454 |
 
 ## Public API re-exported through `mod.rs`
 
@@ -26,7 +29,7 @@ Full job lifecycle: enqueue → analyze → process → upload to Telegram → s
 1. Upload/watch/reprocess code calls `enqueue_job()`.
 2. `enqueue_job()` inserts a queued `JobState` into `state.jobs` and sends a `JobRequest`.
 3. `job_dispatcher` acquires the concurrency semaphore and calls `process_job()`.
-4. `process_job()` runs `media::analyze_media()` → `media::process_media()` → `upload_outputs()` → `build_db_rows()` → `db::save_job()`.
+4. `process_job()` runs `media::analyze_media()` → `media::process_media()` → `processing_upload::upload_outputs()` → `build_db_rows()` → `db::save_job()`.
 5. Background watchers handle timeout, cancellation, webhook notification, terminal cleanup, and path cleanup.
 
 ## Dependency direction
@@ -70,6 +73,6 @@ jobs/download.rs ──► {db, telegram}
 |---|---|
 | Change list/get/patch/delete/cancel API behavior | `handlers.rs` plus `json.rs` if response shape changes. |
 | Change processing steps or progress text | `processing.rs`. |
-| Change Telegram upload file collection/splitting | `processing.rs`. |
+| Change Telegram upload file collection/splitting | `processing_upload.rs`. |
 | Change original download/reconstruction | `download.rs`. |
 | Add job metadata | `types.rs`, `handlers.rs`, `json.rs`, `processing.rs`, and `src/db/`. |

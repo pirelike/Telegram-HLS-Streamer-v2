@@ -45,7 +45,13 @@ async fn manager_loop(state: Arc<AppState>) {
         let cfg = state.config.read().await.clone();
         if !cfg.cloudflared_enabled {
             set_disabled(&state).await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = state.shutdown_token.cancelled() => {
+                    tracing::info!("cloudflared manager shutting down");
+                    return;
+                }
+            }
             continue;
         }
         if cfg.cloudflared_config.trim().is_empty() {
@@ -55,7 +61,13 @@ async fn manager_loop(state: Arc<AppState>) {
                 "CLOUDFLARED_CONFIG is required when cloudflared is enabled",
             )
             .await;
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                _ = state.shutdown_token.cancelled() => {
+                    tracing::info!("cloudflared manager shutting down");
+                    return;
+                }
+            }
             continue;
         }
 
@@ -63,7 +75,8 @@ async fn manager_loop(state: Arc<AppState>) {
         let mut cmd = Command::new("cloudflared");
         cmd.args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         tracing::info!(args = ?args, "starting cloudflared");
         match cmd.spawn() {
             Ok(mut child) => {
@@ -100,6 +113,12 @@ async fn manager_loop(state: Arc<AppState>) {
                                 break "cloudflared config changed".into();
                             }
                         }
+                        _ = state.shutdown_token.cancelled() => {
+                            let _ = child.kill().await;
+                            set_disabled(&state).await;
+                            tracing::info!("cloudflared stopped due to shutdown");
+                            return;
+                        }
                     }
                 };
                 if message == "cloudflared disabled" {
@@ -113,7 +132,13 @@ async fn manager_loop(state: Arc<AppState>) {
                 set_error(&state, true, &format!("failed to start cloudflared: {e}")).await;
             }
         }
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = state.shutdown_token.cancelled() => {
+                tracing::info!("cloudflared manager shutting down");
+                return;
+            }
+        }
     }
 }
 

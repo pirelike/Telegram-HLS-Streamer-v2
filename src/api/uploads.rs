@@ -458,11 +458,26 @@ pub(super) async fn handle_upload_finalize(
 pub(super) async fn handle_upload_status(
     State(state): State<Arc<AppState>>,
     Path(upload_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
+    if uuid::Uuid::parse_str(&upload_id).is_err() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            "invalid upload id format",
+        );
+    }
+
+    let cfg = state.config.read().await.clone();
+    let ip = client_ip(&headers, cfg.behind_proxy);
+
     let pending = state.pending_uploads.lock().await;
     let Some(upload) = pending.get(&upload_id) else {
         return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
     };
+    if upload.ip != ip {
+        return api_error(StatusCode::NOT_FOUND, "not_found", "upload not found");
+    }
     Json(upload_status_json(upload, "pending")).into_response()
 }
 
@@ -562,8 +577,14 @@ fn client_ip(headers: &HeaderMap, behind_proxy: bool) -> std::net::IpAddr {
         headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse().ok())
+            .and_then(|v| {
+                let entries: Vec<&str> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                entries.last().and_then(|s| s.parse().ok())
+            })
             .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback ip"))
     } else {
         "127.0.0.1".parse().expect("loopback ip")
@@ -631,6 +652,46 @@ pub(crate) fn free_space_bytes(path: &FsPath) -> std::io::Result<u64> {
 #[cfg(not(unix))]
 pub(crate) fn free_space_bytes(_path: &FsPath) -> std::io::Result<u64> {
     Ok(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn make_headers(forwarded: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", forwarded.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn client_ip_takes_rightmost_entry() {
+        let headers = make_headers("1.2.3.4, 10.0.0.1");
+        let ip = client_ip(&headers, true);
+        assert_eq!(ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_single_entry() {
+        let headers = make_headers("10.0.0.1");
+        let ip = client_ip(&headers, true);
+        assert_eq!(ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_no_proxy_returns_loopback() {
+        let headers = HeaderMap::new();
+        let ip = client_ip(&headers, false);
+        assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_missing_header_returns_loopback() {
+        let headers = HeaderMap::new();
+        let ip = client_ip(&headers, true);
+        assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
 }
 
 pub(crate) async fn cleanup_orphaned_uploads(uploads_dir: &std::path::Path) {

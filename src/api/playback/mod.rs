@@ -1,5 +1,8 @@
 mod cache;
 mod real;
+mod real_fetch;
+mod real_prefetch;
+mod real_recovery;
 #[cfg(test)]
 mod tests;
 mod virtual_;
@@ -103,7 +106,7 @@ pub(super) async fn handle_segment(
 
 // Exposed for playlists::handle_thumbnail
 pub(super) use real::serve_real_segment;
-pub(super) use real::spawn_cache_warmup;
+pub(super) use real_prefetch::spawn_cache_warmup;
 
 fn cache_response(entry: CacheEntry) -> Response {
     if let Some(path) = entry.file_path.clone() {

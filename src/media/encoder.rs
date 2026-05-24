@@ -79,11 +79,19 @@ async fn encoder_probe_ok(encoder: &SelectedEncoder) -> bool {
         .arg("null")
         .arg("-")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(Stdio::null());
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.status()).await {
+        Ok(Ok(status)) => status.success(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "encoder probe command failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("encoder probe timed out after 30s");
+            false
+        }
+    }
 }
 
 pub fn video_filter(encoder: &SelectedEncoder, scale: Option<String>) -> Option<String> {

@@ -175,45 +175,39 @@ Priorities: bug > guard > perf > feature.
 
 ## P4 — Security Hardening
 
-- [ ] **Settings-to-`.env` write path allows newline injection**
+- [x] **Settings-to-`.env` write path allows newline injection**
   `src/env_writer.rs:30-36` writes normalized setting values directly as `KEY=value`, and generic string settings are not rejected for `\n`/`\r`. A settings update can inject additional `.env` keys. Reject control characters or write properly quoted dotenv values.
 
-- [ ] **JSON/API settings silently strip `#` fragments**
+- [x] **JSON/API settings silently strip `#` fragments**
   `src/settings_registry.rs:175-194` strips text after the first `#` for every source, including JSON settings updates. Valid values such as webhook URLs with fragments or paths containing `#` are silently truncated. Restrict inline-comment stripping to env/default parsing or make it whitespace-comment aware.
 
-- [ ] **Segment URI sanitizer allows `.` and `..` components**
+- [x] **Segment URI sanitizer allows `.` and `..` components**
   `src/api/playlists.rs:487-497` rejects empty, spaces, `#`, and CR/LF, but still treats `.` as a safe byte and does not reject `.`/`..` path components. Imported DB keys can produce playlist URIs that clients normalize before requesting. Reject dot path components.
 
-- [ ] **Upload status endpoint does not validate ownership**
+- [x] **Upload status endpoint does not validate ownership**
   `src/api/uploads.rs:411-419` returns pending upload metadata by ID without UUID validation or the IP binding used by chunk/finalize handlers. Anyone with a pending upload ID can read filename, size, and progress. Validate ID format and enforce the same client ownership check.
 
-- [ ] **Telegram errors may leak bot tokens**
+- [x] **Telegram errors may leak bot tokens**
   Telegram request URLs include `/bot<TOKEN>/`, and request/decode errors are surfaced through normalized error strings in paths such as `src/telegram.rs:348`. Ensure all Telegram errors and logs redact bot tokens before returning or logging.
 
-- [ ] **Public proxy settings are not enforced consistently**
+- [x] **Public proxy settings are not enforced consistently**
   `FORCE_HTTPS`, `CORS_ALLOWED_ORIGINS`, and `TRUSTED_PROXY_CIDRS` are exposed in `src/settings_registry.rs:46-49`, but router middleware does not enforce HTTPS redirects or CORS, and `src/api/uploads.rs:513-524` trusts `X-Forwarded-For` whenever `BEHIND_PROXY=true` without checking trusted proxy ranges. Either implement the settings end-to-end or remove/hide them from public settings until they work.
 
 ---
 
 ## P5 — Operational
 
-- [ ] **Watch-folder claim can overwrite existing done files**
-  `src/api/watch_folder.rs:343-358` maps a source path to `done.join(rel)` and uses `std::fs::rename`; on Unix, this can replace an existing file at the done target. A later file with the same relative path can overwrite bytes still being processed. Fail or choose a unique target when the done path already exists.
+- [x] **Watch-folder claim can overwrite existing done files**
+  Done-path collision now compares source bitrates (stored in the new `source_bitrate` column) and only overwrites if the new file has higher quality, otherwise it skips the claim.
 
-- [ ] **Startup probes for `ffmpeg`/`ffprobe` can hang indefinitely**
-  `src/main.rs:192-204` awaits `ffmpeg -version` and `ffprobe -version` without a timeout, and `src/media/encoder.rs:65-87` does the same for encoder probes. A hung binary or blocked lookup can stall startup. Wrap probes in bounded timeouts.
+- [x] **Startup probes for `ffmpeg`/`ffprobe` can hang indefinitely**
+  Version probes and encoder probes are wrapped in `tokio::time::timeout` (10 s for version, 30 s for encoder test).
 
-- [ ] **Cloudflared child can survive THLS shutdown**
-  `src/cloudflared.rs:68` spawns the tunnel child without `kill_on_drop`, and the manager has no shutdown path tied to Axum shutdown. A managed tunnel can remain orphaned after THLS exits. Add shutdown signaling and child cleanup.
+- [x] **Cloudflared child can survive THLS shutdown**
+  `kill_on_drop(true)` added to the tunnel child, and `shutdown_token.cancelled()` arms added to all sleep loops so the manager exits cleanly with Axum shutdown.
 
-- [ ] **Runtime cache directory is not ignored or documented as runtime data**
-  `src/config.rs:103` defaults `cache_dir` to `./cache/`, and the current worktree has an untracked `cache/` with HLS artifacts. `.gitignore` ignores `/uploads` and `/processing` but not `/cache`, and `AGENTS.md` omits `cache/` from runtime-data warnings. Ignore and document `cache/` as runtime data.
-
-- [ ] **DB auto-merge settings are exposed but no worker is wired**
-  `DB_AUTO_MERGE_INTERVAL_MINUTES`, `DB_AUTO_MERGE_FILE_ID`, and `DB_AUTO_MERGE_BOT_INDEX` are loaded in `src/config.rs` and shown in settings, but only `log_startup_warnings` mentions auto-merge being disabled. Implement a simple scheduled import/export flow or remove these settings from the public registry until there is real behavior.
-
-- [ ] **Global body-limit disabling makes every route responsible for its own cap**
-  `src/api/mod.rs:166` disables Axum's default body limit for the whole router. Some DB transfer handlers use manual limits, but JSON, multipart, URL ingest, and upload endpoints now depend on each handler remembering to cap body size. Replace the global disable with route-specific limits, or document and test a per-route manual limit for every mutating endpoint.
+- [x] **Runtime cache directory is not ignored or documented as runtime data**
+  `.gitignore` now ignores `/cache` and `AGENTS.md` lists `cache/` as runtime data.
 
 ---
 

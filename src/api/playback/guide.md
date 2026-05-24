@@ -6,11 +6,14 @@ Serves HLS segment-like assets on demand with an in-memory LRU cache, single-fli
 
 | File | Responsibility | ~Lines |
 |---|---|---|
-| `mod.rs` | Module root, `handle_segment`, shared response/content helpers, `SegmentLookup` helper impl. | 119 |
-| `cache.rs` | `SegmentCache`, LRU bookkeeping, cache snapshots, in-flight single-flight coordination. | 155 |
-| `real.rs` | Persisted segment serving: DB lookup, Telegram fetch, multipart reconstruction, WebVTT timestamp injection, prefetch. | 398 |
-| `virtual_.rs` | Virtual ABR: source fetch, init generation, FFmpeg transcode, fMP4 box parsing, virtual prefetch. | 402 |
-| `tests.rs` | Cache, content-type, virtual-key, WebVTT, and fMP4 parsing tests. | 77 |
+| `mod.rs` | Module root, `handle_segment`, shared response/content helpers, `SegmentLookup` helper impl. | 220 |
+| `cache.rs` | `SegmentCache`, LRU bookkeeping, cache snapshots, in-flight single-flight coordination. | 220 |
+| `real.rs` | Persisted segment serving entry points, DB lookup, played-segment cleanup, and source/cache recovery helpers. | 389 |
+| `real_fetch.rs` | Real segment single-flight fetch core, multipart reconstruction, Telegram fetch timeout handling. | 241 |
+| `real_recovery.rs` | Stale Telegram file-id recovery and re-upload decision helpers. | 112 |
+| `real_prefetch.rs` | Real segment prefetch and cache warm-up selection/execution. | 218 |
+| `virtual_.rs` | Virtual ABR: source fetch, init generation, FFmpeg transcode, fMP4 box parsing, virtual prefetch. | 637 |
+| `tests.rs` | Cache, content-type, virtual-key, WebVTT, and fMP4 parsing tests. | 480 |
 
 ## Public API
 
@@ -22,7 +25,7 @@ Serves HLS segment-like assets on demand with an in-memory LRU cache, single-fli
 
 1. `handle_segment` validates `job_id` and segment key using `playlists::sanitize_segment_uri()`.
 2. Virtual keys (`virtual/...`) dispatch to `virtual_.rs`; all other keys dispatch to `real.rs`.
-3. Real path: check cache → check DB for multipart rows → reconstruct or single-flight fetch from Telegram → cache/respond → prefetch next real segments.
+3. Real path: check cache → check DB for multipart rows → reconstruct or single-flight fetch from Telegram via `real_fetch.rs` → cache/respond → prefetch next real segments via `real_prefetch.rs`.
 4. Virtual path: check cache → single-flight → fetch tier-0 source/init → transcode via FFmpeg when needed → cache/respond → prefetch next virtual segments.
 
 ## Dependency direction
@@ -30,7 +33,7 @@ Serves HLS segment-like assets on demand with an in-memory LRU cache, single-fli
 ```text
 api/mod.rs ──► playback::handle_segment
 playlists.rs ──► playback::serve_real_segment (thumbnail)
-playback/real.rs ──► {db, telegram}
+playback/real*.rs ──► {db, telegram}
 playback/virtual_.rs ──► {db, telegram, media helpers, ffmpeg}
 playback/cache.rs ──► std/tokio sync only
 ```
@@ -64,7 +67,7 @@ playback/cache.rs ──► std/tokio sync only
 | I want to... | Go to |
 |---|---|
 | Change cache budget/eviction/snapshots | `cache.rs`. |
-| Change Telegram segment fetch or multipart reconstruction | `real.rs`. |
+| Change Telegram segment fetch or multipart reconstruction | `real_fetch.rs`. |
 | Change virtual ABR transcode or fMP4 parsing | `virtual_.rs`. |
 | Add a served extension/content type | `mod.rs` content-type helper and tests. |
 | Change playlist URIs for segments | `api/playlists.rs`, not this module. |

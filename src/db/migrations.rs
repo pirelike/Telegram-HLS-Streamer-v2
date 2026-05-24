@@ -140,6 +140,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         name: "add_telegram_encryption_nonces",
         run: run_migration_26,
     },
+    Migration {
+        revision: 27,
+        name: "add_jobs_source_bitrate",
+        run: run_migration_27,
+    },
 ];
 
 // Public wrappers for test access
@@ -220,6 +225,9 @@ pub(crate) fn run_migration_25(conn: &Connection) -> Result<()> {
 }
 pub(crate) fn run_migration_26(conn: &Connection) -> Result<()> {
     migration_26_add_telegram_encryption_nonces(conn)
+}
+pub(crate) fn run_migration_27(conn: &Connection) -> Result<()> {
+    migration_27_add_jobs_source_bitrate(conn)
 }
 
 fn table_sql_contains(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
@@ -415,6 +423,7 @@ fn validate_column_name(column: &str) -> Result<&str> {
         | "created_at_unix"
         | "prefix"
         | "episode_title"
+        | "source_bitrate"
         | "encryption_nonce" => Ok(column),
         _ => bail!("unknown sqlite column: {column}"),
     }
@@ -1259,6 +1268,10 @@ fn migration_26_add_telegram_encryption_nonces(conn: &Connection) -> Result<()> 
         "TEXT DEFAULT NULL",
     )?;
     Ok(())
+}
+
+fn migration_27_add_jobs_source_bitrate(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "jobs", "source_bitrate", "INTEGER NOT NULL DEFAULT 0")
 }
 
 fn backfill_segment_key_parts(conn: &Connection, table: &str) -> Result<()> {

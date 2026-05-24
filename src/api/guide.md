@@ -6,19 +6,26 @@ HTTP layer for THLS. This folder owns Axum routes, request/response shaping, bro
 
 | Module | Type | Responsibility | ~Lines |
 |---|---|---|---|
-| `mod.rs` | file | Router definition, `AppState`, health/metrics endpoints, shared API helpers. | 232 |
-| `bots_settings.rs` | file | Settings CRUD and bot-management endpoints. | 343 |
-| `db_transfer.rs` | file | DB export/import/backup/load endpoints. | 386 |
-| `frontend.rs` | file | Server-rendered HTML pages and small HTML helpers. | 775 |
-| `jobs/` | dir | Job lifecycle and jobs REST API. Read `jobs/guide.md`. | ~1962 |
-| `markers.rs` | file | Media marker endpoint: intro/outro for Shaka skip UI. | 24 |
-| `metadata.rs` | file | External metadata cache/search/link API (TMDB, AniList). | 413 |
-| `playback/` | dir | Segment serving, cache, real/virtual segment fetches. Read `playback/guide.md`. | ~1151 |
-| `playlists.rs` | file | HLS master/media/subtitle/virtual playlist generation and thumbnail route. | 734 |
-| `progress.rs` | file | Browser-client playback progress persistence API. | 218 |
-| `tests.rs` | file | Cross-API integration tests and shared API test helpers. | 1038 |
-| `uploads.rs` | file | Chunked resumable upload protocol and pending-upload cleanup. | 528 |
-| `watch_folder.rs` | file | Watch-folder settings, scanning, and auto-enqueue flow. | 400 |
+| `mod.rs` | file | Router definition, `AppState`, health/metrics endpoints, shared API helpers. | 460 |
+| `auth.rs` | file | Lightweight auth/session helpers. | 75 |
+| `bots_settings.rs` | file | Settings CRUD and bot-management endpoints. | 483 |
+| `db_transfer.rs` | file | DB export/import/backup/load HTTP handlers and request helpers. | 378 |
+| `db_transfer_replace.rs` | file | Import staging, merge, live replacement, and pool drain helpers. | 146 |
+| `db_transfer_sync.rs` | file | Automatic DB sync/bootstrap snapshot orchestration and Telegram upload. | 372 |
+| `frontend.rs` | file | Server-rendered page handlers, routing/resolution helpers, shell/chrome, slug helpers. | 372 |
+| `frontend_bodies.rs` | file | Per-page HTML body builders used by `frontend.rs`. | 421 |
+| `ingest.rs` | file | URL ingest validation/download and enqueue flow. | 587 |
+| `jobs/` | dir | Job lifecycle and jobs REST API. Read `jobs/guide.md`. | ~3386 |
+| `markers.rs` | file | Media marker endpoint: intro/outro for Shaka skip UI. | 40 |
+| `metadata.rs` | file | External metadata cache/search/link API (TMDB, AniList). | 717 |
+| `playback/` | dir | Segment serving, cache, real/virtual segment fetches. Read `playback/guide.md`. | ~2517 |
+| `playlists.rs` | file | HLS master/media/subtitle/virtual playlist generation and thumbnail route. | 585 |
+| `playlists/` | dir | Playlist unit tests. | ~222 |
+| `progress.rs` | file | Browser-client playback progress persistence API. | 244 |
+| `tests.rs` | file | Cross-API integration test module root. | 7 |
+| `tests/` | dir | Split integration test harness and feature clusters. | ~1667 |
+| `uploads.rs` | file | Chunked resumable upload protocol and pending-upload cleanup. | 727 |
+| `watch_folder.rs` | file | Watch-folder settings, scanning, and auto-enqueue flow. | 640 |
 
 ## Key public items from `mod.rs`
 

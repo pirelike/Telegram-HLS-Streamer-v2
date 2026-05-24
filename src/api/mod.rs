@@ -1,7 +1,10 @@
 mod auth;
 mod bots_settings;
 pub(crate) mod db_transfer;
+mod db_transfer_replace;
+mod db_transfer_sync;
 mod frontend;
+mod frontend_bodies;
 mod ingest;
 pub(crate) mod jobs;
 mod markers;
@@ -19,17 +22,20 @@ pub(crate) use watch_folder::load_watch_settings;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 use bots_settings::{
@@ -111,7 +117,15 @@ pub(super) fn valid_job_id(value: &str) -> bool {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let cfg = state
+        .config
+        .try_read()
+        .expect("config available at router init");
+    let force_https = cfg.force_https;
+    let cors_origins = cfg.cors_allowed_origins.clone();
+    drop(cfg);
+
+    let mut r = Router::new()
         .route("/", get(frontend::handle_home))
         .route("/films", get(frontend::handle_films))
         .route("/series", get(frontend::handle_series_root))
@@ -225,7 +239,83 @@ pub fn router(state: Arc<AppState>) -> Router {
             auth::require_auth,
         ))
         .route("/health", get(handle_health))
-        .with_state(state)
+        .with_state(state);
+
+    // HTTPS redirect (inner layer — runs after CORS on incoming requests)
+    if force_https {
+        r = r.layer(axum::middleware::from_fn(redirect_to_https));
+    }
+
+    // CORS (outer layer — applied first to incoming requests)
+    if !cors_origins.is_empty() {
+        if cors_origins.iter().any(|o| o == "*") {
+            r = r.layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods([
+                        Method::GET,
+                        Method::POST,
+                        Method::PUT,
+                        Method::DELETE,
+                        Method::PATCH,
+                        Method::OPTIONS,
+                    ])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+                    .max_age(Duration::from_secs(86400)),
+            );
+        } else {
+            let origins: Vec<HeaderValue> = cors_origins
+                .iter()
+                .filter_map(|o| o.parse::<HeaderValue>().ok())
+                .collect();
+            if !origins.is_empty() {
+                r = r.layer(
+                    CorsLayer::new()
+                        .allow_origin(origins)
+                        .allow_methods([
+                            Method::GET,
+                            Method::POST,
+                            Method::PUT,
+                            Method::DELETE,
+                            Method::PATCH,
+                            Method::OPTIONS,
+                        ])
+                        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+                        .allow_credentials(true)
+                        .max_age(Duration::from_secs(86400)),
+                );
+            }
+        }
+    }
+
+    r
+}
+
+async fn redirect_to_https(request: Request<Body>, next: Next) -> Response {
+    let proto = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    if proto == "http" {
+        let host = request
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost");
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let https_url = format!("https://{}{}", host, path);
+        return Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header("location", https_url)
+            .body(Body::empty())
+            .unwrap();
+    }
+    next.run(request).await
 }
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<Value> {

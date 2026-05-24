@@ -283,7 +283,7 @@ async fn fetch_source_for_virtual(
                 )
                 .await
                 .with_context(|| format!("fetching part of {source_key}"))?;
-                let aad = super::real::segment_part_aad(source_key, part.part_index);
+                let aad = super::real_fetch::segment_part_aad(source_key, part.part_index);
                 let bytes = crate::crypto::decrypt_optional(
                     cfg.telegram_encryption_key.as_ref(),
                     part.encryption_nonce.as_deref(),
@@ -305,7 +305,7 @@ async fn fetch_source_for_virtual(
         let entry = result?;
         return Ok((*entry.bytes).clone());
     }
-    let entry = super::real::fetch_real_with_singleflight(
+    let entry = super::real_fetch::fetch_real_with_singleflight(
         state,
         cfg,
         &cache_key,

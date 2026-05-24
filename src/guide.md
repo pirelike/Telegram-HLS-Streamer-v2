@@ -10,7 +10,8 @@ Start here before editing code under `src/`. This file is the top-level map; the
 | `config.rs` | file | Effective runtime config loaded from DB settings plus env-var overrides. |
 | `crypto.rs` | file | Env-key parsing plus AEAD encrypt/decrypt helpers for Telegram-bound payloads. |
 | `settings_registry.rs` | file | Setting key definitions, defaults, validation rules, and public-key allowlist. |
-| `telegram.rs` | file | Telegram Bot API client/runtime: upload, download, bot pool management, metrics, retry behavior. |
+| `telegram.rs` | file | Telegram Bot API runtime, metrics, health probing, and module root for Telegram helpers. |
+| `telegram/` | dir | Telegram upload/download/error helper submodules and Telegram unit tests. |
 | `api/` | dir | HTTP layer: router, handlers, upload flow, job processing, segment serving, pages. See `src/api/guide.md`. |
 | `db/` | dir | SQLite persistence: schema migrations, query functions, export/import/backup. See `src/db/guide.md`. |
 | `media/` | dir | FFprobe/FFmpeg pipeline: analysis, ABR tier selection, encoder probe, HLS processing. See `src/media/guide.md`. |
@@ -42,7 +43,7 @@ Keep this direction acyclic. `api` orchestrates application flows; `db`, `media`
 | Upload protocol changes | `api/uploads.rs`. |
 | SQLite schema/query/export behavior | `db/`. Do not write SQL in unrelated modules unless it is a test setup. |
 | FFprobe/FFmpeg media processing | `media/`. Do not put HTTP, DB, or Telegram logic here. |
-| Telegram Bot API behavior | `telegram.rs`. |
+| Telegram Bot API behavior | `telegram.rs` plus the focused `telegram/` helper files. |
 | Telegram payload encryption/decryption primitives | `crypto.rs`; orchestration stays in API/job/db-transfer code. |
 | Runtime setting key/default/validation | `settings_registry.rs` and, if needed, `config.rs`. |
 

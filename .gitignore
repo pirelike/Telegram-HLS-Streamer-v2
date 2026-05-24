@@ -31,6 +31,17 @@ Thumbs.db
 # AI agent tooling
 .sisyphus/
 .antigravitycli/
+.claude/
+.codex/
+
+# Knowledge graph / analysis cache
+graphify-out/
+.understand-anything/
+
+# Node (used by graphify tooling only)
+node_modules/
+package.json
+package-lock.json
 
 # Internal docs
 /docs/
