@@ -15,21 +15,20 @@ pub(super) fn file_url(base_url: &str, token: &str, file_path: &str) -> String {
 }
 
 pub(super) fn validate_file_id(file_id: &str) -> Result<()> {
-    if file_id.len() < 5 {
+    if file_id.trim().len() < 5 {
         tracing::warn!(
             len = file_id.len(),
             "validate_file_id called with suspiciously short file_id"
         );
+        bail!("invalid Telegram file_id")
     }
-    if (50..=255).contains(&file_id.len())
-        && file_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if file_id.trim().is_empty()
+        || file_id.len() > 4096
+        || file_id.bytes().any(|b| b.is_ascii_control())
     {
-        Ok(())
-    } else {
-        bail!("invalid Telegram file_id (expected 50–255 chars of A-Za-z0-9/_-)")
+        bail!("invalid Telegram file_id")
     }
+    Ok(())
 }
 
 pub(super) fn redact_bot_token(msg: &str) -> String {
@@ -70,7 +69,7 @@ pub(super) fn classify_api_body(status: u16, body: &Value) -> TelegramError {
             .pointer("/parameters/retry_after")
             .and_then(Value::as_u64)
             .unwrap_or(1);
-        return TelegramError::RetryAfter(Duration::from_secs(retry_after));
+        return TelegramError::RetryAfter(Duration::from_secs(retry_after.max(1)));
     }
     if code == 400 || code == 403 {
         return TelegramError::Permanent(anyhow!(normalize_telegram_api_error(status, body)));

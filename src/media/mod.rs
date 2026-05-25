@@ -11,6 +11,7 @@ mod tiers;
 
 pub use analysis::*;
 pub use encoder::*;
+pub(crate) use ffmpeg::run_ffmpeg_cancellable;
 pub use markers::*;
 pub use models::*;
 pub use process::*;
@@ -19,6 +20,7 @@ pub use tiers::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,12 +44,31 @@ mod tests {
         assert_eq!(analysis.subtitle_streams[0].language, "hun");
     }
 
+    #[tokio::test]
+    async fn ffprobe_analysis_skips_attached_picture_when_real_video_exists() {
+        let value = serde_json::json!({
+            "format": { "duration": "12.5", "size": "1000" },
+            "streams": [
+                { "index": 0, "codec_type": "video", "codec_name": "mjpeg", "width": 500, "height": 500, "disposition": { "attached_pic": 1 } },
+                { "index": 1, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080, "bit_rate": "5000000" }
+            ]
+        });
+        let analysis = analysis::analysis_from_ffprobe(std::path::Path::new("/missing"), &value)
+            .await
+            .unwrap();
+        assert_eq!(analysis.video_streams.len(), 1);
+        assert_eq!(analysis.video_streams[0].index, 1);
+        assert_eq!(analysis.video_streams[0].codec_name, "h264");
+    }
+
     #[test]
     fn copy_mode_abr_matrix_selects_expected_tiers() {
-        let mut cfg = crate::config::Config::default();
-        cfg.abr_tiers = "1080:10M,720:5M,480:2M".into();
-        cfg.enable_copy_mode = true;
-        cfg.abr_enabled = true;
+        let mut cfg = crate::config::Config {
+            abr_tiers: "1080:10M,720:5M,480:2M".into(),
+            enable_copy_mode: true,
+            abr_enabled: true,
+            ..Default::default()
+        };
         let tiers = select_video_tiers(&cfg, "h264", 1080);
         assert_eq!(
             tiers.iter().map(|t| t.height).collect::<Vec<_>>(),
@@ -75,9 +96,11 @@ mod tests {
 
     #[test]
     fn virtual_abr_generates_only_tier_zero() {
-        let mut cfg = crate::config::Config::default();
-        cfg.abr_enabled = true;
-        cfg.virtual_abr_tiers = true;
+        let cfg = crate::config::Config {
+            abr_enabled: true,
+            virtual_abr_tiers: true,
+            ..Default::default()
+        };
         let tiers = select_video_tiers(&cfg, "h264", 1080);
         assert_eq!(tiers.len(), 1);
     }
@@ -146,11 +169,13 @@ nested/video_0001.m4s?token=ignored
         assert_eq!(analysis.video_streams[0].codec_name, "h264");
         assert_eq!(analysis.audio_streams.len(), 1);
 
-        let mut cfg = crate::config::Config::default();
-        cfg.enable_hw_accel = false;
-        cfg.abr_enabled = false;
-        // Drive the per-job formula toward ~1 s segments by making the byte ceiling tiny.
-        cfg.segment_target_size = 256 * 1024;
+        let cfg = crate::config::Config {
+            enable_hw_accel: false,
+            abr_enabled: false,
+            // Drive the per-job formula toward ~1 s segments by making the byte ceiling tiny.
+            segment_target_size: 256 * 1024,
+            ..Default::default()
+        };
         let output = base.join("out");
         let cancel = Arc::new(AtomicBool::new(false));
         let result = process_media(&analysis, "job1", &output, &cfg, &cancel, None)
@@ -341,31 +366,20 @@ nested/video_0001.m4s?token=ignored
     }
 
     #[test]
-    fn repair_needs_split_at_32kbps_floor() {
+    fn repair_needs_split_allows_32kbps_floor() {
         assert!(process::repair_needs_split(31999));
-        assert!(process::repair_needs_split(32000));
-        assert!(process::repair_needs_split(32001));
+        assert!(!process::repair_needs_split(32000));
+        assert!(!process::repair_needs_split(32001));
         assert!(!process::repair_needs_split(33000));
         assert!(!process::repair_needs_split(1_000_000));
     }
 
     #[test]
-    fn fmp4_input_arg_uses_concat_for_m4s() {
+    fn fmp4_input_arg_uses_plain_path_for_m4s() {
         use std::path::PathBuf;
         let m4s = PathBuf::from("/tmp/video_0/video_0001.m4s");
         let arg = process::fmp4_input_arg(&m4s);
-        assert!(
-            arg.starts_with("concat:"),
-            "expected concat format for m4s, got: {arg}"
-        );
-        assert!(
-            arg.contains("init.mp4"),
-            "should include init.mp4, got: {arg}"
-        );
-        assert!(
-            arg.contains("video_0001.m4s"),
-            "should include the segment, got: {arg}"
-        );
+        assert_eq!(arg, "/tmp/video_0/video_0001.m4s");
 
         let ts = PathBuf::from("/tmp/video_0/video_0001.ts");
         let arg = process::fmp4_input_arg(&ts);
@@ -388,6 +402,37 @@ nested/video_0001.m4s?token=ignored
         assert_eq!(process::bitrate_bits("128000"), 128_000);
         assert_eq!(process::bitrate_bits("128kbps"), 128_000);
         assert_eq!(process::bitrate_bits("2Mbps"), 2_000_000);
+    }
+
+    #[test]
+    fn target_segment_duration_parses_multi_char_bitrate_suffixes() {
+        let cfg = Config {
+            segment_target_size: 15 * 1024 * 1024,
+            ..Default::default()
+        };
+        let analysis = MediaAnalysis {
+            file_path: std::path::PathBuf::from("/tmp/source.mkv"),
+            duration: 60.0,
+            file_size: 100_000_000,
+            video_streams: Vec::new(),
+            audio_streams: Vec::new(),
+            subtitle_streams: Vec::new(),
+            raw_ffprobe_json: None,
+        };
+        let tier_kbps = VideoTier {
+            index: 0,
+            height: 720,
+            bitrate: "1500kbps".into(),
+            copy: false,
+        };
+        let tier_k = VideoTier {
+            bitrate: "1500k".into(),
+            ..tier_kbps.clone()
+        };
+        assert_eq!(
+            process::target_segment_seconds_for_tier(&cfg, &analysis, &tier_kbps),
+            process::target_segment_seconds_for_tier(&cfg, &analysis, &tier_k)
+        );
     }
 
     #[test]

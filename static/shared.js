@@ -199,5 +199,7 @@ function updateSidebar() {
     }
 
     pollActiveJobs();
-    setInterval(pollActiveJobs, 5000);
+    const globalPollTimer = setInterval(pollActiveJobs, 5000);
+    window.addEventListener('pagehide', () => clearInterval(globalPollTimer), { once: true });
+    window.addEventListener('beforeunload', () => clearInterval(globalPollTimer), { once: true });
 })();

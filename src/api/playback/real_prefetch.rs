@@ -55,7 +55,6 @@ pub(super) fn spawn_prefetch_real(state: Arc<AppState>, job_id: String, key: Str
                     match state.db_conn().await {
                         Ok(conn) => tokio::task::spawn_blocking(move || {
                             db::get_segment_parts(&conn, &job_id_for_db, &segment_key)
-                                .map_err(anyhow::Error::from)
                         })
                         .await
                         .unwrap_or_else(|e| Err(anyhow::anyhow!(e))),
@@ -143,7 +142,6 @@ pub(crate) fn spawn_cache_warmup(state: Arc<AppState>, job_id: String) {
                     match state.db_conn().await {
                         Ok(conn) => tokio::task::spawn_blocking(move || {
                             db::get_segment_parts(&conn, &job_id_for_db, &segment_key)
-                                .map_err(anyhow::Error::from)
                         })
                         .await
                         .unwrap_or_else(|e| Err(anyhow::anyhow!(e))),

@@ -29,7 +29,10 @@ pub async fn require_auth(
             let decoded = base64_decode(encoded)?;
             let creds = std::str::from_utf8(&decoded).ok()?;
             let (user, pass) = creds.split_once(':')?;
-            Some(user == cfg.admin_user.as_str() && pass == cfg.admin_pass.as_str())
+            Some(
+                constant_time_eq(user.as_bytes(), cfg.admin_user.as_bytes())
+                    & constant_time_eq(pass.as_bytes(), cfg.admin_pass.as_bytes()),
+            )
         })
         .unwrap_or(false);
 
@@ -45,8 +48,19 @@ pub async fn require_auth(
                 r#"Basic realm="THLS", charset="UTF-8""#,
             )
             .body(Body::from("Unauthorized"))
-            .unwrap()
+            .expect("static 401 response with valid header values")
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for i in 0..max_len {
+        let a = left.get(i).copied().unwrap_or(0);
+        let b = right.get(i).copied().unwrap_or(0);
+        diff |= (a ^ b) as usize;
+    }
+    diff == 0
 }
 
 fn base64_decode(input: &str) -> Option<Vec<u8>> {

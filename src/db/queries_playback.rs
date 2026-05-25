@@ -20,14 +20,15 @@ pub fn save_playback_progress(conn: &Connection, progress: &NewPlaybackProgress)
             duration_seconds=excluded.duration_seconds,
             progress_pct=excluded.progress_pct,
             completed=excluded.completed,
-            updated_at=CURRENT_TIMESTAMP",
+            updated_at=CURRENT_TIMESTAMP
+         WHERE excluded.position_seconds > playback_progress.position_seconds",
         params![
             progress.client_id,
             progress.job_id,
             progress.position_seconds,
             progress.duration_seconds,
             pct,
-            bool_to_i64(completed) as i64,
+            { bool_to_i64(completed) },
         ],
     )?;
     Ok(())
@@ -75,8 +76,9 @@ pub fn save_media_markers(
     job_id: &str,
     markers: &[NewMediaMarker],
 ) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
     for marker in markers {
-        conn.execute(
+        tx.execute(
             "INSERT INTO media_markers(job_id, marker_type, start_seconds, end_seconds, source, confidence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -89,6 +91,7 @@ pub fn save_media_markers(
             ],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 

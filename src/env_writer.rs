@@ -31,21 +31,20 @@ pub fn write_env_values(env_path: &Path, env_map: &HashMap<&str, String>) -> Res
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let Some((key, rest)) = trimmed.split_once('=') else {
+        let Some((key, _)) = trimmed.split_once('=') else {
             continue;
         };
         let key = key.trim();
         let Some(new_value) = env_map.get(key) else {
             continue;
         };
-        let inline_comment = find_inline_comment(rest);
-        *line = format!("{key}={new_value}{inline_comment}");
+        *line = format!("{key}={}", encode_env_value(new_value));
         updated.insert(key.to_string());
     }
 
     for (key, value) in env_map {
         if !updated.contains(*key) {
-            lines.push(format!("{key}={value}"));
+            lines.push(format!("{key}={}", encode_env_value(value)));
         }
     }
 
@@ -58,10 +57,7 @@ pub fn write_env_values(env_path: &Path, env_map: &HashMap<&str, String>) -> Res
         thread_id
     );
     // Remove characters that might be invalid in paths (like spaces or special punctuation in ThreadId format)
-    let tmp_name = tmp_name.replace(
-        |c: char| c == ' ' || c == '(' || c == ')' || c == '{' || c == '}',
-        "",
-    );
+    let tmp_name = tmp_name.replace([' ', '(', ')', '{', '}'], "");
     let tmp = env_path.with_file_name(tmp_name);
 
     let content = lines.join("\n");
@@ -83,6 +79,15 @@ pub fn write_env_values(env_path: &Path, env_map: &HashMap<&str, String>) -> Res
     }
 
     Ok(())
+}
+
+fn encode_env_value(value: &str) -> String {
+    if value.contains('#') || value.contains('"') || value.contains('\\') {
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        value.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -128,23 +133,19 @@ mod tests {
         assert!(result.is_ok(), "should accept clean value: {:?}", result);
         std::fs::remove_dir_all(&dir).ok();
     }
-}
 
-fn find_inline_comment(rest: &str) -> String {
-    for (i, b) in rest.bytes().enumerate() {
-        if b == b'#' {
-            let before = &rest[..i];
-            if !before.ends_with('\\') {
-                // A comment must be preceded by whitespace, or be at the start of the string
-                if before.chars().last().map_or(true, |c| c.is_whitespace()) {
-                    let ws_start = before
-                        .rfind(|c: char| !c.is_whitespace())
-                        .map(|pos| pos + 1)
-                        .unwrap_or(0);
-                    return rest[ws_start..].to_string();
-                }
-            }
-        }
+    #[test]
+    fn quotes_hash_values_and_drops_stale_inline_comment() {
+        let mut map = HashMap::new();
+        map.insert("WEBHOOK_URL", "https://example.test/hook#frag".to_string());
+        let dir = std::env::temp_dir().join(format!("thls_env_hash_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join(".env.test");
+        std::fs::write(&path, "WEBHOOK_URL=https://old.test # old comment\n").unwrap();
+
+        write_env_values(&path, &map).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "WEBHOOK_URL=\"https://example.test/hook#frag\"\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
-    String::new()
 }

@@ -360,3 +360,62 @@ async fn malformed_job_id_returns_400_before_db_lookup() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn enqueue_existing_job_rejects_terminal_state_overwrite() {
+    let state = app_state();
+    let job_id = "terminal-job-123";
+    let source = state.uploads_dir.join("test.mkv");
+    tokio::fs::write(&source, b"fake").await.unwrap();
+
+    {
+        let mut jobs = state.jobs.lock().await;
+        jobs.insert(
+            job_id.into(),
+            crate::api::jobs::JobState {
+                job_id: job_id.into(),
+                filename: "test.mkv".into(),
+                source_path: source.clone(),
+                processing_path: state.processing_dir.join(job_id),
+                status: crate::api::jobs::JobStatus::Error,
+                progress: 100.0,
+                step: 5,
+                total_steps: 5,
+                description: "errored".into(),
+                queued_at: std::time::Instant::now(),
+                started_at: Some(std::time::Instant::now()),
+                finished_at: Some(std::time::Instant::now()),
+                cancel_requested: false,
+                cancel_flag: std::sync::Arc::new(AtomicBool::new(false)),
+                error: Some("timeout".into()),
+                metadata: crate::api::jobs::JobMetadata::default(),
+                analysis: None,
+                delete_source_on_finish: false,
+                original_source_path: None,
+            },
+        );
+    }
+
+    let result = crate::api::jobs::enqueue_existing_job(
+        &state,
+        job_id.into(),
+        "test.mkv".into(),
+        source.clone(),
+        crate::api::jobs::JobMetadata::default(),
+        false,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("job already terminal"),
+        "expected terminal error, got: {err}"
+    );
+
+    let jobs = state.jobs.lock().await;
+    let job = jobs.get(job_id).unwrap();
+    assert_eq!(job.status, crate::api::jobs::JobStatus::Error);
+}

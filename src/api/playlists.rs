@@ -308,14 +308,17 @@ fn build_master_playlist(cfg: &Config, job: &JobRow, tracks: &[TrackRow]) -> Str
     }
 
     if cfg.virtual_abr_tiers && !cfg.abr_enabled && !videos.is_empty() {
-        let source = videos.iter().max_by_key(|t| t.height).unwrap();
+        let source = videos
+            .iter()
+            .max_by_key(|t| t.height)
+            .expect("guarded by !videos.is_empty()");
         let mut seen_heights = std::collections::HashSet::new();
         let mut tiers = media::parse_tiers_in_order(&cfg.abr_tiers)
             .into_iter()
             .filter(|(h, _)| *h < source.height)
             .filter(|(h, _)| seen_heights.insert(*h))
             .collect::<Vec<_>>();
-        tiers.sort_by(|a, b| b.0.cmp(&a.0));
+        tiers.sort_by_key(|b| std::cmp::Reverse(b.0));
         for (height, bitrate) in tiers {
             let bw = parse_bitrate_str(&bitrate)
                 .unwrap_or(2_000_000)

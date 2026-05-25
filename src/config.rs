@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 
 use anyhow::Result;
@@ -147,7 +147,7 @@ impl Default for Config {
             job_retention_days: 0,
             max_concurrent_jobs: 1,
             upload_rate_limit_window: 60,
-            upload_rate_limit_max_requests: 500,
+            upload_rate_limit_max_requests: 100,
             max_pending_uploads_per_ip: 5,
             watch_poll_seconds: 5,
             watch_stable_seconds: 30,
@@ -283,7 +283,10 @@ impl Config {
             "ABR_TIERS" => self.abr_tiers.clone(),
             "TIER0_BITRATES" => self.tier0_bitrates.clone(),
             "TIER0_BITRATE_DEFAULT" => self.tier0_bitrate_default.clone(),
-            _ => String::new(),
+            _ => {
+                tracing::warn!(key, "unmapped setting key");
+                String::new()
+            }
         }
     }
 
@@ -304,13 +307,6 @@ impl Config {
     pub fn is_unchanged_masked_tmdb_api_key(&self, value: &str) -> bool {
         !self.tmdb_api_key.is_empty() && value == self.masked_tmdb_api_key()
     }
-}
-
-pub fn apply_normalized_settings(cfg: &mut Config, settings: &HashMap<String, String>) {
-    for (key, value) in settings {
-        apply_setting(cfg, key, value, "runtime");
-    }
-    enforce_invariants(cfg);
 }
 
 pub fn env_or_default_value(key: &str) -> Option<String> {
@@ -349,10 +345,12 @@ fn load_telegram_encryption_key() -> Result<Option<EncryptionKey>> {
 
 pub fn effective_setting_values(conn: &Connection) -> Result<BTreeMap<&'static str, String>> {
     let mut values = settings_registry::default_settings();
+    let mut env_values = BTreeMap::new();
     for spec in settings_registry::SETTINGS {
         if let Ok(raw) = std::env::var(spec.env) {
             match settings_registry::normalize_str_for_key(spec.key, &raw) {
                 Ok(value) => {
+                    env_values.insert(spec.key, value.clone());
                     values.insert(spec.key, value);
                 }
                 Err(e) => tracing::warn!(
@@ -368,6 +366,16 @@ pub fn effective_setting_values(conn: &Connection) -> Result<BTreeMap<&'static s
         match settings_registry::setting_spec(&key) {
             Some(spec) => match settings_registry::normalize_str_for_key(spec.key, &raw) {
                 Ok(value) => {
+                    if env_values
+                        .get(spec.key)
+                        .is_some_and(|env_value| env_value != &value)
+                    {
+                        tracing::warn!(
+                            key = spec.key,
+                            env = spec.env,
+                            "DB setting overrides environment config value"
+                        );
+                    }
                     values.insert(spec.key, value);
                 }
                 Err(e) => tracing::warn!(
@@ -482,6 +490,54 @@ fn enforce_invariants(cfg: &mut Config) {
         );
         cfg.virtual_abr_tiers = false;
     }
+    if cfg.max_upload_size > 0 && cfg.upload_chunk_size > cfg.max_upload_size {
+        tracing::warn!("UPLOAD_CHUNK_SIZE exceeds MAX_UPLOAD_SIZE; clamping upload chunk size");
+        cfg.upload_chunk_size = cfg.max_upload_size;
+    }
+    if cfg.max_concurrent_jobs == 0 {
+        tracing::warn!("MAX_CONCURRENT_JOBS must be at least 1; clamping to 1");
+        cfg.max_concurrent_jobs = 1;
+    }
+    if cfg.disk_cache_enabled && cfg.segment_cache_size_mb == 0 {
+        tracing::warn!("DISK_CACHE_ENABLED requires SEGMENT_CACHE_SIZE_MB > 0; clamping to 1");
+        cfg.segment_cache_size_mb = 1;
+    }
+    if cfg.watch_poll_seconds == 0 {
+        tracing::warn!("WATCH_POLL_SECONDS must be at least 1; clamping to 1");
+        cfg.watch_poll_seconds = 1;
+    }
+    if cfg.telegram_max_file_size <= crate::crypto::TAG_LEN && cfg.telegram_encryption_key.is_some()
+    {
+        tracing::warn!(
+            "TELEGRAM_MAX_FILE_SIZE must exceed AEAD tag size when encryption is enabled; disabling encryption key"
+        );
+        cfg.telegram_encryption_key = None;
+    }
+    let max_segment_target =
+        cfg.telegram_max_file_size
+            .saturating_sub(if cfg.telegram_encryption_key.is_some() {
+                crate::crypto::TAG_LEN
+            } else {
+                0
+            });
+    if max_segment_target > 0 && cfg.segment_target_size > max_segment_target {
+        tracing::warn!(
+            segment_target_size = cfg.segment_target_size,
+            max_segment_target,
+            "SEGMENT_TARGET_SIZE exceeds Telegram upload ceiling; clamping"
+        );
+        cfg.segment_target_size = max_segment_target;
+    }
+    if cfg.bots.is_empty() {
+        cfg.db_auto_merge_bot_index = 0;
+    } else if cfg.db_auto_merge_bot_index as usize >= cfg.bots.len() {
+        tracing::warn!(
+            db_auto_merge_bot_index = cfg.db_auto_merge_bot_index,
+            bot_count = cfg.bots.len(),
+            "DB_AUTO_MERGE_BOT_INDEX out of range; clamping"
+        );
+        cfg.db_auto_merge_bot_index = (cfg.bots.len() - 1) as u32;
+    }
 }
 
 fn parse_int<T>(s: &str) -> Result<T, String>
@@ -493,13 +549,10 @@ where
 }
 
 fn parse_bool(s: &str) -> Result<bool, String> {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("true") {
-        Ok(true)
-    } else if t.eq_ignore_ascii_case("false") {
-        Ok(false)
-    } else {
-        Err(format!("not a boolean: {s}"))
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(format!("not a boolean (expected true/false/1/0): {s}")),
     }
 }
 
@@ -619,4 +672,54 @@ fn build_bot_pool(conn: &Connection) -> Result<Vec<BotConfig>> {
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_default_matches_rate_limit_registry_default() {
+        let registry_default = settings_registry::default_settings()
+            .get("UPLOAD_RATE_LIMIT_MAX_REQUESTS")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(
+            Config::default().upload_rate_limit_max_requests,
+            registry_default
+        );
+    }
+
+    #[test]
+    fn enforce_invariants_clamps_cross_field_runtime_values() {
+        let mut cfg = Config {
+            telegram_max_file_size: 10,
+            segment_target_size: 20,
+            max_upload_size: 5,
+            upload_chunk_size: 10,
+            max_concurrent_jobs: 0,
+            disk_cache_enabled: true,
+            segment_cache_size_mb: 0,
+            watch_poll_seconds: 0,
+            db_auto_merge_bot_index: 9,
+            bots: vec![BotConfig {
+                token: "12345678:abcdefghijklmnopqrstuvwxyzabcdefghi".into(),
+                channel_id: -100,
+                source: BotSource::Db,
+                db_id: Some(1),
+                label: "bot".into(),
+            }],
+            ..Default::default()
+        };
+
+        enforce_invariants(&mut cfg);
+
+        assert_eq!(cfg.segment_target_size, 10);
+        assert_eq!(cfg.upload_chunk_size, 5);
+        assert_eq!(cfg.max_concurrent_jobs, 1);
+        assert_eq!(cfg.segment_cache_size_mb, 1);
+        assert_eq!(cfg.watch_poll_seconds, 1);
+        assert_eq!(cfg.db_auto_merge_bot_index, 0);
+    }
 }

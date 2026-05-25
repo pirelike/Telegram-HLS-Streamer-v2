@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 
 use super::ffmpeg::run_ffmpeg_cancellable;
@@ -72,7 +72,9 @@ pub(super) async fn collect_segment_durations(output_dir: &Path) -> Result<HashM
                 if out.contains_key(&key) {
                     continue;
                 }
-                probe_duration(&path).await.unwrap_or(0.0)
+                probe_duration(&path)
+                    .await
+                    .with_context(|| format!("probing duration for {}", path.display()))?
             } else {
                 0.0
             };
@@ -124,16 +126,7 @@ pub(crate) fn parse_hls_segment_durations(prefix: &str, playlist: &str) -> HashM
 }
 
 pub(crate) fn fmp4_input_arg(path: &Path) -> String {
-    if path.extension().and_then(|e| e.to_str()) == Some("m4s") {
-        let init = path.parent().unwrap_or(Path::new(".")).join("init.mp4");
-        format!(
-            "concat:{}|{}",
-            init.to_string_lossy(),
-            path.to_string_lossy()
-        )
-    } else {
-        path.to_string_lossy().into_owned()
-    }
+    path.to_string_lossy().into_owned()
 }
 
 pub(super) async fn probe_duration(path: &Path) -> Result<f64> {
@@ -144,7 +137,7 @@ pub(super) async fn probe_duration(path: &Path) -> Result<f64> {
         .arg("format=duration")
         .arg("-of")
         .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(&fmp4_input_arg(path))
+        .arg(fmp4_input_arg(path))
         .output()
         .await?;
     if !output.status.success() {

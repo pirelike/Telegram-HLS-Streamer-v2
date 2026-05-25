@@ -104,6 +104,12 @@
       clearInterval(timer);
       timer = setInterval(() => showSlide((current + 1) % spots.length), 9000);
     }
+    function stopTimer() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    }
 
     dotEls.forEach((dot, i) => dot.addEventListener('click', () => {
       clearInterval(timer);
@@ -113,6 +119,8 @@
 
     showSlide(0);
     startTimer();
+    window.addEventListener('pagehide', stopTimer, { once: true });
+    window.addEventListener('beforeunload', stopTimer, { once: true });
   }
 
   function heroBodyHtml(j) {
@@ -406,27 +414,3 @@
     return 'linear-gradient(135deg,hsl(' + a + ' 60% 30%),hsl(' + b + ' 50% 12%))';
   }
 })();
-
-// ─── Global helpers used by browse.js on non-home pages ─────────────────────
-function escapeHtml(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
-function escapeAttr(s) { return escapeHtml(s); }
-function pad(n) { return String(n).padStart(2,'0'); }
-function slugify(s) { return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,''); }
-function formatDuration(seconds) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return '';
-  const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60);
-  return h ? h + 'h ' + m + 'm' : m + 'm';
-}
-function cleanTitle(name) {
-  return String(name||'').replace(/\.[a-z0-9]{2,4}$/i,'').replace(/[._]+/g,' ').replace(/\s+/g,' ').trim();
-}
-function jobIdToGradient(seed) {
-  let h = 0;
-  for (const c of String(seed||'')) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  const a = h % 360, b = (a + 60) % 360;
-  return 'linear-gradient(135deg,hsl(' + a + ' 60% 30%),hsl(' + b + ' 50% 12%))';
-}

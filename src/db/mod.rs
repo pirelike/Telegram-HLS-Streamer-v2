@@ -18,6 +18,7 @@ pub use queries_playback::*;
 pub use queries_settings::*;
 pub use transfer::*;
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -50,9 +51,8 @@ pub(crate) fn init_db_pool_lazy(path: &Path) -> DbPool {
 }
 
 fn sqlite_connection_manager(path: &Path) -> SqliteConnectionManager {
-    let manager = SqliteConnectionManager::file(path)
-        .with_init(|conn| conn.execute_batch(SQLITE_CONNECTION_PRAGMAS));
-    manager
+    SqliteConnectionManager::file(path)
+        .with_init(|conn| conn.execute_batch(SQLITE_CONNECTION_PRAGMAS))
 }
 
 pub fn init_db(path: &Path) -> Result<Connection> {
@@ -150,9 +150,12 @@ fn validate_setting_key(key: &str) -> Result<()> {
 }
 
 fn validate_sqlite_header(path: &Path) -> Result<()> {
-    let header = std::fs::read(path)
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening sqlite header from {}", path.display()))?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header)
         .with_context(|| format!("reading sqlite header from {}", path.display()))?;
-    if header.len() >= 16 && &header[..16] == b"SQLite format 3\0" {
+    if &header == b"SQLite format 3\0" {
         Ok(())
     } else {
         anyhow::bail!("replacement database is not a SQLite file");

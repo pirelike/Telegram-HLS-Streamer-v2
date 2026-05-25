@@ -79,7 +79,7 @@ pub fn select_video_tiers_with(
 
 pub fn parse_tiers(raw: &str) -> Vec<(i64, String)> {
     let mut tiers = parse_tiers_in_order(raw);
-    tiers.sort_by(|a, b| b.0.cmp(&a.0));
+    tiers.sort_by_key(|b| std::cmp::Reverse(b.0));
     tiers
 }
 

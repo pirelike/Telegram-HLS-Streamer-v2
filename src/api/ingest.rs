@@ -387,6 +387,7 @@ async fn stream_to_file(
         .await
         .map_err(|e| e.to_string())?;
     let mut downloaded = 0u64;
+    let mut last_progress_update = std::time::Instant::now();
     loop {
         let chunk = resp.chunk().await.map_err(|e| e.to_string())?;
         let Some(chunk) = chunk else { break };
@@ -395,22 +396,26 @@ async fn stream_to_file(
             return Err("remote file is too large".into());
         }
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        let mut jobs = state.jobs.lock().await;
-        if let Some(job) = jobs.get_mut(job_id) {
-            if job.cancel_requested
-                || job.status == JobStatus::Cancelled
-                || job.status == JobStatus::Error
-            {
-                return Err("cancelled".into());
+        // Batch progress updates to avoid locking the jobs map on every chunk
+        if last_progress_update.elapsed() >= std::time::Duration::from_millis(500) {
+            last_progress_update = std::time::Instant::now();
+            let mut jobs = state.jobs.lock().await;
+            if let Some(job) = jobs.get_mut(job_id) {
+                if job.cancel_requested
+                    || job.status == JobStatus::Cancelled
+                    || job.status == JobStatus::Error
+                {
+                    return Err("cancelled".into());
+                }
+                job.progress = total
+                    .map(|t| (downloaded as f64 / t as f64) * 100.0)
+                    .unwrap_or(0.0)
+                    .min(99.0);
+                job.description = match total {
+                    Some(t) => format!("downloading remote file ({downloaded}/{t} bytes)"),
+                    None => format!("downloading remote file ({downloaded} bytes)"),
+                };
             }
-            job.progress = total
-                .map(|t| (downloaded as f64 / t as f64) * 100.0)
-                .unwrap_or(0.0)
-                .min(99.0);
-            job.description = match total {
-                Some(t) => format!("downloading remote file ({downloaded}/{t} bytes)"),
-                None => format!("downloading remote file ({downloaded} bytes)"),
-            };
         }
     }
     file.flush().await.map_err(|e| e.to_string())?;

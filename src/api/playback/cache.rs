@@ -6,6 +6,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{Mutex, Notify};
 
+use super::super::AppState;
+
 pub struct SegmentCache {
     pub(super) inner: Mutex<CacheInner>,
     pub(super) inflight: Mutex<HashMap<String, Arc<Inflight>>>,
@@ -206,9 +208,9 @@ pub(super) async fn finish_inflight(
     inflight: Arc<Inflight>,
     result: &Result<CacheEntry>,
 ) {
-    // Remove from map first to prevent new claimants from finding a stale entry.
-    // Existing waiters hold Arc<Inflight> clones and can still read the outcome.
-    state.cache.inflight.lock().await.remove(cache_key);
+    // Set outcome and notify waiters before removing from the map.
+    // A claimant arriving between notify and remove finds the existing Arc,
+    // reads the already-set outcome, and does not become a spurious leader.
     {
         let mut outcome = inflight.outcome.lock().await;
         *outcome = Some(match result {
@@ -217,4 +219,53 @@ pub(super) async fn finish_inflight(
         });
     }
     inflight.notify.notify_waiters();
+    state.cache.inflight.lock().await.remove(cache_key);
+}
+
+/// RAII guard that calls `finish_inflight` with an error if the leader task
+/// exits before explicitly disarming (e.g. on panic or early-return bug).
+/// Prevents waiters from hanging up to the 300 s timeout and avoids poisoning
+/// the inflight map with an entry whose outcome is never set.
+pub(super) struct InflightGuard {
+    state: Arc<AppState>,
+    cache_key: String,
+    inflight: Arc<Inflight>,
+    armed: bool,
+}
+
+impl InflightGuard {
+    pub(super) fn new(state: Arc<AppState>, cache_key: String, inflight: Arc<Inflight>) -> Self {
+        Self {
+            state,
+            cache_key,
+            inflight,
+            armed: true,
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let key = std::mem::take(&mut self.cache_key);
+        let inflight = self.inflight.clone();
+        tokio::spawn(async move {
+            finish_inflight(
+                &state,
+                &key,
+                inflight,
+                &Err(anyhow::anyhow!(
+                    "single-flight leader aborted before completion"
+                )),
+            )
+            .await;
+        });
+    }
 }

@@ -364,8 +364,22 @@ fn add_column_if_missing(
 
 fn validate_table_name(table: &str) -> Result<&str> {
     match table {
-        "jobs" | "tracks" | "segments" | "settings" | "bots" | "schema_migrations"
-        | "segment_parts" | "kv_internal" | "db_sync_uploads" => Ok(table),
+        "jobs"
+        | "tracks"
+        | "segments"
+        | "settings"
+        | "bots"
+        | "schema_migrations"
+        | "segment_parts"
+        | "kv_internal"
+        | "db_sync_uploads"
+        | "db_sync_snapshots"
+        | "external_metadata"
+        | "job_metadata_links"
+        | "series_metadata_links"
+        | "playback_progress"
+        | "media_markers"
+        | "media_fingerprints" => Ok(table),
         _ => bail!("unknown sqlite table: {table}"),
     }
 }
@@ -424,7 +438,40 @@ fn validate_column_name(column: &str) -> Result<&str> {
         | "prefix"
         | "episode_title"
         | "source_bitrate"
-        | "encryption_nonce" => Ok(column),
+        | "encryption_nonce"
+        | "schema_revision"
+        | "size_bytes"
+        | "last_error"
+        | "snapshot_id"
+        | "uploaded_at"
+        | "provider"
+        | "provider_id"
+        | "media_kind"
+        | "original_title"
+        | "overview"
+        | "poster_url"
+        | "backdrop_url"
+        | "release_date"
+        | "year"
+        | "rating"
+        | "raw_json"
+        | "fetched_at"
+        | "metadata_id"
+        | "role"
+        | "client_id"
+        | "position_seconds"
+        | "duration_seconds"
+        | "progress_pct"
+        | "completed"
+        | "marker_type"
+        | "start_seconds"
+        | "end_seconds"
+        | "confidence"
+        | "window_type"
+        | "window_start_seconds"
+        | "window_duration_seconds"
+        | "fingerprint"
+        | "fingerprint_source" => Ok(column),
         _ => bail!("unknown sqlite column: {column}"),
     }
 }

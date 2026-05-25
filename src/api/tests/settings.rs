@@ -50,7 +50,7 @@ async fn settings_get_post_and_reset_update_runtime_config() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_response(response).await;
-    assert_eq!(state.config.read().await.disk_cache_enabled, true);
+    assert!(state.config.read().await.disk_cache_enabled);
     let file_settings = body["categories"]["file_handling"]["settings"]
         .as_array()
         .unwrap();
@@ -184,6 +184,43 @@ async fn settings_update_does_not_reload_bot_pool() {
     assert_eq!(cfg.max_concurrent_jobs, 3);
     // Settings update reloads from DB — picks up any bot changes since last load
     assert_eq!(cfg.bots.len(), env_bot_count + 1);
+}
+
+#[tokio::test]
+async fn settings_reset_reloads_bot_pool() {
+    let state = app_state();
+    let env_bot_count;
+    {
+        let conn = state.db_conn().await.unwrap();
+        db::add_bot(
+            &conn,
+            "32345678:abcdefghijklmnopqrstuvwxyzabcdefghi",
+            -100,
+            "first",
+        )
+        .unwrap();
+        *state.config.write().await = Arc::new(Config::load(&conn).unwrap());
+        env_bot_count = state.config.read().await.bots.len();
+        db::add_bot(
+            &conn,
+            "42345678:abcdefghijklmnopqrstuvwxyzabcdefghi",
+            -101,
+            "second",
+        )
+        .unwrap();
+    }
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/api/settings/reset")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"keys":["MAX_CONCURRENT_JOBS"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.config.read().await.bots.len(), env_bot_count + 1);
 }
 
 #[tokio::test]

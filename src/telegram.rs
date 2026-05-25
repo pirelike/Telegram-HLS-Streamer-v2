@@ -21,9 +21,9 @@ const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
 
 fn jittered_backoff(attempt: usize) -> Duration {
     let base = 2_u64.pow(attempt as u32);
-    let half = base.saturating_sub(1) / 2;
-    let jitter = rand::random::<u64>() % (half.saturating_add(1));
-    Duration::from_secs(base.saturating_add(jitter))
+    let base_ms = base.saturating_mul(1000);
+    let jitter_ms = rand::random::<u64>() % base_ms.max(1);
+    Duration::from_millis(base_ms.saturating_add(jitter_ms))
 }
 
 #[derive(Debug, Clone)]

@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
         db_sync_lock: Mutex::new(()),
         jobs: Mutex::new(std::collections::HashMap::new()),
         played_segments: Mutex::new(std::collections::HashMap::new()),
+        segment_meta_cache: Mutex::new(std::collections::HashMap::new()),
         job_queue,
         cache: Arc::new(api::SegmentCache::new(cache_budget)),
         ffmpeg_available,
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
         ingest_download_semaphore: Arc::new(tokio::sync::Semaphore::new(5)),
     });
     api::db_transfer::bootstrap_db_sync_if_configured(state.clone()).await;
-    api::start_background_tasks(state.clone(), job_receiver);
+    let worker_handles = api::start_background_tasks(state.clone(), job_receiver);
     cloudflared::start_manager(state.clone());
 
     crate::api::jobs::processing::recover_stuck_processing_jobs(&state).await;
@@ -122,9 +123,15 @@ async fn main() -> Result<()> {
         server_shutdown.cancel();
     });
     let graceful = shutdown_token.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { graceful.cancelled().await })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { graceful.cancelled().await })
+    .await?;
+
+    // Cancel all background workers now that the HTTP server has stopped
+    shutdown_token.cancel();
 
     tracing::info!("http server stopped, draining in-flight jobs");
     let drain_deadline = Duration::from_secs(30);
@@ -167,6 +174,23 @@ async fn main() -> Result<()> {
             "waiting for in-flight jobs"
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    tracing::info!("waiting for background workers to exit");
+    let worker_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut set = tokio::task::JoinSet::new();
+    for handle in worker_handles {
+        set.spawn(async move {
+            let _ = handle.await;
+        });
+    }
+    while !set.is_empty() {
+        let remaining = worker_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("background workers did not exit within 5s, proceeding");
+            break;
+        }
+        let _ = tokio::time::timeout(remaining, set.join_next()).await;
     }
 
     Ok(())

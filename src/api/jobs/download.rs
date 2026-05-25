@@ -1,5 +1,6 @@
 use std::io::SeekFrom;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -211,18 +212,14 @@ pub(super) async fn reconstruct_job_source(
         .arg("-movflags")
         .arg("+faststart")
         .arg(&output_path);
-    let output = cmd
-        .output()
-        .await
-        .context("running ffmpeg reconstruction")?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let timeout = state.config.read().await.job_timeout_seconds as u64;
+    let result = crate::media::run_ffmpeg_cancellable(&mut cmd, &cancel, timeout).await;
     let _ = tokio::fs::remove_file(&video_path).await;
     let _ = tokio::fs::remove_file(&audio_path).await;
-    if !output.status.success() {
+    if let Err(e) = result {
         let _ = tokio::fs::remove_file(&output_path).await;
-        bail!(
-            "ffmpeg reconstruction failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("ffmpeg reconstruction failed: {e}");
     }
     Ok(output_path)
 }

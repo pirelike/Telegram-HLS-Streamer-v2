@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -5,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use tokio::process::Command;
 
-use super::cache::{claim_inflight, finish_inflight, CacheEntry};
+use super::cache::{claim_inflight, finish_inflight, CacheEntry, InflightGuard};
 use super::{api_error, AppState};
 use crate::config::Config;
 use crate::{db, media, telegram};
@@ -176,6 +177,7 @@ async fn virtual_fetch_into_cache(
     Ok(entry)
 }
 
+#[allow(clippy::too_many_arguments)] // virtual init needs all transcode context plus source dims
 async fn build_virtual_init(
     state: &Arc<AppState>,
     cfg: &Config,
@@ -258,6 +260,7 @@ async fn fetch_source_for_virtual(
                 Err(e) => bail!(e),
             };
         }
+        let mut guard = InflightGuard::new(state.clone(), cache_key.clone(), inflight.clone());
         let result = async {
             let parts = {
                 let conn = state
@@ -302,6 +305,7 @@ async fn fetch_source_for_virtual(
         }
         .await;
         finish_inflight(state, &cache_key, inflight, &result).await;
+        guard.disarm();
         let entry = result?;
         return Ok((*entry.bytes).clone());
     }
@@ -319,6 +323,7 @@ async fn fetch_source_for_virtual(
     Ok((*entry.bytes).clone())
 }
 
+#[allow(clippy::too_many_arguments)] // all args are distinct transcode parameters; no sensible grouping
 async fn transcode_segment(
     cfg: &Config,
     encoder: &media::SelectedEncoder,
@@ -386,6 +391,7 @@ async fn transcode_segment(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors transcode_segment; both need all encoding params
 async fn transcode_segment_with_encoder(
     cfg: &Config,
     encoder: &media::SelectedEncoder,
@@ -398,16 +404,15 @@ async fn transcode_segment_with_encoder(
 ) -> Result<Vec<u8>> {
     let scaled_w = media::scaled_width(source_width, source_height, target_height as i64);
     let scale = if scaled_w > 0 {
-        format!("scale={scaled_w}:{target_height}")
+        Some(format!("scale={scaled_w}:{target_height}"))
     } else {
-        // Fallback for legacy jobs where source dims are zero
-        format!("scale='trunc({target_height}*16/9/2)*2':{target_height}")
+        None
     };
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-nostdin").arg("-loglevel").arg("error").arg("-y");
     media::add_encoder_device_args(&mut cmd, encoder);
     cmd.arg("-i")
-        .arg(&in_path)
+        .arg(in_path)
         .arg("-map")
         .arg("0:v:0")
         .arg("-an")
@@ -432,7 +437,7 @@ async fn transcode_segment_with_encoder(
             cfg.hls_segment_duration.max(1)
         ));
     media::add_forced_idr_args(&mut cmd, encoder);
-    if let Some(filter) = media::video_filter(&encoder, Some(scale)) {
+    if let Some(filter) = media::video_filter(encoder, scale) {
         cmd.arg("-vf").arg(filter);
     }
     tracing::info!(
@@ -444,18 +449,18 @@ async fn transcode_segment_with_encoder(
     );
     tracing::debug!(cmd = ?cmd, "virtual abr ffmpeg command");
     let started = std::time::Instant::now();
-    let status = cmd
-        .arg("-f")
+    cmd.arg("-f")
         .arg("mp4")
         .arg("-movflags")
         .arg("frag_keyframe+empty_moov+default_base_moof")
-        .arg(&out_path)
-        .status()
-        .await
-        .context("running ffmpeg for virtual transcode")?;
-    if !status.success() {
-        bail!("ffmpeg virtual transcode exited with {status}");
-    }
+        .arg(out_path);
+    media::run_ffmpeg_cancellable(
+        &mut cmd,
+        &Arc::new(AtomicBool::new(false)),
+        cfg.job_timeout_seconds as u64,
+    )
+    .await
+    .context("running ffmpeg for virtual transcode")?;
     let bytes = tokio::fs::read(&out_path).await?;
     validate_fmp4(&bytes)?;
     tracing::info!(
@@ -468,15 +473,30 @@ async fn transcode_segment_with_encoder(
     Ok(bytes)
 }
 
-fn double_bitrate(bitrate: &str) -> String {
+pub(super) fn double_bitrate(bitrate: &str) -> String {
     let trimmed = bitrate.trim();
     let number_len = trimmed
-        .find(|c: char| !c.is_ascii_digit())
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(trimmed.len());
     let (number, suffix) = trimmed.split_at(number_len);
-    match number.parse::<u64>() {
-        Ok(n) if n > 0 => format!("{}{}", n * 2, suffix),
+    match number.parse::<f64>() {
+        Ok(n) if n > 0.0 => format!("{}{}", format_float_bitrate(n * 2.0), suffix),
         _ => trimmed.to_string(),
+    }
+}
+
+fn format_float_bitrate(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{}", value as u64)
+    } else {
+        let mut s = format!("{value:.3}");
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+        s
     }
 }
 

@@ -48,6 +48,7 @@ pub(crate) async fn enqueue_job(
     Ok(job_id)
 }
 
+#[allow(clippy::too_many_arguments)] // job re-queue requires all scheduling context at once
 pub(crate) async fn enqueue_existing_job(
     state: &Arc<AppState>,
     job_id: String,
@@ -88,6 +89,9 @@ pub(crate) async fn enqueue_existing_job(
         } else if let Some(job) = jobs.get_mut(&job_id) {
             if job.cancel_requested || job.status == JobStatus::Cancelled {
                 bail!("cancelled");
+            }
+            if job.status.is_terminal() {
+                bail!("job already terminal: {:?}", job.status);
             }
             job.filename = filename.clone();
             job.source_path = source_path.clone();
@@ -157,7 +161,11 @@ pub(super) fn sanitize_original_source_path(value: Option<String>) -> Result<Opt
     Ok(Some(value.to_string()))
 }
 
-fn spawn_supervised<F, Fut>(name: &'static str, mut make_future: F)
+fn spawn_supervised<F, Fut>(
+    name: &'static str,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    mut make_future: F,
+) -> tokio::task::JoinHandle<()>
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -166,8 +174,18 @@ where
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(8);
         loop {
-            let handle = tokio::spawn(make_future());
-            let result = handle.await;
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let inner = tokio::spawn(make_future());
+            // Wait for the inner task or a shutdown signal
+            let result = tokio::select! {
+                r = inner => r,
+                _ = shutdown_token.cancelled() => break,
+            };
+            if shutdown_token.is_cancelled() {
+                break;
+            }
             match result {
                 Ok(()) => {
                     tracing::info!(worker = name, "worker exited normally, respawning");
@@ -180,45 +198,67 @@ where
                     );
                 }
                 Err(e) => {
-                    tracing::error!(worker = name, error = %e, "worker join error, respawning in {:?}", backoff);
+                    tracing::error!(
+                        worker = name,
+                        error = %e,
+                        "worker join error, respawning in {:?}",
+                        backoff
+                    );
                 }
             }
-            tokio::time::sleep(backoff).await;
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = shutdown_token.cancelled() => break,
+            }
             backoff = (backoff * 2).min(max_backoff);
         }
-    });
+        tracing::info!(worker = name, "worker supervisor exiting");
+    })
 }
 
-pub(crate) fn start_background_tasks(state: Arc<AppState>, receiver: mpsc::Receiver<JobRequest>) {
+pub(crate) fn start_background_tasks(
+    state: Arc<AppState>,
+    receiver: mpsc::Receiver<JobRequest>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let shutdown = state.shutdown_token.clone();
     let dispatcher_state = state.clone();
-    tokio::spawn(async move {
+    let dispatcher_handle = tokio::spawn(async move {
         let handle = tokio::spawn(job_dispatcher(dispatcher_state, receiver));
         match handle.await {
             Ok(()) => tracing::info!(worker = "job_dispatcher", "exited"),
             Err(e) => tracing::error!(worker = "job_dispatcher", "panicked: {e}"),
         }
     });
-    {
+    let sweeper_handle = {
         let state = state.clone();
-        spawn_supervised("upload_sweeper", move || {
+        let token = shutdown.clone();
+        spawn_supervised("upload_sweeper", token, move || {
             let state = state.clone();
             async move { super::super::uploads::upload_sweeper(state).await }
-        });
-    }
-    {
+        })
+    };
+    let poller_handle = {
         let state = state.clone();
-        spawn_supervised("watch_folder_poller", move || {
+        let token = shutdown.clone();
+        spawn_supervised("watch_folder_poller", token, move || {
             let state = state.clone();
             async move { super::super::watch_folder::watch_folder_poller(state).await }
-        });
-    }
-    {
+        })
+    };
+    let watcher_handle = {
         let state = state.clone();
-        spawn_supervised("job_timeout_watcher", move || {
+        let token = shutdown.clone();
+        spawn_supervised("job_timeout_watcher", token, move || {
             let state = state.clone();
             async move { job_timeout_watcher(state).await }
-        });
-    }
+        })
+    };
+    vec![
+        dispatcher_handle,
+        sweeper_handle,
+        poller_handle,
+        watcher_handle,
+    ]
 }
 
 async fn job_dispatcher(state: Arc<AppState>, mut receiver: mpsc::Receiver<JobRequest>) {

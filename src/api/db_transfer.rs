@@ -1,14 +1,18 @@
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::to_bytes;
+use axum::body::{to_bytes, Body};
 use axum::extract::{FromRequest, Multipart, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::ReadBuf;
+use tokio_util::io::ReaderStream;
 
 use super::db_transfer_replace::{
     merge_database_path, replace_live_database, stage_import_database,
@@ -50,6 +54,33 @@ pub(super) struct SnapshotUploadResult {
     pub(super) failed_bots: Vec<serde_json::Value>,
 }
 
+/// Streams a file and deletes it once the stream is fully consumed/dropped.
+struct FileGuard {
+    inner: tokio::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for FileGuard {
+    fn drop(&mut self) {
+        let path = self.path.clone();
+        // Best-effort background cleanup; always runs within a tokio runtime.
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(path).await;
+        });
+    }
+}
+
+impl tokio::io::AsyncRead for FileGuard {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // SAFETY: `inner` is not self-referential so projecting through is safe.
+        unsafe { self.map_unchecked_mut(|s| &mut s.inner) }.poll_read(cx, buf)
+    }
+}
+
 pub(super) async fn handle_db_export(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -83,8 +114,8 @@ pub(super) async fn handle_db_export(
     };
 
     if !upload_to_telegram {
-        let bytes = match tokio::fs::read(&snapshot.path).await {
-            Ok(bytes) => bytes,
+        let file = match tokio::fs::File::open(&snapshot.path).await {
+            Ok(f) => f,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&snapshot.path).await;
                 return api_error(
@@ -95,8 +126,13 @@ pub(super) async fn handle_db_export(
             }
         };
         let filename = snapshot.filename.clone();
-        let _ = tokio::fs::remove_file(&snapshot.path).await;
-        let mut response = bytes.into_response();
+        // FileGuard deletes snapshot.path when the stream is dropped (after response sent)
+        let guard = FileGuard {
+            inner: file,
+            path: snapshot.path.clone(),
+        };
+        let body = Body::from_stream(ReaderStream::new(guard));
+        let mut response = body.into_response();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/vnd.sqlite3"),

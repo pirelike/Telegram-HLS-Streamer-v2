@@ -412,6 +412,7 @@ pub async fn handle_reprocess_job(
         },
     };
     let metadata = download::metadata_from_job(&job);
+    let source_for_cleanup = source.clone();
     match enqueue_job(
         &state,
         job.filename.clone(),
@@ -428,7 +429,12 @@ pub async fn handle_reprocess_job(
             "message": "queued",
         }))
         .into_response(),
-        Err(e) => api_error(StatusCode::SERVICE_UNAVAILABLE, "queue_full", e.to_string()),
+        Err(e) => {
+            if delete_source {
+                let _ = tokio::fs::remove_file(&source_for_cleanup).await;
+            }
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "queue_full", e.to_string())
+        }
     }
 }
 

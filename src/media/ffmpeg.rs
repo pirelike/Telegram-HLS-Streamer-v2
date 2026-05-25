@@ -49,7 +49,7 @@ pub(super) async fn graceful_kill(child: &mut tokio::process::Child) {
     )
     .await
     {
-        Ok(Ok(_)) => return, // exited gracefully
+        Ok(Ok(_)) => (), // exited gracefully
         _ => {
             tracing::warn!(pid, "ffmpeg did not exit after SIGTERM; sending SIGKILL");
             let _ = child.kill().await;
@@ -64,7 +64,7 @@ pub(super) async fn graceful_kill(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
-pub(super) async fn run_ffmpeg_cancellable(
+pub(crate) async fn run_ffmpeg_cancellable(
     cmd: &mut Command,
     cancel: &Arc<AtomicBool>,
     timeout_secs: u64,

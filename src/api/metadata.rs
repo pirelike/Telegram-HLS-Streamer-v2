@@ -244,8 +244,9 @@ pub async fn handle_link_series(
                 let state2 = state.clone();
                 let pid = provider_id.clone();
                 let sn = series_name.clone();
+                let mt = media_type.clone();
                 tokio::spawn(async move {
-                    backfill_tmdb_episode_titles(&state2, &pid, &sn).await;
+                    backfill_tmdb_episode_titles(&state2, &pid, &sn, &mt).await;
                 });
             }
             Json(json!({ "linked": true, "media_type": media_type, "series_name": series_name, "metadata_id": meta_id })).into_response()
@@ -345,6 +346,10 @@ async fn fetch_tmdb(
     provider_id: &str,
     media_kind: &str,
 ) -> Result<NewExternalMetadata, String> {
+    // TMDB v3 requires the key as a query parameter — there is no header alternative
+    // without a v4 Read Access Token. This is acceptable: reqwest is built without the
+    // `log` feature (no URL logging), traffic is direct TLS to api.themoviedb.org, and
+    // no code path logs this URL. Do not add tracing/log statements that print `url`.
     let url = format!(
         "https://api.themoviedb.org/3/{kind}/{id}?api_key={key}",
         kind = media_kind,
@@ -478,6 +483,7 @@ pub(crate) async fn search_tmdb(
     api_key: &str,
     query: &str,
 ) -> Result<Vec<Value>, String> {
+    // Same constraint as fetch_tmdb: key in query param, no URL logging permitted.
     let url = format!(
         "https://api.themoviedb.org/3/search/multi?api_key={}&query={}&include_adult=false",
         api_key,
@@ -618,6 +624,7 @@ pub(crate) async fn backfill_tmdb_episode_titles(
     state: &Arc<AppState>,
     tmdb_series_id: &str,
     series_name: &str,
+    media_type: &str,
 ) {
     let cfg = state.config.read().await.clone();
     if cfg.tmdb_api_key.is_empty() {
@@ -652,12 +659,33 @@ pub(crate) async fn backfill_tmdb_episode_titles(
         };
         let season_url =
             format!("https://api.themoviedb.org/3/tv/{series_id}/season/{sn}?api_key={api_key}");
-        let season_data: Value = match client.get(&season_url).send().await {
-            Ok(r) if r.status().is_success() => match r.json().await {
+        let resp = match client.get(&season_url).send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // Honour rate-limit responses with a backoff and a single retry
+        let resp = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            tokio::time::sleep(std::time::Duration::from_secs(retry_after.max(1))).await;
+            match client.get(&season_url).send().await {
+                Ok(r) => r,
+                Err(_) => continue,
+            }
+        } else {
+            resp
+        };
+        let season_data: Value = if resp.status().is_success() {
+            match resp.json().await {
                 Ok(v) => v,
                 Err(_) => continue,
-            },
-            _ => continue,
+            }
+        } else {
+            continue;
         };
         if let Some(episodes) = season_data["episodes"].as_array() {
             for ep in episodes {
@@ -669,6 +697,8 @@ pub(crate) async fn backfill_tmdb_episode_titles(
                 }
             }
         }
+        // Throttle burst: TMDB allows ~40 req/10s; 250ms keeps us well within limits
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
     if ep_titles.is_empty() {
@@ -680,8 +710,9 @@ pub(crate) async fn backfill_tmdb_episode_titles(
         Err(_) => return,
     };
     let sn = series_name.to_string();
+    let mt = media_type.to_string();
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let jobs = db::get_season_episode_job_ids(&conn, &sn)?;
+        let jobs = db::get_season_episode_job_ids(&conn, &sn, &mt)?;
         let updates: Vec<(String, String)> = jobs
             .into_iter()
             .filter_map(|(job_id, season, ep)| {

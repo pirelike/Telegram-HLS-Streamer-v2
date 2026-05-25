@@ -13,6 +13,7 @@ use super::process_probe::parse_hls_segment_durations;
 use super::tiers::tier0_bitrate;
 use crate::config::Config;
 
+#[allow(clippy::too_many_arguments)] // all args are distinct encoding parameters; no grouping is natural
 pub(super) async fn encode_video_tier(
     analysis: &MediaAnalysis,
     video: &VideoStream,
@@ -60,7 +61,7 @@ pub(super) async fn encode_video_tier(
             tier.clone()
         };
     let repair_target_secs = target_segment_seconds_for_tier(cfg, analysis, &effective_tier);
-    repair_oversized_video_segments(
+    let ts_repair_count = repair_oversized_video_segments(
         &ts_dir,
         &effective_tier,
         encoder,
@@ -70,7 +71,7 @@ pub(super) async fn encode_video_tier(
         encode_semaphore,
     )
     .await?;
-    remux_video_ts_to_fmp4(&ts_dir, cfg, dir, cancel).await?;
+    remux_video_ts_to_fmp4(&ts_dir, cfg, repair_target_secs, dir, cancel).await?;
 
     let mut oversized_m4s = Vec::new();
     {
@@ -95,10 +96,6 @@ pub(super) async fn encode_video_tier(
         }
     }
 
-    // m4s repair is deferred to upload-time byte-splitting; no in-place re-encode is done.
-    // Report 0 repaired so callers have an honest count.
-    let m4s_repair_count = 0usize;
-
     for path in &oversized_m4s {
         let duration = super::process_probe::probe_duration(path)
             .await
@@ -122,7 +119,7 @@ pub(super) async fn encode_video_tier(
     }
 
     let _ = tokio::fs::remove_dir_all(&ts_dir).await;
-    Ok(m4s_repair_count)
+    Ok(ts_repair_count)
 }
 
 pub(super) async fn encode_video_tier_ts(
@@ -212,7 +209,7 @@ pub(super) async fn repair_oversized_video_segments(
     target_secs: u32,
     cancel: &Arc<AtomicBool>,
     encode_semaphore: &Arc<Semaphore>,
-) -> Result<()> {
+) -> Result<usize> {
     let mut oversized = Vec::new();
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -234,7 +231,7 @@ pub(super) async fn repair_oversized_video_segments(
     }
 
     if oversized.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     let encoder = encoder.clone();
@@ -267,11 +264,12 @@ pub(super) async fn repair_oversized_video_segments(
         }));
     }
 
+    let repair_count = handles.len();
     for handle in handles {
         handle.await??;
     }
 
-    Ok(())
+    Ok(repair_count)
 }
 
 pub(crate) async fn copied_segments_need_reencode(dir: &Path, target_secs: u32) -> Result<bool> {
@@ -294,7 +292,7 @@ pub(crate) fn max_bitrate_for_segment(max_file_size: u64, duration_secs: f64) ->
 }
 
 pub(crate) fn repair_needs_split(bps: u64) -> bool {
-    bps / 1000 <= 32
+    bps / 1000 < 32
 }
 
 pub(super) async fn repair_oversized_segment_max_bitrate(
@@ -383,7 +381,16 @@ pub(super) async fn repair_oversized_segment_max_bitrate(
             )
         })?;
 
-    tokio::fs::rename(&tmp, path).await?;
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e).with_context(|| {
+            format!(
+                "renaming repaired segment {} -> {}",
+                tmp.display(),
+                path.display()
+            )
+        });
+    }
 
     let repaired = tokio::fs::metadata(path).await?.len();
     // telegram_max_file_size is user-configurable; raise if Telegram increases Bot API limits.
@@ -408,6 +415,7 @@ pub(super) async fn repair_oversized_segment_max_bitrate(
 pub(super) async fn remux_video_ts_to_fmp4(
     ts_dir: &Path,
     cfg: &Config,
+    target_secs: u32,
     out_dir: &Path,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -443,7 +451,7 @@ pub(super) async fn remux_video_ts_to_fmp4(
         .arg("-f")
         .arg("hls")
         .arg("-hls_time")
-        .arg(cfg.hls_segment_duration.to_string())
+        .arg(target_secs.to_string())
         .arg("-hls_playlist_type")
         .arg("vod")
         .arg("-hls_segment_type")

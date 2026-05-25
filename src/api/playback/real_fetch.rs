@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
-use super::cache::{claim_inflight, finish_inflight, CacheEntry};
+use super::cache::{claim_inflight, finish_inflight, CacheEntry, InflightGuard};
 use super::AppState;
 use crate::config::Config;
 use crate::telegram;
@@ -20,6 +20,7 @@ pub(super) fn segment_part_aad(segment_key: &str, part_index: i64) -> String {
     format!("{segment_key}/part_{part_index}")
 }
 
+#[allow(clippy::too_many_arguments)] // single-flight fetch needs all segment lookup context
 pub(super) async fn fetch_real_with_singleflight(
     state: &Arc<AppState>,
     cfg: &Config,
@@ -44,6 +45,7 @@ pub(super) async fn fetch_real_with_singleflight(
             Err(e) => bail!(e),
         }
     }
+    let mut guard = InflightGuard::new(state.clone(), cache_key.to_string(), inflight.clone());
     let result = real_fetch_into_cache(
         state,
         cfg,
@@ -56,9 +58,11 @@ pub(super) async fn fetch_real_with_singleflight(
     )
     .await;
     finish_inflight(state, cache_key, inflight, &result).await;
+    guard.disarm();
     result
 }
 
+#[allow(clippy::too_many_arguments)] // same context required as fetch_real_with_singleflight
 pub(super) async fn real_fetch_into_cache(
     state: &AppState,
     cfg: &Config,
@@ -122,8 +126,10 @@ pub(super) async fn fetch_reconstructed_with_singleflight(
             Err(e) => bail!(e),
         }
     }
+    let mut guard = InflightGuard::new(state.clone(), cache_key.to_string(), inflight.clone());
     let result = reconstructed_fetch_into_cache(state, cfg, cache_key, key, parts).await;
     finish_inflight(state, cache_key, inflight, &result).await;
+    guard.disarm();
     result
 }
 

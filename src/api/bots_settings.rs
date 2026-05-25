@@ -91,7 +91,7 @@ pub(super) async fn handle_post_settings(
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "env_write_failed",
-            format!("settings applied to database but not persisted to .env: {e}. Changes will be lost on restart."),
+            format!("Settings saved to database but .env file update failed: {e}. Settings will still take effect on restart from the database."),
         );
     }
     // Reload config from DB (canonical source — eliminates TOCTOU)
@@ -182,8 +182,29 @@ pub(super) async fn handle_reset_settings(
     if let Err(e) = write_settings_to_env(&state, &restored).await {
         tracing::warn!(error = %e, "failed to update .env file on reset");
     }
-    let mut new_cfg = state.config.read().await.as_ref().clone();
-    config::apply_normalized_settings(&mut new_cfg, &restored);
+    let new_cfg = {
+        let conn = match state.db_conn().await {
+            Ok(conn) => conn,
+            Err(e) => return db_unavailable(e),
+        };
+        match tokio::task::spawn_blocking(move || Config::load(&conn)).await {
+            Ok(Ok(cfg)) => cfg,
+            Ok(Err(e)) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "config_reload_failed",
+                    e.to_string(),
+                );
+            }
+            Err(e) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "config_reload_failed",
+                    e.to_string(),
+                );
+            }
+        }
+    };
     let response = settings_response(&new_cfg);
     store_config(&state, new_cfg, resets_encoder_settings(&keys)).await;
     if matches!(
@@ -426,6 +447,7 @@ fn settings_response(cfg: &Config) -> Value {
 }
 
 async fn store_config(state: &AppState, cfg: Config, refresh_encoder: bool) {
+    *state.config.write().await = Arc::new(cfg.clone());
     if refresh_encoder {
         let selected = media::select_encoder(&cfg).await;
         tracing::info!(
@@ -435,7 +457,6 @@ async fn store_config(state: &AppState, cfg: Config, refresh_encoder: bool) {
         );
         *state.selected_encoder.write().await = selected;
     }
-    *state.config.write().await = Arc::new(cfg);
 }
 
 fn updates_encoder_settings(settings: &HashMap<String, String>) -> bool {

@@ -242,12 +242,13 @@ pub fn get_series_poster_urls(
 pub fn get_season_episode_job_ids(
     conn: &Connection,
     series_name: &str,
+    media_type: &str,
 ) -> Result<Vec<(String, i64, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT job_id, season_number, episode_number FROM jobs
-         WHERE series_name = ?1 AND season_number IS NOT NULL AND episode_number IS NOT NULL",
+         WHERE series_name = ?1 AND media_type = ?2 AND season_number IS NOT NULL AND episode_number IS NOT NULL",
     )?;
-    let rows = stmt.query_map(params![series_name], |row| {
+    let rows = stmt.query_map(params![series_name, media_type], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -264,20 +265,22 @@ pub fn rename_series(
     new_name: &str,
     media_type: &str,
 ) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE jobs SET series_name = ?1 WHERE series_name = ?2 AND media_type = ?3",
         params![new_name, old_name, media_type],
     )?;
     // If the new name already exists in series_metadata_links, delete the old entry
     // rather than trying to rename it (the new link was already written by link_series_metadata).
-    conn.execute(
+    tx.execute(
         "DELETE FROM series_metadata_links WHERE series_name = ?1 AND media_type = ?2",
         params![old_name, media_type],
     )?;
-    conn.execute(
-        "UPDATE OR IGNORE media_fingerprints SET series_name = ?1 WHERE series_name = ?2",
-        params![new_name, old_name],
+    tx.execute(
+        "UPDATE OR IGNORE media_fingerprints SET series_name = ?1 WHERE series_name = ?2 AND media_type = ?3",
+        params![new_name, old_name, media_type],
     )?;
+    tx.commit()?;
     Ok(())
 }
 

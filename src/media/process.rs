@@ -117,11 +117,22 @@ pub(crate) fn target_segment_seconds_for_tier(
 /// back to a safe default.
 fn parse_bitrate_bps(s: &str) -> Option<u64> {
     let trimmed = s.trim();
-    let (num, mult) = match trimmed.bytes().last()? {
-        b'k' | b'K' => (&trimmed[..trimmed.len() - 1], 1_000u64),
-        b'm' | b'M' => (&trimmed[..trimmed.len() - 1], 1_000_000u64),
-        b'g' | b'G' => (&trimmed[..trimmed.len() - 1], 1_000_000_000u64),
-        _ => (trimmed, 1u64),
+    let lower = trimmed.to_ascii_lowercase();
+    let (num, mult) = if let Some(num) = lower.strip_suffix("kbps") {
+        (num, 1_000u64)
+    } else if let Some(num) = lower.strip_suffix("mbps") {
+        (num, 1_000_000u64)
+    } else if let Some(num) = lower.strip_suffix("gbps") {
+        (num, 1_000_000_000u64)
+    } else if let Some(num) = lower.strip_suffix("bps") {
+        (num, 1u64)
+    } else {
+        match lower.bytes().last()? {
+            b'k' => (&lower[..lower.len() - 1], 1_000u64),
+            b'm' => (&lower[..lower.len() - 1], 1_000_000u64),
+            b'g' => (&lower[..lower.len() - 1], 1_000_000_000u64),
+            _ => (lower.as_str(), 1u64),
+        }
     };
     let v: f64 = num.parse().ok()?;
     Some((v * mult as f64) as u64)

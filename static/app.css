@@ -284,6 +284,7 @@ input, select, textarea { font: inherit; color: inherit; }
   gap: var(--t-gap);
   overflow-x: auto;
   scroll-snap-type: x mandatory;
+  scroll-padding: 0 56px;
   padding: 0 56px 4px;
   margin: 0 -56px;
   scrollbar-width: none;
@@ -1205,7 +1206,7 @@ input, select, textarea { font: inherit; color: inherit; }
   .upload-btn-text { display: none; }
   .t-livepill { display: none; }
   .t-section { padding-inline: 20px; }
-  .t-row { padding-inline: 20px; margin-inline: -20px; }
+  .t-row { padding-inline: 20px; margin-inline: -20px; scroll-padding: 0 20px; }
   .video-grid, .section-header, .page-card, .breadcrumb { padding-inline: 20px; margin-inline: 20px; }
   .t-hero__body { padding: 32px 24px 24px; }
   .thls-stats { grid-template-columns: 1fr 1fr; }

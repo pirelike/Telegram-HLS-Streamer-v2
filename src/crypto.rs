@@ -78,11 +78,11 @@ pub struct EncryptedPayload {
     pub ciphertext: Vec<u8>,
 }
 
-pub fn max_plaintext_size(max_upload_size: u64, encrypted: bool) -> Result<u64> {
+pub fn max_plaintext_size(telegram_max_file_size: u64, encrypted: bool) -> Result<u64> {
     if !encrypted {
-        return Ok(max_upload_size);
+        return Ok(telegram_max_file_size);
     }
-    max_upload_size
+    telegram_max_file_size
         .checked_sub(TAG_LEN)
         .filter(|v| *v > 0)
         .ok_or_else(|| anyhow!("telegram_max_file_size must be greater than AEAD tag size"))

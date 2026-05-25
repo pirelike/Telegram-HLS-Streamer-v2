@@ -231,10 +231,10 @@ fn category_ctx(category: &str, label: &str, href: &str) -> Value {
 }
 
 fn browse_page(title: &str, active_tab: &str, ctx: Value) -> Html<String> {
-    let context = format!(
-        r#"<script>window.BROWSE_CTX = {};</script>"#,
-        serde_json::to_string(&ctx).expect("serialise browse ctx")
-    );
+    let browse_ctx = serde_json::to_string(&ctx)
+        .expect("serialise browse ctx")
+        .replace('/', "\\/");
+    let context = format!(r#"<script>window.BROWSE_CTX = {};</script>"#, browse_ctx);
     base_shell(
         &format!("{title} - Telegram HLS Streamer"),
         active_tab,

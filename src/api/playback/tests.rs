@@ -6,7 +6,8 @@ use axum::body::to_bytes;
 use crate::config::Config;
 use crate::db::SegmentRow;
 
-use super::cache::{CacheEntry, Inflight};
+use super::cache::claim_inflight;
+use super::cache::{CacheEntry, Inflight, InflightGuard};
 use super::virtual_::*;
 use super::*;
 
@@ -96,12 +97,14 @@ fn cache_warmup_selects_only_first_playable_video_audio_and_thumbnail() {
 
 #[tokio::test]
 async fn disk_cache_disabled_keeps_entry_memory_only() {
-    let mut cfg = Config::default();
-    cfg.disk_cache_enabled = false;
-    cfg.cache_dir = std::env::temp_dir()
-        .join(format!("thls-disk-cache-disabled-{}", uuid::Uuid::new_v4()))
-        .to_string_lossy()
-        .into_owned();
+    let cfg = Config {
+        disk_cache_enabled: false,
+        cache_dir: std::env::temp_dir()
+            .join(format!("thls-disk-cache-disabled-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
+        ..Default::default()
+    };
 
     let entry = cache_entry_for_bytes(
         &cfg,
@@ -118,12 +121,14 @@ async fn disk_cache_disabled_keeps_entry_memory_only() {
 
 #[tokio::test]
 async fn disk_cache_enabled_writes_file_backed_entry() {
-    let mut cfg = Config::default();
-    cfg.disk_cache_enabled = true;
-    cfg.cache_dir = std::env::temp_dir()
-        .join(format!("thls-disk-cache-enabled-{}", uuid::Uuid::new_v4()))
-        .to_string_lossy()
-        .into_owned();
+    let cfg = Config {
+        disk_cache_enabled: true,
+        cache_dir: std::env::temp_dir()
+            .join(format!("thls-disk-cache-enabled-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
+        ..Default::default()
+    };
 
     let entry = cache_entry_for_bytes(
         &cfg,
@@ -168,10 +173,19 @@ async fn inflight_wait_for_outcome_handles_prior_notify() {
 #[test]
 fn stale_file_id_error_detection_covers_telegram_permanent_errors() {
     assert!(super::real::telegram_error_suggests_stale_file_id(
-        &anyhow::anyhow!("telegram_api_error status=400 description=Bad Request")
+        &anyhow::anyhow!("telegram_api_error status=400 description=Bad Request: wrong file_id")
     ));
     assert!(super::real::telegram_error_suggests_stale_file_id(
-        &anyhow::anyhow!("telegram_api_error status=403 description=Forbidden")
+        &anyhow::anyhow!("telegram_api_error status=400 description=FILE_ID_INVALID")
+    ));
+    assert!(super::real::telegram_error_suggests_stale_file_id(
+        &anyhow::anyhow!("telegram_api_error status=400 description=Invalid file id")
+    ));
+    assert!(!super::real::telegram_error_suggests_stale_file_id(
+        &anyhow::anyhow!("telegram_api_error status=400 description=Bad Request: file is too big")
+    ));
+    assert!(!super::real::telegram_error_suggests_stale_file_id(
+        &anyhow::anyhow!("telegram_api_error status=403 description=Forbidden: bot was blocked")
     ));
     assert!(!super::real::telegram_error_suggests_stale_file_id(
         &anyhow::anyhow!("network timeout")
@@ -350,6 +364,13 @@ fn is_virtual_key_recognises_virtual_prefix() {
 }
 
 #[test]
+fn virtual_double_bitrate_handles_fractional_values() {
+    assert_eq!(double_bitrate("1.5M"), "3M");
+    assert_eq!(double_bitrate("2.25Mbps"), "4.5Mbps");
+    assert_eq!(double_bitrate("1500k"), "3000k");
+}
+
+#[test]
 fn webvtt_hls_timestamp_map_is_injected_once() {
     let input = b"WEBVTT\n\n00:01.000 --> 00:02.000\nHi\n".to_vec();
     let once = bytes_for_key("sub_0/subtitles.vtt", input);
@@ -477,4 +498,90 @@ fn extract_init_from_fmp4_malformed_data_returns_err() {
     data.extend_from_slice(&9999u32.to_be_bytes()); // moov claims 9999 bytes
     data.extend_from_slice(b"moov"); // but no body data follows
     assert!(extract_init_from_fmp4(&data).is_err());
+}
+
+fn make_test_state() -> Arc<AppState> {
+    let dir = std::env::temp_dir().join(format!("thls-playback-test-{}", uuid::Uuid::new_v4()));
+    let db_path = dir.join("streamer.db");
+    let uploads_dir = dir.join("uploads");
+    let processing_dir = dir.join("processing");
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    std::fs::create_dir_all(&processing_dir).unwrap();
+    let pool = crate::db::init_db_pool(&db_path).unwrap();
+    let conn = pool.get().unwrap();
+    let cfg = crate::config::Config::load(&conn).unwrap();
+    drop(conn);
+    let (job_queue, _job_receiver) = tokio::sync::mpsc::channel(100);
+    Arc::new(AppState {
+        db: tokio::sync::RwLock::new(pool),
+        db_path: db_path.clone(),
+        env_path: db_path.parent().unwrap().join(".env"),
+        config: tokio::sync::RwLock::new(Arc::new(cfg)),
+        started_at: std::time::Instant::now(),
+        bot_health: tokio::sync::RwLock::new(Vec::new()),
+        cloudflared: crate::cloudflared::SharedCloudflaredStatus::default(),
+        http: reqwest::Client::new(),
+        telegram: crate::telegram::TelegramRuntime::new(),
+        telegram_base_url: crate::telegram::DEFAULT_API_BASE.to_string(),
+        uploads_dir,
+        processing_dir,
+        watch_settings: tokio::sync::RwLock::new(crate::api::watch_folder::WatchSettings {
+            watch_enabled: false,
+            watch_root: String::new(),
+            watch_done_dir: String::new(),
+        }),
+        watch_seen: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        pending_uploads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        upload_rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        db_sync_lock: tokio::sync::Mutex::new(()),
+        jobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        played_segments: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        segment_meta_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        job_queue,
+        cache: Arc::new(SegmentCache::new(64 * 1024 * 1024)),
+        ffmpeg_available: true,
+        ffprobe_available: true,
+        selected_encoder: tokio::sync::RwLock::new(crate::media::cpu_encoder()),
+        last_bot_index: std::sync::atomic::AtomicI64::new(0),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
+        ingest_download_semaphore: Arc::new(tokio::sync::Semaphore::new(5)),
+    })
+}
+
+#[tokio::test]
+async fn inflight_guard_resolves_waiters_on_drop() {
+    // When the leader task drops an armed InflightGuard (simulating a panic),
+    // concurrent waiters must receive an Err promptly — not hang for 300 s.
+    let state = make_test_state();
+    let cache_key = "job-guard-test/video_0001.m4s";
+
+    let (inflight, is_leader) = claim_inflight(&state, cache_key).await;
+    assert!(is_leader);
+
+    // Spawn a waiter that holds a clone of the inflight entry and blocks on the outcome.
+    let waiter_inflight = inflight.clone();
+    let waiter = tokio::spawn(async move { waiter_inflight.wait_for_outcome().await });
+
+    // Create and immediately drop an armed guard — this mimics a leader panic.
+    {
+        let _guard = InflightGuard::new(state.clone(), cache_key.to_string(), inflight);
+        // guard drops here with armed=true → spawns finish_inflight(Err)
+    }
+
+    // Waiter must resolve in well under the 300 s backstop.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("waiter timed out — guard did not notify")
+        .expect("waiter task panicked");
+    assert!(
+        outcome.is_err(),
+        "expected Err from armed guard drop, got Ok"
+    );
+
+    // Inflight map must be empty: no poisoned entry left behind.
+    let map = state.cache.inflight.lock().await;
+    assert!(
+        map.get(cache_key).is_none(),
+        "stale inflight entry after guard drop"
+    );
 }

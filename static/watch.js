@@ -7,6 +7,7 @@ let currentSiblings = [];
 let currentMarkers = [];
 let skipBtn = null;
 let skipBtnAutoFade = null;
+let playerEventAbort = null;
 
 // ─── Watch progress persistence (used by home "Continue Watching") ────────────
 const THLS_PROGRESS_KEY = 'thls_progress_v1';
@@ -254,6 +255,9 @@ async function initPlayer(job, overrideBufferConfig = null) {
             if (knownDuration > 0 && knownDuration <= seconds + 5) return 0;
             return seconds;
         })();
+        if (playerEventAbort) playerEventAbort.abort();
+        playerEventAbort = new AbortController();
+        const playerEventOptions = { signal: playerEventAbort.signal };
         let lastSave = 0;
         let serverLastSave = 0;
         videoEl.addEventListener('timeupdate', () => {
@@ -262,32 +266,26 @@ async function initPlayer(job, overrideBufferConfig = null) {
             if (now - lastSave < 5000) return;
             lastSave = now;
             saveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
-        });
+        }, playerEventOptions);
         videoEl.addEventListener('timeupdate', () => {
             const now = Date.now();
             if (now - serverLastSave < 30000) return;
             serverLastSave = now;
             serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
-        });
+        }, playerEventOptions);
         videoEl.addEventListener('ended', () => {
             saveProgress(job.job_id, videoEl.duration, videoEl.duration);
             serverSaveProgress(job.job_id, videoEl.duration, videoEl.duration);
-        });
+        }, playerEventOptions);
         videoEl.addEventListener('pause', () => {
             serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
-        });
+        }, playerEventOptions);
         videoEl.addEventListener('seeked', () => {
             serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
-        });
+        }, playerEventOptions);
 
         try {
             await player.load(m3u8Url, resumeSeconds || undefined);
-            const duration = Number(videoEl.duration || job.duration || 0);
-            if (resumeSeconds > 0
-                && (!duration || duration > resumeSeconds + 5)
-                && Math.abs((videoEl.currentTime || 0) - resumeSeconds) > 2) {
-                videoEl.currentTime = resumeSeconds;
-            }
         }
         catch (e) {
             console.error('Shaka load error', e);
@@ -336,7 +334,7 @@ function renderInfoPanel(job) {
     const metaParts = [];
     if (job.duration > 0) metaParts.push(formatDuration(job.duration));
     if (job.video_height) metaParts.push(`${job.video_height}p`);
-    if (job.video_codec) metaParts.push(escapeHtml(job.video_codec));
+    if (job.video_codec) metaParts.push(job.video_codec);
     if (ext.rating) metaParts.push(`★ ${ext.rating.toFixed(1)}`);
     if (job.series_name && job.is_series) {
         if (job.season_number != null && job.episode_number != null) {
@@ -541,9 +539,11 @@ function renderEpisodeNav(job, siblings) {
 function copyPlayerUrl() {
     const el = document.getElementById('playerM3u8Url');
     if (el) navigator.clipboard.writeText(el.textContent).then(() => {
-        const btn = el.nextElementSibling;
+        const btn = document.querySelector('[onclick="copyPlayerUrl()"]');
+        if (!btn) return;
+        const originalHtml = btn.innerHTML;
         btn.textContent = 'Copied!';
-        setTimeout(() => btn.textContent = 'Copy M3U8', 2000);
+        setTimeout(() => { btn.innerHTML = originalHtml; }, 2000);
     });
 }
 

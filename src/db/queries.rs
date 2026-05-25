@@ -18,8 +18,8 @@ pub fn save_job(
         "INSERT INTO jobs(
             job_id, filename, duration, file_size, video_codec, video_width, video_height, status,
             media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number,
-            source_path, source_bitrate
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            source_path, source_bitrate, created_at_unix
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, strftime('%s','now'))
          ON CONFLICT(job_id) DO UPDATE SET
             filename = excluded.filename,
             duration = excluded.duration,
@@ -191,6 +191,7 @@ pub fn update_job_metadata(
     Ok(n > 0)
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors the flat metadata columns on the jobs table
 pub fn update_job_metadata_fields(
     conn: &mut Connection,
     job_id: &str,
@@ -383,6 +384,9 @@ pub fn delete_job(conn: &Connection, job_id: &str) -> Result<bool> {
 }
 
 pub fn delete_old_jobs(conn: &Connection, older_than_days: i64) -> Result<usize> {
+    if older_than_days < 0 {
+        anyhow::bail!("older_than_days must be non-negative");
+    }
     conn.execute(
         "DELETE FROM jobs WHERE created_at < datetime('now', '-' || ?1 || ' days')",
         params![older_than_days],
@@ -403,7 +407,7 @@ pub fn insert_job_marker(
     status: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO jobs(job_id, filename, status, created_at) VALUES (?1, ?2, ?3, datetime('now'))",
+        "INSERT OR IGNORE INTO jobs(job_id, filename, status, created_at, created_at_unix) VALUES (?1, ?2, ?3, datetime('now'), strftime('%s','now'))",
         rusqlite::params![job_id, filename, status],
     )?;
     Ok(())

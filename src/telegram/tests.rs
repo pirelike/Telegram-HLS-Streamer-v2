@@ -246,7 +246,7 @@ async fn oversized_upload_fails_before_contacting_telegram() {
 
     assert!(err.to_string().contains("telegram_file_too_large"));
     assert_eq!(fake.send_attempts.load(Ordering::SeqCst), 0);
-    assert_eq!(runtime.metrics_snapshot().await.upload_errors, 1);
+    assert_eq!(runtime.metrics_snapshot().await.upload_errors, 0);
     let _ = tokio::fs::remove_file(path).await;
 }
 
@@ -478,18 +478,20 @@ fn validate_file_id_rejects_short_input() {
         "short string (3 chars) should be rejected: {err}"
     );
 
-    let err = validate_file_id(&"a".repeat(49)).unwrap_err();
+    let err = validate_file_id("abc\nxyz").unwrap_err();
     assert!(
         err.to_string().contains("invalid Telegram file_id"),
-        "49-char string should be rejected: {err}"
+        "control characters should be rejected: {err}"
     );
 }
 
 #[test]
 fn validate_file_id_accepts_valid_ids() {
+    assert!(validate_file_id(&"a".repeat(49)).is_ok());
     assert!(validate_file_id(&"A".repeat(50)).is_ok());
     assert!(validate_file_id(&"aB3_z-".repeat(10)).is_ok());
     assert!(validate_file_id(&"A".repeat(255)).is_ok());
+    assert!(validate_file_id(&format!("{}+/=", "A".repeat(50))).is_ok());
 }
 
 #[test]

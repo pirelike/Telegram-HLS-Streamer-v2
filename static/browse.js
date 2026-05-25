@@ -6,6 +6,9 @@ let allJobs = [];
 let searchQuery = '';
 let jobsPage = 1;
 let hasMoreJobs = false;
+let _seriesDetailSelected = null;
+let _seriesDetailEpisodes = {};
+let _seriesDetailKey = null;
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const searchInput = document.getElementById('searchInput');
@@ -14,11 +17,15 @@ const loadMoreBtn = document.getElementById('loadMoreBtn');
 
 // ─── Search ──────────────────────────────────────────────────────────────────
 let searchTimeout = null;
-searchInput.addEventListener('input', () => {
-    searchQuery = searchInput.value.trim();
+function setSearchQuery(value) {
+    searchQuery = String(value || '').trim();
+    if (searchInput) searchInput.value = searchQuery;
     clearTimeout(searchTimeout);
     searchTimeout = setTimeout(loadJobs, 400);
-});
+}
+if (searchInput) {
+    searchInput.addEventListener('input', () => setSearchQuery(searchInput.value));
+}
 
 // ─── Breadcrumbs ─────────────────────────────────────────────────────────────
 function renderBreadcrumbs() {
@@ -74,10 +81,11 @@ function loadJobs() {
 }
 
 function loadMoreJobs() {
-    jobsPage += 1;
-    fetch(_buildApiUrl(jobsPage))
+    const nextPage = jobsPage + 1;
+    fetch(_buildApiUrl(nextPage))
         .then(r => r.json())
         .then(data => {
+            jobsPage = nextPage;
             const newJobs = data.jobs || [];
             allJobs = allJobs.concat(newJobs);
             hasMoreJobs = !!data.has_more;
@@ -106,6 +114,7 @@ function renderJobs() {
              <div class="subtitle">Sorted by recently added.</div>
              <div class="t-fbar">
                <i class="material-icons-round">filter_list</i>
+               <input class="t-chip" id="pageSearchInput" type="search" value="${escapeAttr(searchQuery)}" placeholder="Search this view" style="min-width:180px;text-align:left">
                ${['All','Unwatched','4K','HDR','HEVC','AV1','2024']
                   .map((c,i)=>`<button class="t-chip" aria-pressed="${i===0?'true':'false'}">${c}</button>`).join('')}
                <div style="flex:1"></div>
@@ -141,7 +150,12 @@ function renderJobs() {
     videosContainer.innerHTML = header + contentHtml;
 
     // Wire filter chips (visual-only for now — toggle aria-pressed within the bar)
-    videosContainer.querySelectorAll('.t-fbar .t-chip').forEach((chip, i, all) => {
+    const pageSearchInput = videosContainer.querySelector('#pageSearchInput');
+    if (pageSearchInput) {
+        pageSearchInput.addEventListener('input', () => setSearchQuery(pageSearchInput.value));
+    }
+
+    videosContainer.querySelectorAll('.t-fbar button.t-chip').forEach((chip, i, all) => {
         chip.addEventListener('click', () => {
             // sort chip is the last one — don't toggle the filter group
             if (i === all.length - 1) return;
@@ -232,7 +246,6 @@ function renderCard(j, type) {
                 ? `<div class="thumb-progress-bg"><div class="thumb-progress-fg" style="width:${j.progress_pct}%"></div></div>` 
                 : ''}
         </div>
-        </div>
         <div class="card-meta">
             <div class="card-title">${title}</div>
             <div class="card-subtitle"><span class="dot"></span>${subtitleHtml}</div>
@@ -245,9 +258,6 @@ function renderCard(j, type) {
 }
 
 // ─── Series detail (seasons view) ────────────────────────────────────────────
-let _seriesDetailSelected = null;
-let _seriesDetailEpisodes = {};
-
 function renderSeriesDetailHeader(seasonItems) {
     const ctx = window.BROWSE_CTX;
     const sample = seasonItems.find(j => j.has_thumbnail) || seasonItems[0] || {};
@@ -291,6 +301,12 @@ function renderSeriesDetailHeader(seasonItems) {
 
 function renderSeriesSeasonContent(seasonItems) {
     const ctx = window.BROWSE_CTX;
+    const detailKey = `${ctx.category || ''}\u0000${ctx.seriesName || ''}`;
+    if (_seriesDetailKey !== detailKey) {
+        _seriesDetailKey = detailKey;
+        _seriesDetailSelected = null;
+        _seriesDetailEpisodes = {};
+    }
     const seriesSlug = ctx.seriesSlug || slugify(ctx.seriesName || '');
     const catRoot = ctx.category === 'Anime TV' ? '/anime-tv' : '/series';
 

@@ -498,6 +498,99 @@ fn merge_from_export_remaps_metadata_and_preserves_marker_collisions() {
 }
 
 #[test]
+fn merge_from_export_dedups_near_equal_media_markers() {
+    let source_path = temp_db_path("marker_dedup_source.db");
+    let mut source = init_db(&source_path).unwrap();
+    save_job(
+        &mut source,
+        &NewJob::complete("marker-job", "episode.mkv"),
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap();
+    save_media_markers(
+        &source,
+        "marker-job",
+        &[NewMediaMarker {
+            marker_type: "intro".into(),
+            start_seconds: 10.0,
+            end_seconds: 70.0,
+            source: "chapter".into(),
+            confidence: 1.0,
+        }],
+    )
+    .unwrap();
+    let export = export_to_dict(&source).unwrap();
+
+    let target_path = temp_db_path("marker_dedup_target.db");
+    let mut target = init_db(&target_path).unwrap();
+    save_job(
+        &mut target,
+        &NewJob::complete("marker-job", "episode.mkv"),
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap();
+    save_media_markers(
+        &target,
+        "marker-job",
+        &[NewMediaMarker {
+            marker_type: "intro".into(),
+            start_seconds: 10.005,
+            end_seconds: 69.995,
+            source: "chapter".into(),
+            confidence: 0.9,
+        }],
+    )
+    .unwrap();
+
+    merge_from_export(&mut target, &export, &std::collections::HashMap::new()).unwrap();
+    let markers = get_media_markers(&target, "marker-job", false).unwrap();
+    assert_eq!(markers.len(), 1);
+}
+
+#[test]
+fn save_media_markers_rolls_back_partial_insert_on_error() {
+    let path = temp_db_path("marker_atomic.db");
+    let mut conn = init_db(&path).unwrap();
+    save_job(
+        &mut conn,
+        &NewJob::complete("marker-job", "episode.mkv"),
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap();
+
+    let result = save_media_markers(
+        &conn,
+        "marker-job",
+        &[
+            NewMediaMarker {
+                marker_type: "intro".into(),
+                start_seconds: 10.0,
+                end_seconds: 70.0,
+                source: "chapter".into(),
+                confidence: 1.0,
+            },
+            NewMediaMarker {
+                marker_type: "intro".into(),
+                start_seconds: 80.0,
+                end_seconds: 70.0,
+                source: "chapter".into(),
+                confidence: 1.0,
+            },
+        ],
+    );
+    assert!(result.is_err());
+    assert!(get_media_markers(&conn, "marker-job", false)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn replace_auto_media_markers_preserves_manual_markers() {
     let path = temp_db_path("replace_auto_markers.db");
     let mut conn = init_db(&path).unwrap();
@@ -640,6 +733,36 @@ fn listing_helpers_filter_and_group_library_rows() {
         ..Default::default()
     };
     assert_eq!(list_jobs(&conn, &filter).unwrap()[0].job_id, "special");
+    assert_eq!(count_series_groups(&conn, &filter).unwrap(), 1);
+    assert_eq!(count_season_groups(&conn, &filter).unwrap(), 1);
+
+    let mut literal_percent = NewJob::complete("literal-percent", "100% match.mkv");
+    literal_percent.media_type = "Series".into();
+    literal_percent.series_name = "My Show".into();
+    literal_percent.is_series = true;
+    literal_percent.season_number = Some(2);
+    literal_percent.episode_number = Some(1);
+    save_job(&mut conn, &literal_percent, &[], &[], &[]).unwrap();
+    let mut wildcard_decoy = NewJob::complete("wildcard-decoy", "100x match.mkv");
+    wildcard_decoy.media_type = "Series".into();
+    wildcard_decoy.series_name = "My Show".into();
+    wildcard_decoy.is_series = true;
+    wildcard_decoy.season_number = Some(2);
+    wildcard_decoy.episode_number = Some(2);
+    save_job(&mut conn, &wildcard_decoy, &[], &[], &[]).unwrap();
+    let filter = JobListFilter {
+        category: Some("Series".into()),
+        search: Some("100%".into()),
+        ..Default::default()
+    };
+    let matches = list_jobs(&conn, &filter).unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].job_id, "literal-percent");
+
+    let ids = get_season_episode_job_ids(&conn, "My Show", "Series").unwrap();
+    assert!(ids.iter().any(|(job_id, _, _)| job_id == "show1"));
+    let anime_ids = get_season_episode_job_ids(&conn, "My Show", "Anime TV").unwrap();
+    assert!(anime_ids.is_empty());
 }
 
 #[test]
