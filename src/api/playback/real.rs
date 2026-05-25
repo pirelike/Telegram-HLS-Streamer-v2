@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use super::cache::{claim_inflight, finish_inflight, CacheEntry};
+use super::cache::{claim_inflight, finish_inflight, CacheEntry, InflightGuard};
 use super::{api_error, db_unavailable, AppState};
 use crate::config::Config;
 
@@ -140,10 +140,12 @@ pub(super) async fn serve_reconstructed_segment(
         };
     }
 
+    let mut guard = InflightGuard::new(state.clone(), cache_key.clone(), inflight.clone());
     let entry = match reconstructed_fetch_into_cache(&state, &cfg, &cache_key, &key, &parts).await {
         Ok(entry) => entry,
         Err(e) => {
             finish_inflight(&state, &cache_key, inflight, &Err::<CacheEntry, _>(e)).await;
+            guard.disarm();
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "cache_write_failed",
@@ -157,6 +159,7 @@ pub(super) async fn serve_reconstructed_segment(
     tokio::spawn(async move {
         finish_inflight(&state2, &cache_key, inflight, &Ok(entry_clone)).await;
     });
+    guard.disarm();
 
     spawn_prefetch_real(state.clone(), job_id.clone(), key.clone());
     mark_segment_played_and_cleanup(&state, &job_id, &key).await;
@@ -183,35 +186,65 @@ pub(super) async fn mark_segment_played_and_cleanup(
         entry.1 = now;
     }
 
-    let (segments, source_path) = {
-        let conn = match state.db_conn().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                tracing::warn!(job_id, error = %e, "segment playback cleanup DB connection failed");
-                return;
-            }
+    // Fetch segment keys and source_path from cache (populated once per job, TTL 1 hour)
+    let cache_ttl = std::time::Duration::from_secs(3600);
+    let (segment_keys, source_path) = {
+        let cached = {
+            let cache = state.segment_meta_cache.lock().await;
+            cache.get(job_id).and_then(|(keys, sp, ts)| {
+                if ts.elapsed() < cache_ttl {
+                    Some((keys.clone(), sp.clone()))
+                } else {
+                    None
+                }
+            })
         };
-        let job_id_for_db = job_id.to_string();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let segments = db::get_segments_for_job(&conn, &job_id_for_db)?;
-            let source_path = db::get_job(&conn, &job_id_for_db)?.and_then(|job| job.source_path);
-            Ok((segments, source_path))
-        })
-        .await;
-        match result {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::warn!(job_id, error = %e, "segment playback cleanup DB query failed");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(job_id, error = %e, "segment playback cleanup DB task failed");
-                return;
+        match cached {
+            Some(v) => v,
+            None => {
+                let conn = match state.db_conn().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::warn!(job_id, error = %e, "segment playback cleanup DB connection failed");
+                        return;
+                    }
+                };
+                let job_id_for_db = job_id.to_string();
+                let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let segments = db::get_segments_for_job(&conn, &job_id_for_db)?;
+                    let source_path =
+                        db::get_job(&conn, &job_id_for_db)?.and_then(|job| job.source_path);
+                    Ok((segments, source_path))
+                })
+                .await;
+                match result {
+                    Ok(Ok((segments, source))) => {
+                        let keys = Arc::new(
+                            segments
+                                .iter()
+                                .map(|s| s.segment_key.clone())
+                                .collect::<Vec<_>>(),
+                        );
+                        state.segment_meta_cache.lock().await.insert(
+                            job_id.to_string(),
+                            (keys.clone(), source.clone(), std::time::Instant::now()),
+                        );
+                        (keys, source)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(job_id, error = %e, "segment playback cleanup DB query failed");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(job_id, error = %e, "segment playback cleanup DB task failed");
+                        return;
+                    }
+                }
             }
         }
     };
 
-    if segments.is_empty() {
+    if segment_keys.is_empty() {
         return;
     }
     let all_played = {
@@ -219,9 +252,7 @@ pub(super) async fn mark_segment_played_and_cleanup(
         let Some((played_set, _)) = played.get(job_id) else {
             return;
         };
-        segments
-            .iter()
-            .all(|segment| played_set.contains(&segment.segment_key))
+        segment_keys.iter().all(|k| played_set.contains(k))
     };
     if !all_played {
         return;
@@ -229,6 +260,7 @@ pub(super) async fn mark_segment_played_and_cleanup(
 
     let Some(path) = pending_delete_source_path(state, source_path.as_deref()) else {
         state.played_segments.lock().await.remove(job_id);
+        state.segment_meta_cache.lock().await.remove(job_id);
         return;
     };
     match tokio::fs::remove_file(&path).await {
@@ -251,6 +283,7 @@ pub(super) async fn mark_segment_played_and_cleanup(
         }
     }
     state.played_segments.lock().await.remove(job_id);
+    state.segment_meta_cache.lock().await.remove(job_id);
 }
 
 fn pending_delete_source_path(

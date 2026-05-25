@@ -53,22 +53,35 @@ pub(crate) async fn analysis_from_ffprobe(path: &Path, value: &Value) -> Result<
     let mut audio_streams = Vec::new();
     let mut subtitle_streams = Vec::new();
 
-    for stream in value["streams"].as_array().cloned().unwrap_or_default() {
+    let streams = value["streams"].as_array().cloned().unwrap_or_default();
+    let has_real_video = streams.iter().any(|stream| {
+        stream["codec_type"].as_str() == Some("video")
+            && stream["disposition"]["attached_pic"].as_i64().unwrap_or(0) != 1
+            && !matches!(stream["codec_name"].as_str().unwrap_or(""), "mjpeg" | "png")
+    });
+    for stream in streams {
         let codec_type = stream["codec_type"].as_str().unwrap_or("");
         let codec_name = str_field(&stream, "codec_name", "unknown");
         let tags = &stream["tags"];
         let language = tags["language"].as_str().unwrap_or("und").to_string();
         let title = tags["title"].as_str().unwrap_or("").to_string();
         match codec_type {
-            "video" => video_streams.push(VideoStream {
-                index: int_field(&stream, "index", -1),
-                codec_name,
-                width: int_field(&stream, "width", 0),
-                height: int_field(&stream, "height", 0),
-                bit_rate: str_field(&stream, "bit_rate", "0"),
-                language,
-                title,
-            }),
+            "video" => {
+                let attached_pic = stream["disposition"]["attached_pic"].as_i64().unwrap_or(0) == 1;
+                let album_art_codec = matches!(codec_name.as_str(), "mjpeg" | "png");
+                if has_real_video && (attached_pic || album_art_codec) {
+                    continue;
+                }
+                video_streams.push(VideoStream {
+                    index: int_field(&stream, "index", -1),
+                    codec_name,
+                    width: int_field(&stream, "width", 0),
+                    height: int_field(&stream, "height", 0),
+                    bit_rate: str_field(&stream, "bit_rate", "0"),
+                    language,
+                    title,
+                });
+            }
             "audio" => audio_streams.push(AudioStream {
                 index: int_field(&stream, "index", -1),
                 codec_name,

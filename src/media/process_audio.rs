@@ -157,7 +157,7 @@ pub(crate) fn double_bitrate(raw: &str) -> String {
     let suffixes = ["kbps", "mbps", "gbps", "bps", "k", "m", "g"];
     let (number_str, suffix_len) = suffixes
         .iter()
-        .find_map(|s| lower.ends_with(s).then(|| s.len()))
+        .find_map(|s| lower.ends_with(s).then_some(s.len()))
         .map_or((raw, 0), |len| (&raw[..raw.len() - len], len));
     let suffix = if suffix_len > 0 {
         &raw[raw.len() - suffix_len..]

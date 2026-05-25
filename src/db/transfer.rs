@@ -145,8 +145,8 @@ pub fn merge_from_export(
             "INSERT OR IGNORE INTO jobs(
                 job_id, filename, duration, file_size, video_codec, video_width, video_height, status,
                 error, created_at, media_type, series_name, has_thumbnail, is_series, season_number, episode_number, part_number,
-                source_path, source_bitrate
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                source_path, episode_title, source_bitrate, created_at_unix
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, strftime('%s','now'))",
             params![
                 new_job.job_id,
                 new_job.filename,
@@ -166,6 +166,7 @@ pub fn merge_from_export(
                 new_job.episode_number,
                 new_job.part_number,
                 new_job.source_path,
+                job.episode_title,
                 new_job.source_bitrate,
             ],
         )?;
@@ -229,9 +230,16 @@ pub fn merge_from_export(
     }
     for progress in &export.playback_progress {
         tx.execute(
-            "INSERT OR REPLACE INTO playback_progress(client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![progress.client_id, progress.job_id, progress.position_seconds, progress.duration_seconds, progress.progress_pct, bool_to_i64(progress.completed) as i64, progress.updated_at],
+            "INSERT INTO playback_progress(client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(client_id, job_id) DO UPDATE SET
+                 position_seconds = excluded.position_seconds,
+                 duration_seconds = excluded.duration_seconds,
+                 progress_pct     = excluded.progress_pct,
+                 completed        = excluded.completed,
+                 updated_at       = excluded.updated_at
+             WHERE excluded.updated_at > playback_progress.updated_at",
+            params![progress.client_id, progress.job_id, progress.position_seconds, progress.duration_seconds, progress.progress_pct, { bool_to_i64(progress.completed) }, progress.updated_at],
         )?;
     }
     for meta in &export.external_metadata {
@@ -281,9 +289,12 @@ pub fn merge_from_export(
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
              WHERE NOT EXISTS (
                 SELECT 1 FROM media_markers
-                WHERE job_id = ?1 AND marker_type = ?2 AND start_seconds = ?3 AND end_seconds = ?4 AND source = ?5
+                WHERE job_id = ?1 AND marker_type = ?2
+                  AND ABS(start_seconds - ?3) < 0.01
+                  AND ABS(end_seconds - ?4) < 0.01
+                  AND source = ?5
              )",
-            params![marker.job_id, marker.marker_type, marker.start_seconds, marker.end_seconds, marker.source, marker.confidence, bool_to_i64(marker.enabled) as i64, marker.created_at, marker.updated_at],
+            params![marker.job_id, marker.marker_type, marker.start_seconds, marker.end_seconds, marker.source, marker.confidence, { bool_to_i64(marker.enabled) }, marker.created_at, marker.updated_at],
         )?;
     }
     for fp in &export.media_fingerprints {

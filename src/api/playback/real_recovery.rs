@@ -104,9 +104,8 @@ pub(super) async fn reupload_from_cache_or_source(
 }
 
 pub(super) fn telegram_error_suggests_stale_file_id(err: &anyhow::Error) -> bool {
-    let err = err.to_string();
-    err.contains("400")
-        || err.contains("403")
-        || err.contains("Bad Request")
-        || err.contains("Forbidden")
+    let err = err.to_string().to_lowercase();
+    err.contains("file_id_invalid")
+        || err.contains("wrong file_id")
+        || err.contains("invalid file id")
 }

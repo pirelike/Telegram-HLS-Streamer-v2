@@ -224,6 +224,16 @@ pub(super) async fn upload_snapshot_to_all_bots(
     .await?;
 
     for (bot_index, bot) in cfg.bots.iter().cloned().enumerate() {
+        // Buffer this bot's uploads; only commit to the descriptor after ALL parts succeed
+        struct BotUploadRecord {
+            part_index: usize,
+            file_id: String,
+            file_size: u64,
+            encryption_nonce: Option<String>,
+        }
+        let mut bot_buffer: Vec<BotUploadRecord> = Vec::new();
+        let mut bot_failed = false;
+
         for (part_index, path) in upload_paths.iter().enumerate() {
             let logical_key = crate::crypto::db_sync_aad(&snapshot.id, part_index as i64);
             let uploaded = telegram::upload_document(
@@ -240,23 +250,12 @@ pub(super) async fn upload_snapshot_to_all_bots(
             .await;
             match uploaded {
                 Ok(uploaded) => {
-                    let conn = state.db_conn().await?;
-                    db::record_db_sync_upload(
-                        &conn,
-                        &snapshot.id,
-                        bot_index as i64,
-                        part_index as i64,
-                        &uploaded.file_id,
-                        uploaded.file_size,
-                        uploaded.encryption_nonce.as_deref(),
-                    )?;
-                    uploads.push(json!({
-                        "bot_index": bot_index,
-                        "part_index": part_index,
-                        "file_id": uploaded.file_id,
-                        "size": uploaded.file_size,
-                        "encryption_nonce": uploaded.encryption_nonce,
-                    }));
+                    bot_buffer.push(BotUploadRecord {
+                        part_index,
+                        file_id: uploaded.file_id,
+                        file_size: uploaded.file_size,
+                        encryption_nonce: uploaded.encryption_nonce,
+                    });
                 }
                 Err(e) => {
                     failed_bots.push(json!({
@@ -271,8 +270,32 @@ pub(super) async fn upload_snapshot_to_all_bots(
                         error = %e,
                         "db sync upload failed for bot"
                     );
+                    bot_failed = true;
                     break;
                 }
+            }
+        }
+
+        // Only include this bot in the descriptor if every part succeeded
+        if !bot_failed {
+            let conn = state.db_conn().await?;
+            for rec in bot_buffer {
+                db::record_db_sync_upload(
+                    &conn,
+                    &snapshot.id,
+                    bot_index as i64,
+                    rec.part_index as i64,
+                    &rec.file_id,
+                    rec.file_size,
+                    rec.encryption_nonce.as_deref(),
+                )?;
+                uploads.push(json!({
+                    "bot_index": bot_index,
+                    "part_index": rec.part_index,
+                    "file_id": rec.file_id,
+                    "size": rec.file_size,
+                    "encryption_nonce": rec.encryption_nonce,
+                }));
             }
         }
     }

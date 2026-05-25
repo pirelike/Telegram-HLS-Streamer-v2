@@ -172,8 +172,15 @@ pub(super) async fn handle_post_watch_settings(
             e.to_string(),
         );
     }
+    let old = state.watch_settings.read().await.clone();
     *state.watch_settings.write().await = body.clone();
-    state.watch_seen.lock().await.clear();
+    // Only reset the in-memory dedup cache when watch-relevant settings change
+    if old.watch_enabled != body.watch_enabled
+        || old.watch_root != body.watch_root
+        || old.watch_done_dir != body.watch_done_dir
+    {
+        state.watch_seen.lock().await.clear();
+    }
     Json(json!({
         "watch_enabled": body.watch_enabled,
         "watch_root": body.watch_root,
@@ -187,14 +194,20 @@ pub(super) async fn watch_folder_poller(state: Arc<AppState>) {
     loop {
         let settings = state.watch_settings.read().await.clone();
         let cfg = state.config.read().await.clone();
-        if !settings.watch_enabled {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
+        if settings.watch_enabled {
+            if let Err(e) = scan_watch_folder(&state, &settings, &cfg).await {
+                tracing::warn!(error = %e, "watch folder scan failed");
+            }
         }
-        if let Err(e) = scan_watch_folder(&state, &settings, &cfg).await {
-            tracing::warn!(error = %e, "watch folder scan failed");
+        let sleep_secs = if settings.watch_enabled {
+            cfg.watch_poll_seconds.max(1) as u64
+        } else {
+            1
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
+            _ = state.shutdown_token.cancelled() => break,
         }
-        tokio::time::sleep(Duration::from_secs(cfg.watch_poll_seconds.max(1) as u64)).await;
     }
 }
 
@@ -554,6 +567,7 @@ mod tests {
             db_sync_lock: Mutex::new(()),
             jobs: Mutex::new(HashMap::new()),
             played_segments: Mutex::new(HashMap::new()),
+            segment_meta_cache: Mutex::new(HashMap::new()),
             job_queue,
             cache: Arc::new(crate::api::playback::SegmentCache::new(64 * 1024 * 1024)),
             ffmpeg_available: true,

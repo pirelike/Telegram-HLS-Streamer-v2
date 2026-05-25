@@ -10,6 +10,7 @@ use crate::crypto::EncryptionKey;
 use super::errors::TelegramError;
 use super::*;
 
+#[allow(clippy::too_many_arguments)] // public upload API; bot+path+key+config are all required
 pub async fn upload_document(
     client: &reqwest::Client,
     runtime: &TelegramRuntime,
@@ -30,7 +31,6 @@ pub async fn upload_document(
     let prepared =
         prepare_upload_payload(path, &segment_key, encryption_key, plaintext_size).await?;
     if prepared.upload_size > max_file_size {
-        runtime.record_upload_error(bot_index).await;
         let upload_size = prepared.upload_size;
         let _ = prepared.cleanup().await;
         bail!(
@@ -46,12 +46,8 @@ pub async fn upload_document(
         base_url,
         bot,
         bot_index,
-        &prepared.path,
-        &prepared.filename,
         segment_key,
-        plaintext_size,
-        prepared.upload_size,
-        prepared.encryption_nonce.clone(),
+        &prepared,
     )
     .await;
     let cleanup_result = prepared.cleanup().await;
@@ -64,6 +60,7 @@ pub async fn upload_document(
 struct PreparedUpload {
     path: PathBuf,
     filename: String,
+    plaintext_size: u64,
     upload_size: u64,
     encryption_nonce: Option<String>,
     cleanup_path: Option<PathBuf>,
@@ -97,6 +94,7 @@ async fn prepare_upload_payload(
         return Ok(PreparedUpload {
             path: path.to_path_buf(),
             filename,
+            plaintext_size,
             upload_size: plaintext_size,
             encryption_nonce: None,
             cleanup_path: None,
@@ -115,6 +113,7 @@ async fn prepare_upload_payload(
     Ok(PreparedUpload {
         path: staged_path.clone(),
         filename,
+        plaintext_size,
         upload_size: encrypted.ciphertext.len() as u64,
         encryption_nonce: Some(encrypted.nonce_hex),
         cleanup_path: Some(staged_path),
@@ -127,12 +126,8 @@ async fn upload_prepared_document(
     base_url: &str,
     bot: BotConfig,
     bot_index: i64,
-    path: &Path,
-    filename: &str,
     segment_key: String,
-    plaintext_size: u64,
-    upload_size: u64,
-    encryption_nonce: Option<String>,
+    prepared: &PreparedUpload,
 ) -> Result<UploadedFile> {
     let lock = runtime.upload_lock(&bot.token).await;
     let mut guard = lock.lock().await;
@@ -140,9 +135,9 @@ async fn upload_prepared_document(
     tracing::info!(
         segment_key = %segment_key,
         bot_index,
-        file_size = plaintext_size,
-        upload_size,
-        filename = %filename,
+        file_size = prepared.plaintext_size,
+        upload_size = prepared.upload_size,
+        filename = %prepared.filename,
         "telegram upload started"
     );
 
@@ -151,32 +146,36 @@ async fn upload_prepared_document(
             client,
             base_url,
             &bot,
-            path,
-            filename,
-            upload_size,
+            &prepared.path,
+            &prepared.filename,
+            prepared.upload_size,
         )
         .await
         {
             Ok((file_id, remote_size)) => {
-                if remote_size != upload_size {
+                if remote_size != prepared.upload_size {
                     runtime.record_upload_error(bot_index).await;
                     runtime.record_consecutive_failure(bot_index).await;
                     bail!(
                         "upload_integrity_mismatch: {} local={} telegram={}",
                         segment_key,
-                        upload_size,
+                        prepared.upload_size,
                         remote_size
                     );
                 }
                 runtime
-                    .record_upload_success(bot_index, upload_size, started.elapsed().as_secs_f64())
+                    .record_upload_success(
+                        bot_index,
+                        prepared.upload_size,
+                        started.elapsed().as_secs_f64(),
+                    )
                     .await;
                 runtime.reset_consecutive_failures(bot_index).await;
                 tracing::info!(
                     segment_key = %segment_key,
                     bot_index,
-                    file_size = plaintext_size,
-                    upload_size,
+                    file_size = prepared.plaintext_size,
+                    upload_size = prepared.upload_size,
                     elapsed_ms = started.elapsed().as_millis(),
                     "telegram upload complete"
                 );
@@ -184,8 +183,8 @@ async fn upload_prepared_document(
                     segment_key,
                     file_id,
                     bot_index,
-                    file_size: plaintext_size,
-                    encryption_nonce,
+                    file_size: prepared.plaintext_size,
+                    encryption_nonce: prepared.encryption_nonce.clone(),
                 });
             }
             Err(TelegramError::Permanent(e)) => {

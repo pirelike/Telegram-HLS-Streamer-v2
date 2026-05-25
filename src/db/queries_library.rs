@@ -82,13 +82,14 @@ pub fn list_series_groups(
 
 pub fn count_series_groups(conn: &Connection, filter: &JobListFilter) -> Result<i64> {
     let (where_sql, params) = job_filter_sql(filter);
-    let sql = if where_sql.is_empty() {
-        "SELECT COUNT(*) FROM (SELECT series_name FROM jobs WHERE COALESCE(series_name, '') != '' GROUP BY series_name)".to_string()
-    } else {
-        format!(
-            "SELECT COUNT(*) FROM (SELECT series_name FROM jobs {where_sql} AND COALESCE(series_name, '') != '' GROUP BY series_name)"
-        )
-    };
+    let sql = format!(
+        "WITH filtered AS (SELECT * FROM jobs {where_sql})
+         SELECT COUNT(*) FROM (
+            SELECT series_name FROM filtered
+            WHERE COALESCE(series_name, '') != ''
+            GROUP BY series_name
+         )"
+    );
     let refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     conn.query_row(&sql, refs.as_slice(), |r| r.get(0))
@@ -152,13 +153,14 @@ pub fn list_season_groups(
 
 pub fn count_season_groups(conn: &Connection, filter: &JobListFilter) -> Result<i64> {
     let (where_sql, params) = job_filter_sql(filter);
-    let sql = if where_sql.is_empty() {
-        "SELECT COUNT(*) FROM (SELECT series_name, season_number FROM jobs WHERE COALESCE(series_name, '') != '' GROUP BY series_name, season_number)".to_string()
-    } else {
-        format!(
-            "SELECT COUNT(*) FROM (SELECT series_name, season_number FROM jobs {where_sql} AND COALESCE(series_name, '') != '' GROUP BY series_name, season_number)"
-        )
-    };
+    let sql = format!(
+        "WITH filtered AS (SELECT * FROM jobs {where_sql})
+         SELECT COUNT(*) FROM (
+            SELECT series_name, season_number FROM filtered
+            WHERE COALESCE(series_name, '') != ''
+            GROUP BY series_name, season_number
+         )"
+    );
     let refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     conn.query_row(&sql, refs.as_slice(), |r| r.get(0))

@@ -207,12 +207,32 @@ fn normalize_str(spec: &SettingSpec, value: &str) -> Result<String, String> {
 }
 
 fn strip_inline_comment(value: &str) -> String {
-    value
+    let trimmed = value.trim();
+    if let Some(unquoted) = unquote_env_value(trimmed) {
+        return unquoted;
+    }
+    trimmed
         .split_once('#')
         .map(|(head, _)| head)
-        .unwrap_or(value)
+        .unwrap_or(trimmed)
         .trim()
         .to_string()
+}
+
+fn unquote_env_value(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 fn normalize_int(spec: &SettingSpec, value: &str) -> Result<String, String> {
@@ -234,13 +254,13 @@ fn normalize_int(spec: &SettingSpec, value: &str) -> Result<String, String> {
 }
 
 fn normalize_bool(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("true") {
-        Ok("true".to_string())
-    } else if value.eq_ignore_ascii_case("false") {
-        Ok("false".to_string())
-    } else {
-        Err(format!("not a boolean: {value}"))
+    let trimmed = value.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok("true".to_string()),
+        "false" | "0" => Ok("false".to_string()),
+        _ => Err(format!(
+            "not a boolean (expected true/false/1/0): {trimmed}"
+        )),
     }
 }
 
@@ -252,25 +272,17 @@ fn normalize_string(key: &str, value: &str) -> Result<String, String> {
                 .parse::<IpAddr>()
                 .map_err(|e| format!("invalid bind host: {e}"))?;
         }
-        "PREFERRED_ENCODER" => {
-            if !matches!(value, "vaapi" | "nvenc" | "qsv" | "cpu") {
-                return Err("must be one of vaapi, nvenc, qsv, cpu".to_string());
-            }
+        "PREFERRED_ENCODER" if !matches!(value, "vaapi" | "nvenc" | "qsv" | "cpu") => {
+            return Err("must be one of vaapi, nvenc, qsv, cpu".to_string());
         }
-        "VAAPI_DEVICE" => {
-            if !value.is_empty() && !is_vaapi_device(value) {
-                return Err("must be empty or /dev/dri/renderD<N>".to_string());
-            }
+        "VAAPI_DEVICE" if !value.is_empty() && !is_vaapi_device(value) => {
+            return Err("must be empty or /dev/dri/renderD<N>".to_string());
         }
-        "VIDEO_BITRATE" | "AUDIO_BITRATE" | "TIER0_BITRATE_DEFAULT" => {
-            if !is_bitrate(value) {
-                return Err("invalid bitrate".to_string());
-            }
+        "VIDEO_BITRATE" | "AUDIO_BITRATE" | "TIER0_BITRATE_DEFAULT" if !is_bitrate(value) => {
+            return Err("invalid bitrate".to_string());
         }
-        "DB_AUTO_MERGE_FILE_ID" => {
-            if !value.is_empty() && !is_telegram_file_id(value) {
-                return Err("invalid Telegram file_id".to_string());
-            }
+        "DB_AUTO_MERGE_FILE_ID" if !value.is_empty() && !is_telegram_file_id(value) => {
+            return Err("invalid Telegram file_id".to_string());
         }
         _ => {}
     }
@@ -426,17 +438,25 @@ fn is_bitrate(value: &str) -> bool {
         return false;
     }
     let mut dot_count = 0;
+    let mut seen_dot = false;
+    let mut digits_before_dot = 0;
+    let mut digits_after_dot = 0;
     for b in number.bytes() {
         if b == b'.' {
             dot_count += 1;
+            seen_dot = true;
             if dot_count > 1 {
                 return false;
             }
         } else if !b.is_ascii_digit() {
             return false;
+        } else if seen_dot {
+            digits_after_dot += 1;
+        } else {
+            digits_before_dot += 1;
         }
     }
-    number.bytes().any(|b| b.is_ascii_digit())
+    digits_before_dot > 0 && (!seen_dot || digits_after_dot > 0)
 }
 
 fn is_telegram_file_id(value: &str) -> bool {
@@ -468,6 +488,8 @@ mod tests {
             normalize_str_for_key("DISK_CACHE_ENABLED", "TRUE").unwrap(),
             "true"
         );
+        assert_eq!(normalize_str_for_key("ABR_ENABLED", "1").unwrap(), "true");
+        assert_eq!(normalize_str_for_key("ABR_ENABLED", "0").unwrap(), "false");
         assert!(normalize_str_for_key("PORT", "70000").is_err());
         assert_eq!(
             normalize_str_for_key("WATCH_VIDEO_EXTENSIONS", "mp4,.mkv").unwrap(),
@@ -476,6 +498,8 @@ mod tests {
         assert!(normalize_str_for_key("PREFERRED_ENCODER", "x264").is_err());
         assert!(normalize_str_for_key("VAAPI_DEVICE", "/dev/dri/card0").is_err());
         assert!(normalize_str_for_key("VIDEO_BITRATE", "4000").is_err());
+        assert!(normalize_str_for_key("VIDEO_BITRATE", ".5M").is_err());
+        assert!(normalize_str_for_key("VIDEO_BITRATE", "5.M").is_err());
         assert!(normalize_str_for_key("ABR_TIERS", "720:5M,480:1200k").is_ok());
         assert!(normalize_str_for_key("TRUSTED_PROXY_CIDRS", "127.0.0.1/32").is_ok());
         assert!(normalize_str_for_key("CORS_ALLOWED_ORIGINS", "http://localhost:5050").is_ok());
@@ -510,6 +534,10 @@ mod tests {
         assert_eq!(
             normalize_str_for_key("WEBHOOK_URL", "https://x.com/hook#frag").unwrap(),
             "https://x.com/hook"
+        );
+        assert_eq!(
+            normalize_str_for_key("WEBHOOK_URL", "\"https://x.com/hook#frag\"").unwrap(),
+            "https://x.com/hook#frag"
         );
     }
 }

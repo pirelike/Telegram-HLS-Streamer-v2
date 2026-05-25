@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -57,11 +58,15 @@ pub(super) struct UploadFinalizeRequest {
 
 pub(super) async fn handle_upload_init(
     State(state): State<Arc<AppState>>,
+    maybe_addr: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     Json(body): Json<UploadInitRequest>,
 ) -> Response {
     let cfg = state.config.read().await.clone();
-    let ip = client_ip(&headers, cfg.behind_proxy);
+    let peer = maybe_addr
+        .map(|ConnectInfo(a)| a.ip())
+        .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
+    let ip = client_ip(&headers, cfg.behind_proxy, peer);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
@@ -207,11 +212,15 @@ pub(super) async fn handle_upload_init(
 
 pub(super) async fn handle_upload_chunk(
     State(state): State<Arc<AppState>>,
+    maybe_addr: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let cfg = state.config.read().await.clone();
-    let ip = client_ip(&headers, cfg.behind_proxy);
+    let peer = maybe_addr
+        .map(|ConnectInfo(a)| a.ip())
+        .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
+    let ip = client_ip(&headers, cfg.behind_proxy, peer);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
@@ -356,11 +365,15 @@ pub(super) async fn handle_upload_chunk(
 
 pub(super) async fn handle_upload_finalize(
     State(state): State<Arc<AppState>>,
+    maybe_addr: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     Json(body): Json<UploadFinalizeRequest>,
 ) -> Response {
     let cfg = state.config.read().await.clone();
-    let ip = client_ip(&headers, cfg.behind_proxy);
+    let peer = maybe_addr
+        .map(|ConnectInfo(a)| a.ip())
+        .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
+    let ip = client_ip(&headers, cfg.behind_proxy, peer);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
@@ -407,7 +420,7 @@ pub(super) async fn handle_upload_finalize(
         )
     };
 
-    let metadata = body.metadata.unwrap_or_else(|| JobMetadata {
+    let metadata = body.metadata.unwrap_or(JobMetadata {
         media_type: body.media_type,
         is_series: body.is_series,
         series_name: body.series_name,
@@ -458,6 +471,7 @@ pub(super) async fn handle_upload_finalize(
 pub(super) async fn handle_upload_status(
     State(state): State<Arc<AppState>>,
     Path(upload_id): Path<String>,
+    maybe_addr: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
     if uuid::Uuid::parse_str(&upload_id).is_err() {
@@ -469,7 +483,10 @@ pub(super) async fn handle_upload_status(
     }
 
     let cfg = state.config.read().await.clone();
-    let ip = client_ip(&headers, cfg.behind_proxy);
+    let peer = maybe_addr
+        .map(|ConnectInfo(a)| a.ip())
+        .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
+    let ip = client_ip(&headers, cfg.behind_proxy, peer);
 
     let pending = state.pending_uploads.lock().await;
     let Some(upload) = pending.get(&upload_id) else {
@@ -487,8 +504,12 @@ pub(super) async fn upload_sweeper(state: Arc<AppState>) {
             let cfg = state.config.read().await;
             cfg.pending_upload_cleanup_interval_seconds.max(1)
         };
-        tokio::time::sleep(Duration::from_secs(interval as u64)).await;
-        cleanup_expired_uploads(&state).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(interval as u64)) => {
+                cleanup_expired_uploads(&state).await;
+            }
+            _ = state.shutdown_token.cancelled() => break,
+        }
     }
 }
 
@@ -572,7 +593,11 @@ fn required_header(headers: &HeaderMap, name: &str) -> Result<String, String> {
         .map_err(|_| format!("invalid {name} header"))
 }
 
-fn client_ip(headers: &HeaderMap, behind_proxy: bool) -> std::net::IpAddr {
+fn client_ip(
+    headers: &HeaderMap,
+    behind_proxy: bool,
+    peer_addr: std::net::IpAddr,
+) -> std::net::IpAddr {
     if behind_proxy {
         headers
             .get("x-forwarded-for")
@@ -587,7 +612,7 @@ fn client_ip(headers: &HeaderMap, behind_proxy: bool) -> std::net::IpAddr {
             })
             .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback ip"))
     } else {
-        "127.0.0.1".parse().expect("loopback ip")
+        peer_addr
     }
 }
 
@@ -598,15 +623,19 @@ async fn check_upload_rate_limit(state: &AppState, ip: std::net::IpAddr) -> Opti
     drop(cfg);
 
     let mut limits = state.upload_rate_limits.lock().await;
-    let requests = limits.entry(ip).or_default();
     let now = Instant::now();
-    while requests
-        .front()
-        .map(|t| now.duration_since(*t) > window)
-        .unwrap_or(false)
-    {
-        requests.pop_front();
-    }
+    // Prune all stale per-IP deques and remove empty entries to prevent HashMap growth
+    limits.retain(|_, dq| {
+        while dq
+            .front()
+            .map(|t| now.duration_since(*t) > window)
+            .unwrap_or(false)
+        {
+            dq.pop_front();
+        }
+        !dq.is_empty()
+    });
+    let requests = limits.entry(ip).or_default();
     requests.push_back(now);
     if requests.len() > max {
         return Some(api_error(
@@ -646,52 +675,7 @@ pub(crate) fn free_space_bytes(path: &FsPath) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail as u64 * stats.f_frsize as u64)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn free_space_bytes(_path: &FsPath) -> std::io::Result<u64> {
-    Ok(u64::MAX)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::IpAddr;
-
-    fn make_headers(forwarded: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", forwarded.parse().unwrap());
-        h
-    }
-
-    #[test]
-    fn client_ip_takes_rightmost_entry() {
-        let headers = make_headers("1.2.3.4, 10.0.0.1");
-        let ip = client_ip(&headers, true);
-        assert_eq!(ip, "10.0.0.1".parse::<IpAddr>().unwrap());
-    }
-
-    #[test]
-    fn client_ip_single_entry() {
-        let headers = make_headers("10.0.0.1");
-        let ip = client_ip(&headers, true);
-        assert_eq!(ip, "10.0.0.1".parse::<IpAddr>().unwrap());
-    }
-
-    #[test]
-    fn client_ip_no_proxy_returns_loopback() {
-        let headers = HeaderMap::new();
-        let ip = client_ip(&headers, false);
-        assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
-    }
-
-    #[test]
-    fn client_ip_missing_header_returns_loopback() {
-        let headers = HeaderMap::new();
-        let ip = client_ip(&headers, true);
-        assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
-    }
+    Ok(stats.f_bavail * stats.f_frsize)
 }
 
 pub(crate) async fn cleanup_orphaned_uploads(uploads_dir: &std::path::Path) {
@@ -723,5 +707,58 @@ pub(crate) async fn cleanup_orphaned_uploads(uploads_dir: &std::path::Path) {
     }
     if cleaned > 0 {
         tracing::info!(count = cleaned, dir = %uploads_dir.display(), "cleaned orphaned upload files");
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn free_space_bytes(_path: &FsPath) -> std::io::Result<u64> {
+    Ok(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn make_headers(forwarded: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", forwarded.parse().unwrap());
+        h
+    }
+
+    fn loopback() -> IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
+    fn peer(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn client_ip_takes_rightmost_entry() {
+        let headers = make_headers("1.2.3.4, 10.0.0.1");
+        let ip = client_ip(&headers, true, loopback());
+        assert_eq!(ip, peer("10.0.0.1"));
+    }
+
+    #[test]
+    fn client_ip_single_entry() {
+        let headers = make_headers("10.0.0.1");
+        let ip = client_ip(&headers, true, loopback());
+        assert_eq!(ip, peer("10.0.0.1"));
+    }
+
+    #[test]
+    fn client_ip_no_proxy_returns_peer_addr() {
+        let headers = HeaderMap::new();
+        let ip = client_ip(&headers, false, peer("192.168.1.5"));
+        assert_eq!(ip, peer("192.168.1.5"));
+    }
+
+    #[test]
+    fn client_ip_missing_header_returns_loopback() {
+        let headers = HeaderMap::new();
+        let ip = client_ip(&headers, true, loopback());
+        assert_eq!(ip, loopback());
     }
 }

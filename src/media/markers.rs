@@ -308,8 +308,7 @@ fn find_best_match(
     a: &[u32],
     b: &[u32],
 ) -> Option<NewMediaMarker> {
-    let a_len = a.len() as i64;
-    let max_offset = MAX_OFFSET_POINTS.min(a_len / 4);
+    let max_offset = MAX_OFFSET_POINTS;
 
     let mut best_start = 0usize;
     let mut best_len = 0usize;

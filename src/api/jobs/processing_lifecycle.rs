@@ -76,7 +76,10 @@ pub(super) async fn finish_job_error(state: &AppState, job_id: &str, error: Stri
 
 pub(super) async fn job_timeout_watcher(state: Arc<AppState>) {
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = state.shutdown_token.cancelled() => break,
+        }
         cleanup_old_terminal_jobs(&state).await;
         let (job_timeout, queue_timeout) = {
             let cfg = state.config.read().await;

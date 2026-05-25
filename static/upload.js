@@ -11,6 +11,14 @@ let currentJobId = null;
 let selectedCategory = 'Film';
 let pendingFiles = [];
 let currentUploadController = null;
+const activeStatusPolls = new Set();
+
+function clearActiveStatusPolls() {
+    activeStatusPolls.forEach(interval => clearInterval(interval));
+    activeStatusPolls.clear();
+}
+window.addEventListener('pagehide', clearActiveStatusPolls, { once: true });
+window.addEventListener('beforeunload', clearActiveStatusPolls, { once: true });
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const uploadArea = document.getElementById('uploadArea');
@@ -109,7 +117,12 @@ async function readEntries(entries) {
             files.push(await new Promise(res => entry.file(res)));
         } else if (entry.isDirectory) {
             const reader = entry.createReader();
-            const subEntries = await new Promise(res => reader.readEntries(res));
+            const subEntries = [];
+            for (;;) {
+                const batch = await new Promise(res => reader.readEntries(res));
+                if (!batch.length) break;
+                subEntries.push(...batch);
+            }
             files.push(...await readEntries(subEntries));
         }
     }
@@ -241,15 +254,18 @@ function rebuildMetadataTable() {
     html += '</tbody></table>';
     wrap.innerHTML = html;
 
-    wrap.addEventListener('input', e => {
-        const input = e.target;
-        if (!input.classList.contains('meta-input')) return;
-        const idx = parseInt(input.dataset.idx, 10);
-        const key = input.dataset.key;
-        const val = input.value;
-        pendingFiles[idx].metadata[key] = input.type === 'number' ? (val === '' ? null : parseInt(val, 10)) : val;
-        validateMetadata();
-    });
+    if (!wrap.dataset.metadataInputBound) {
+        wrap.dataset.metadataInputBound = '1';
+        wrap.addEventListener('input', e => {
+            const input = e.target;
+            if (!input.classList.contains('meta-input')) return;
+            const idx = parseInt(input.dataset.idx, 10);
+            const key = input.dataset.key;
+            const val = input.value;
+            pendingFiles[idx].metadata[key] = input.type === 'number' ? (val === '' ? null : parseInt(val, 10)) : val;
+            validateMetadata();
+        });
+    }
 }
 
 function defaultMetadataQuery(metadata) {
@@ -686,15 +702,18 @@ function pollStatus(jobId) {
                 }
                 if (data.status === 'complete') {
                     clearInterval(interval);
+                    activeStatusPolls.delete(interval);
                     currentJobId = null;
                     resolve(jobId);
                 } else if (data.status === 'error') {
                     clearInterval(interval);
+                    activeStatusPolls.delete(interval);
                     currentJobId = null;
                     reject(new Error(data.error || 'Processing failed'));
                 }
             }).catch(()=>{});
         }, 1500);
+        activeStatusPolls.add(interval);
     });
 }
 

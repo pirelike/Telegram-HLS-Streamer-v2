@@ -114,7 +114,7 @@ pub async fn handle_save_progress(
     }
 
     let position_seconds = match extract_f64(&body, "position_seconds") {
-        Some(v) if v >= 0.0 => v,
+        Some(v) if v.is_finite() && v >= 0.0 => v,
         _ => {
             return api_error(
                 StatusCode::BAD_REQUEST,
@@ -125,7 +125,7 @@ pub async fn handle_save_progress(
     };
 
     let duration_seconds = match extract_f64(&body, "duration_seconds") {
-        Some(v) if v > 0.0 => v,
+        Some(v) if v.is_finite() && v > 0.0 => v,
         _ => {
             return api_error(
                 StatusCode::BAD_REQUEST,
@@ -199,6 +199,7 @@ pub async fn handle_delete_progress(
     }
 }
 
+#[allow(clippy::result_large_err)] // Response is pre-built axum type; boxing would require callers to unbox
 fn validate_client_id_param(value: Option<String>) -> Result<String, Response> {
     let id = match value.filter(|s| !s.is_empty()) {
         Some(id) => id,

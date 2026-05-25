@@ -88,15 +88,11 @@ pub(super) async fn replace_live_database(
         let conn = db::init_db(&source)?;
         conn.close().map_err(|(_, e)| anyhow::anyhow!(e))?;
     }
-    // Block live DB replacement while any non-terminal job exists. A job that finishes
-    // after the swap would write stale state into the newly loaded database.
-    {
-        let jobs = state.jobs.lock().await;
-        if jobs.values().any(|j| !j.status.is_terminal()) {
-            anyhow::bail!(
-                "cannot replace database while jobs are active; wait for all jobs to finish"
-            );
-        }
+    // Block live DB replacement while any non-terminal job exists, and hold the lock
+    // across the entire swap to prevent a concurrent enqueue from creating an orphan.
+    let _jobs = state.jobs.lock().await;
+    if _jobs.values().any(|j| !j.status.is_terminal()) {
+        anyhow::bail!("cannot replace database while jobs are active; wait for all jobs to finish");
     }
     let old_pool = {
         let guard = state.db.read().await;

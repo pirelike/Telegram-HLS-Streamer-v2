@@ -90,7 +90,7 @@ fn bandwidth_zero_duration_does_not_divide_by_zero() {
     t.bitrate.clear();
     let j = job(0.0, 100_000_000, 1080);
     let bw = bandwidth_for(&t, &j, &cfg);
-    assert!(bw >= 32_000 && bw <= 50_000_000);
+    assert!((32_000..=50_000_000).contains(&bw));
 }
 
 #[test]
@@ -186,10 +186,12 @@ fn master_playlist_lists_video_audio_subs() {
 
 #[test]
 fn master_includes_virtual_streams_when_enabled() {
-    let mut cfg = Config::default();
-    cfg.abr_enabled = false;
-    cfg.virtual_abr_tiers = true;
-    cfg.abr_tiers = "720:5M,480:2M".into();
+    let cfg = Config {
+        abr_enabled: false,
+        virtual_abr_tiers: true,
+        abr_tiers: "720:5M,480:2M".into(),
+        ..Default::default()
+    };
     let j = job(120.0, 1_000_000, 1080);
     let tracks = vec![vtrack(0, 1080, "10M")];
     let body = build_master_playlist(&cfg, &j, &tracks);
@@ -199,10 +201,12 @@ fn master_includes_virtual_streams_when_enabled() {
 
 #[test]
 fn virtual_master_deduplicates_repeated_heights() {
-    let mut cfg = Config::default();
-    cfg.abr_enabled = false;
-    cfg.virtual_abr_tiers = true;
-    cfg.abr_tiers = "720:6M,720:3M,480:2M,480:800k".into();
+    let cfg = Config {
+        abr_enabled: false,
+        virtual_abr_tiers: true,
+        abr_tiers: "720:6M,720:3M,480:2M,480:800k".into(),
+        ..Default::default()
+    };
     let j = job(120.0, 1_000_000, 1080);
     let tracks = vec![vtrack(0, 1080, "copy")];
     let body = build_master_playlist(&cfg, &j, &tracks);

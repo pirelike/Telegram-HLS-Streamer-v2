@@ -85,6 +85,9 @@ pub struct AppState {
     pub db_sync_lock: Mutex<()>,
     pub jobs: Mutex<HashMap<String, JobState>>,
     pub played_segments: Mutex<HashMap<String, (HashSet<String>, Instant)>>,
+    /// Caches per-job segment keys and source_path to avoid a full DB query on every segment serve.
+    #[allow(clippy::type_complexity)]
+    pub segment_meta_cache: Mutex<HashMap<String, (Arc<Vec<String>>, Option<String>, Instant)>>,
     pub job_queue: mpsc::Sender<JobRequest>,
     pub cache: Arc<SegmentCache>,
     pub ffmpeg_available: bool,
@@ -313,7 +316,7 @@ async fn redirect_to_https(request: Request<Body>, next: Next) -> Response {
             .status(StatusCode::MOVED_PERMANENTLY)
             .header("location", https_url)
             .body(Body::empty())
-            .unwrap();
+            .expect("redirect response; host is already validated by Axum");
     }
     next.run(request).await
 }

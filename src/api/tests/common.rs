@@ -55,6 +55,7 @@ pub(super) fn app_state_with_telegram_base(telegram_base_url: String) -> Arc<App
         db_sync_lock: Mutex::new(()),
         jobs: Mutex::new(HashMap::new()),
         played_segments: Mutex::new(HashMap::new()),
+        segment_meta_cache: Mutex::new(HashMap::new()),
         job_queue,
         cache: Arc::new(SegmentCache::new(64 * 1024 * 1024)),
         ffmpeg_available: true,

@@ -489,9 +489,9 @@ pub(super) fn job_filter_sql(filter: &JobListFilter) -> (String, Vec<String>) {
     let mut clauses = Vec::new();
     let mut params = Vec::new();
     if let Some(search) = filter.search.as_ref().filter(|s| !s.is_empty()) {
-        params.push(format!("%{search}%"));
+        params.push(format!("%{}%", escape_like(search)));
         clauses.push(format!(
-            "(filename LIKE ?{} OR series_name LIKE ?{})",
+            "(filename LIKE ?{} ESCAPE '\\' OR series_name LIKE ?{} ESCAPE '\\')",
             params.len(),
             params.len()
         ));
@@ -515,4 +515,15 @@ pub(super) fn job_filter_sql(filter: &JobListFilter) -> (String, Vec<String>) {
     } else {
         (format!("WHERE {}", clauses.join(" AND ")), params)
     }
+}
+
+fn escape_like(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
