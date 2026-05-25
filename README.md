@@ -50,6 +50,8 @@ Common `.env` values:
 | --- | --- | --- |
 | `LOCAL_HOST` | `0.0.0.0` | Server bind address. |
 | `LOCAL_PORT` | `5050` | Server bind port. |
+| `ADMIN_USER` | unset | HTTP Basic Auth username (empty = disabled). |
+| `ADMIN_PASS` | unset | HTTP Basic Auth password. |
 | `TELEGRAM_BOT_TOKEN_1` | unset | First Telegram bot token. |
 | `TELEGRAM_CHANNEL_ID_1` | unset | Channel used by the first bot. |
 | `TELEGRAM_MAX_FILE_SIZE` | `20971520` | Per-file Telegram upload ceiling. Raise if Telegram increases Bot API limits. |
@@ -57,14 +59,25 @@ Common `.env` values:
 | `SEGMENT_TARGET_SIZE` | `15728640` | Preferred HLS segment target. User-configurable; adjust if upload ceiling changes. |
 | `MAX_UPLOAD_SIZE` | `107374182400` | Max accepted client upload size. |
 | `UPLOAD_CHUNK_SIZE` | `10485760` | Browser/client upload chunk size. |
+| `CACHE_DIR` | `./cache/` | Ephemeral cache directory (wiped on startup). |
+| `DISK_CACHE_ENABLED` | `false` | Store cached segment payloads on disk instead of memory-only cache. |
+| `CACHE_WARMUP_ENABLED` | `false` | Enable cache warm-up behavior. |
+| `SEGMENT_CACHE_SIZE_MB` | `200` | In-memory segment cache budget (MB). |
+| `SEGMENT_PREFETCH_COUNT` | `3` | Number of segments to prefetch ahead of playback. |
+| `SEGMENT_PREFETCH_MIN_FREE_BYTES` | `0` | Free cache bytes threshold before prefetch stops. |
+| `AUDIO_SEGMENT_DURATION` | `30` | Audio segment duration in seconds. |
 | `MAX_CONCURRENT_JOBS` | `1` | Number of queue workers. |
+| `QUEUE_TIMEOUT_SECONDS` | `7200` | Max time a job may sit queued before discard. |
 | `DB_SYNC_ENABLED` | `true` | Create and upload a dated `.db` snapshot after each completed job. |
 | `DB_SYNC_BOOTSTRAP` | unset | Latest auto-written DB sync descriptor for fresh-server restore. |
+| `CLOUDFLARED_ENABLED` | `false` | Auto-manage a Cloudflared tunnel. |
+| `CLOUDFLARED_CONFIG` | unset | Path to the Cloudflared tunnel config file. |
 | `ABR_ENABLED` | `true` | Produce eager ABR tiers. |
 | `ENABLE_COPY_MODE` | `true` | Use source passthrough tier when possible. |
 | `VIRTUAL_ABR_TIERS` | `false` | Transcode lower tiers on demand. |
 | `TMDB_API_KEY` | unset | TMDB API key for movie/TV metadata. |
 | `METADATA_AUTO_FETCH_ENABLED` | `false` | Auto-fetch metadata after upload. |
+| `METADATA_REFRESH_DAYS` | `30` | Days before cached metadata is eligible for refresh. |
 | `INTRO_DETECTION_ENABLED` | `true` | Auto-detect intro/outro markers from chapters. |
 | `INTRO_CHROMAPRINT_ENABLED` | `true` | Use Chromaprint audio fingerprints for intro detection. |
 | `TAC_COMMENTS_ENABLED` | `true` | Show Anime Community comments on anime watch pages. |
@@ -162,6 +175,7 @@ Core API routes:
 | Route | Purpose |
 | --- | --- |
 | `GET /api/jobs` | List and filter jobs. |
+| `GET /api/jobs/active` | List currently active (non-terminal) jobs. |
 | `GET/PATCH/DELETE /api/jobs/:job_id` | Read, edit, or delete a job. |
 | `GET /api/jobs/:job_id/download-original` | Reconstruct and download original media when available. |
 | `POST /api/jobs/:job_id/reprocess` | Queue a reprocess job. |
@@ -188,6 +202,7 @@ Core API routes:
 | `POST /api/series/metadata/link` | Link a series to cached external metadata. |
 | `POST /api/metadata/:metadata_id/refresh` | Refresh cached metadata from provider. |
 | `GET/POST /api/playback/progress/:job_id` | Read or save playback progress for a browser client. |
+| `DELETE /api/playback/progress/:job_id` | Delete playback progress for a browser client. |
 | `GET /api/playback/progress` | List all in-progress items for a client. |
 | `GET /api/jobs/:job_id/markers` | Read intro/outro skip markers for a job. |
 
@@ -209,13 +224,17 @@ Source layout:
 | --- | --- |
 | `src/main.rs` | Process startup, config load, SQLite init, shared state, server bind. |
 | `src/config.rs` | Effective runtime config and bot pool loading. |
+| `src/crypto.rs` | AEAD encrypt/decrypt helpers for Telegram-bound payloads. |
+| `src/env_writer.rs` | Atomic `.env` file read/write with mutex, fsync, and safe line-level replacement. |
+| `src/cloudflared.rs` | Cloudflared tunnel process lifecycle management. |
 | `src/settings_registry.rs` | Public settings metadata, defaults, and validation. |
 | `src/db/` | SQLite schema, migrations, queries, and DB transfer helpers. |
 | `src/media/` | ffprobe analysis, ABR tier selection, encoder probing, and FFmpeg processing. |
-| `src/telegram.rs` | Telegram upload/download runtime. |
-| `src/api/` | Axum router, page handlers, APIs, playback, playlists, uploads, jobs, watch-folder, DB transfer, metadata, progress, markers. See nested `guide.md` files for split modules. |
-| `static/` | Browser UI CSS and JavaScript. |
+| `src/telegram.rs` | Telegram upload/download runtime and module root. |
+| `src/api/` | Axum router, handlers, APIs, playback, playlists, uploads, jobs, watch-folder, DB transfer, metadata, progress, markers. See nested `guide.md` files for split modules. |
+| `static/` | Browser UI: `app.css`, `shaka-controls.css` (CSS); `browse-home.js`, `browse-palette.js`, `browse.js`, `common.js`, `settings.js`, `shaka-player.ui.js`, `shared.js`, `upload.js`, `watch.js` (JS). |
 | `scripts/upload_and_wait.py` | Manual upload/process/playback smoke test helper. |
+| `scripts/benchmark_playback.py` | Lightweight playback/cache benchmark script. |
 
 Useful commands:
 
@@ -245,8 +264,9 @@ The helper starts `cargo run` if no server is already reachable at `http://127.0
 
 ## Related Docs
 
-- `REBUILD.md`: detailed behavior and API contract.
 - `ROADMAP.md`: implementation status and acceptance checklist.
+- `docs/config.md`: detailed `config.rs` developer reference.
+- `docs/settings_registry.md`: full settings registry reference with validation rules.
+- `docs/plans/`: historical implementation plans.
 - `src/api/guide.md`: concise guide to the API modules.
-- `plans/`: historical implementation plans.
 - `AGENTS.md`, `CODEX.md`, `CLAUDE.md`: agent instructions for working in this repo.

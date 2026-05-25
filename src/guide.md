@@ -9,9 +9,11 @@ Start here before editing code under `src/`. This file is the top-level map; the
 | `main.rs` | file | Entry point: loads config, initializes SQLite, builds `AppState`, starts the Axum server. |
 | `config.rs` | file | Effective runtime config loaded from DB settings plus env-var overrides. |
 | `crypto.rs` | file | Env-key parsing plus AEAD encrypt/decrypt helpers for Telegram-bound payloads. |
+| `env_writer.rs` | file | Atomic `.env` file read/write with mutex, fsync, and safe line-level replacement. |
+| `cloudflared.rs` | file | Cloudflared tunnel process lifecycle management (spawn, monitor, status, shutdown). |
 | `settings_registry.rs` | file | Setting key definitions, defaults, validation rules, and public-key allowlist. |
 | `telegram.rs` | file | Telegram Bot API runtime, metrics, health probing, and module root for Telegram helpers. |
-| `telegram/` | dir | Telegram upload/download/error helper submodules and Telegram unit tests. |
+| `telegram/` | dir | Telegram submodules: `upload.rs` (upload flow), `download.rs` (download flow), `errors.rs` (error types), `tests.rs` (unit tests). |
 | `api/` | dir | HTTP layer: router, handlers, upload flow, job processing, segment serving, pages. See `src/api/guide.md`. |
 | `db/` | dir | SQLite persistence: schema migrations, query functions, export/import/backup. See `src/db/guide.md`. |
 | `media/` | dir | FFprobe/FFmpeg pipeline: analysis, ABR tier selection, encoder probe, HLS processing. See `src/media/guide.md`. |
@@ -20,7 +22,7 @@ Start here before editing code under `src/`. This file is the top-level map; the
 
 ```text
 main.rs
-  └─ api/ ──► {config, crypto, db, media, telegram}
+  └─ api/ ──► {config, crypto, db, media, telegram, cloudflared, env_writer}
        ├─ jobs/ ──► {crypto, db, media, telegram}
        └─ playback/ ──► {crypto, db, telegram, media helpers}
 
@@ -28,6 +30,8 @@ db/ ──► {rusqlite, settings_registry}
 media/ ──► config
 telegram.rs ──► reqwest
 crypto.rs ──► ring
+env_writer.rs ──► std::fs, std::sync
+cloudflared.rs ──► tokio::process, api::AppState
 ```
 
 Keep this direction acyclic. `api` orchestrates application flows; `db`, `media`, and `telegram` stay focused support modules.
@@ -45,6 +49,8 @@ Keep this direction acyclic. `api` orchestrates application flows; `db`, `media`
 | FFprobe/FFmpeg media processing | `media/`. Do not put HTTP, DB, or Telegram logic here. |
 | Telegram Bot API behavior | `telegram.rs` plus the focused `telegram/` helper files. |
 | Telegram payload encryption/decryption primitives | `crypto.rs`; orchestration stays in API/job/db-transfer code. |
+| `.env` file safe read/write | `env_writer.rs`. |
+| Cloudflared tunnel management | `cloudflared.rs`. |
 | Runtime setting key/default/validation | `settings_registry.rs` and, if needed, `config.rs`. |
 
 ## What does not belong here

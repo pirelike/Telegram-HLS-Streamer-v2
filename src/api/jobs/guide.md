@@ -8,12 +8,12 @@ Full job lifecycle: enqueue → analyze → process → upload to Telegram → s
 |---|---|---|
 | `mod.rs` | Module root and re-exports used by `api/mod.rs`, uploads, tests. | 21 |
 | `types.rs` | `JobMetadata`, `JobStatus`, `JobState`, `JobRequest`, `JobsQuery`. | 87 |
-| `handlers.rs` | HTTP handlers (`handle_*`) and `queue_metrics`. | 539 |
+| `handlers.rs` | HTTP handlers (`handle_*`) and `queue_metrics`. | 545 |
 | `json.rs` | JSON serialization helpers, queue position, field/category validators. | 161 |
-| `download.rs` | Original-source download, DB-complete lookup, segment reconstruction, response streaming. | 540 |
-| `processing.rs` | Enqueue, dispatcher, `process_job` orchestrator, and processing re-exports. | 554 |
+| `download.rs` | Original-source download, DB-complete lookup, segment reconstruction, response streaming. | 537 |
+| `processing.rs` | Enqueue, dispatcher, `process_job` orchestrator, and processing re-exports. | 594 |
 | `processing_upload.rs` | Upload file collection/splitting, Telegram upload fanout, and DB row construction. | 446 |
-| `processing_lifecycle.rs` | Cancellation, completion/error transitions, timeout cleanup, webhooks, and startup recovery. | 376 |
+| `processing_lifecycle.rs` | Cancellation, completion/error transitions, timeout cleanup, webhooks, and startup recovery. | 379 |
 | `processing_markers.rs` | Intro/outro marker detection preparation, marker save, and metadata auto-fetch trigger. | 208 |
 | `tests.rs` | Focused jobs tests for DB row building, upload-file collection, integrity handling. | 454 |
 

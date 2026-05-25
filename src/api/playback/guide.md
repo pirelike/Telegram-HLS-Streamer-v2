@@ -7,13 +7,13 @@ Serves HLS segment-like assets on demand with an in-memory LRU cache, single-fli
 | File | Responsibility | ~Lines |
 |---|---|---|
 | `mod.rs` | Module root, `handle_segment`, shared response/content helpers, `SegmentLookup` helper impl. | 220 |
-| `cache.rs` | `SegmentCache`, LRU bookkeeping, cache snapshots, in-flight single-flight coordination. | 220 |
-| `real.rs` | Persisted segment serving entry points, DB lookup, played-segment cleanup, and source/cache recovery helpers. | 389 |
-| `real_fetch.rs` | Real segment single-flight fetch core, multipart reconstruction, Telegram fetch timeout handling. | 241 |
-| `real_recovery.rs` | Stale Telegram file-id recovery and re-upload decision helpers. | 112 |
-| `real_prefetch.rs` | Real segment prefetch and cache warm-up selection/execution. | 218 |
-| `virtual_.rs` | Virtual ABR: source fetch, init generation, FFmpeg transcode, fMP4 box parsing, virtual prefetch. | 637 |
-| `tests.rs` | Cache, content-type, virtual-key, WebVTT, and fMP4 parsing tests. | 480 |
+| `cache.rs` | `SegmentCache`, LRU bookkeeping, cache snapshots, in-flight single-flight coordination. | 271 |
+| `real.rs` | Persisted segment serving entry points, DB lookup, played-segment cleanup, and source/cache recovery helpers. | 422 |
+| `real_fetch.rs` | Real segment single-flight fetch core, multipart reconstruction, Telegram fetch timeout handling. | 247 |
+| `real_recovery.rs` | Stale Telegram file-id recovery and re-upload decision helpers. | 111 |
+| `real_prefetch.rs` | Real segment prefetch and cache warm-up selection/execution. | 216 |
+| `virtual_.rs` | Virtual ABR: source fetch, init generation, FFmpeg transcode, fMP4 box parsing, virtual prefetch. | 657 |
+| `tests.rs` | Cache, content-type, virtual-key, WebVTT, and fMP4 parsing tests. | 587 |
 
 ## Public API
 

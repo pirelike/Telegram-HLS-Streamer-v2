@@ -6,17 +6,17 @@ SQLite persistence layer. All reusable DB schema, query, migration, import/expor
 
 | File | Responsibility | ~Lines |
 |---|---|---|
-| `mod.rs` | Module root, re-exports, `init_db()`, schema revision check. | 171 |
-| `models.rs` | Public row/input/result structs plus metadata normalization and filter helpers. | 518 |
+| `mod.rs` | Module root, re-exports, `init_db()`, schema revision check. | 174 |
+| `models.rs` | Public row/input/result structs plus metadata normalization and filter helpers. | 529 |
 | `row_mapping.rs` | SQL select constants and row mappers shared by query/transfer modules. | 176 |
-| `migrations.rs` | Schema migrations, bootstrap from legacy DBs, table/column/index helpers. | 1550 |
-| `queries.rs` | Core job, track, segment, job marker, and db-sync query functions. | 537 |
-| `queries_library.rs` | Library listing, counting, grouping, and series-name query helpers. | 204 |
+| `migrations.rs` | Schema migrations, bootstrap from legacy DBs, table/column/index helpers. | 1597 |
+| `queries.rs` | Core job, track, segment, job marker, and db-sync query functions. | 541 |
+| `queries_library.rs` | Library listing, counting, grouping, and series-name query helpers. | 206 |
 | `queries_settings.rs` | Runtime settings, internal kv, bot records, and bot workload queries. | 166 |
-| `queries_metadata.rs` | External metadata cache, job/series metadata links, posters, and title helpers. | 296 |
-| `queries_playback.rs` | Playback progress, media marker, and fingerprint persistence queries. | 224 |
-| `transfer.rs` | Export/import/merge plus live DB replacement and backup helpers. | 439 |
-| `tests.rs` | DB module unit tests. | 975 |
+| `queries_metadata.rs` | External metadata cache, job/series metadata links, posters, and title helpers. | 299 |
+| `queries_playback.rs` | Playback progress, media marker, and fingerprint persistence queries. | 227 |
+| `transfer.rs` | Export/import/merge plus live DB replacement and backup helpers. | 450 |
+| `tests.rs` | DB module unit tests. | 1098 |
 
 ## Public API surface
 

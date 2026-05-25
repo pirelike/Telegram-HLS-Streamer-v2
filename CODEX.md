@@ -90,9 +90,10 @@ Az AI agentek krónikusan túlkomplikálnak mindent — absztrakciós rétegeket
 - A runtime adat nem forráskód: `streamer.db`, `streamer.db-*`, `uploads/`, `processing/`, `target/` és `TEST_FILE.mkv` nem dokumentációs vagy refaktorálási alap.
 - Dokumentációs szerepek:
   - `README.md`: gyakorlati belépési pont fejlesztőknek és üzemeltetéshez.
-  - `REBUILD.md`: részletes viselkedési/specifikációs referencia.
   - `ROADMAP.md`: megvalósítási állapot és elfogadási lista.
   - `src/**/guide.md`: source-folder module térképek.
+  - `docs/config.md`: részletes `config.rs` fejlesztői referencia.
+  - `docs/settings_registry.md`: teljes beállításjegyzék referencia validációs szabályokkal.
 - `guide.md` használata új session/agent indulásakor:
   - Mielőtt egy `src/` alatti modulban dolgozol, olvasd el a legközelebbi releváns `guide.md`-t: először `src/guide.md`, majd az érintett folder saját guide-ját (pl. `src/api/guide.md`, `src/api/jobs/guide.md`).
   - A guide a navigációs térkép: mit tartalmaz a folder, melyik fájl miért felel, milyen irányba mennek a függőségek, és hova szabad/tilos új kódot tenni.

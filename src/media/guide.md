@@ -6,17 +6,17 @@ FFprobe/FFmpeg-based media analysis and HLS processing. This module turns an inp
 
 | File | Responsibility | ~Lines |
 |---|---|---|
-| `mod.rs` | Module root, public re-exports, media tests. | 448 |
+| `mod.rs` | Module root, public re-exports, media tests. | 493 |
 | `models.rs` | `MediaAnalysis`, stream structs, `ProcessingResult`, playlist descriptors, tier/encoder structs. | 101 |
-| `analysis.rs` | FFprobe invocation and JSON output parsing. | 116 |
+| `analysis.rs` | FFprobe invocation and JSON output parsing. | 129 |
 | `tiers.rs` | ABR tier parsing and source-aware tier selection. | 113 |
 | `encoder.rs` | Encoder selection/probing, hardware-device args, video filter construction. | 120 |
-| `process.rs` | `process_media()` orchestrator, segment-duration doctrine, subtitle extraction, shared small helpers. | 372 |
-| `process_video.rs` | Video tier encode/remux and oversized segment repair helpers. | 463 |
+| `process.rs` | `process_media()` orchestrator, segment-duration doctrine, subtitle extraction, shared small helpers. | 383 |
+| `process_video.rs` | Video tier encode/remux and oversized segment repair helpers. | 471 |
 | `process_audio.rs` | Audio encode/copy path and audio bitrate/channel helpers. | 178 |
 | `ffmpeg.rs` | Cancellation-aware FFmpeg process runner and encode semaphore helper. | 145 |
-| `process_probe.rs` | Thumbnail extraction, segment duration collection, playlist duration parsing, and duration probe helpers. | 157 |
-| `markers.rs` | Intro/outro marker detection: chapter parsing and Chromaprint fingerprint comparison. | 629 |
+| `process_probe.rs` | Thumbnail extraction, segment duration collection, playlist duration parsing, and duration probe helpers. | 150 |
+| `markers.rs` | Intro/outro marker detection: chapter parsing and Chromaprint fingerprint comparison. | 628 |
 
 ## Public API surface
 
