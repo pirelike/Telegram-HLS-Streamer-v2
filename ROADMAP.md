@@ -10,19 +10,25 @@ Priorities: bug > guard > perf > feature.
 ## Active Work
 
 ### P0 — Critical Bugs
-*(none pending)*
+
+- [ ] **`replace_database_file` can still leave no active DB after a failed install**
+  `src/db/transfer.rs:391-397` renames the live DB to backup before all fallible install steps complete, then removes sidecars and renames the staged DB into place. If sidecar cleanup or the final rename fails, the active `streamer.db` path is gone even though the API reports replacement failure. Make the swap rollback-safe: either stage in the same directory with an atomic replace that preserves/rolls back the active DB, or restore the backup on every post-backup failure path.
 
 ### P1 — Performance (High Impact)
 *(none pending)*
 
 ### P2 — Reliability
-*(none pending)*
+
+- [ ] **Server playback progress cannot move backwards or clear completion**
+  `src/db/queries_playback.rs:18-24` only updates an existing row when the new `position_seconds` is greater than the stored value. `static/watch.js:276-284` sends progress on `ended`, `pause`, and `seeked`, so replaying an episode from the beginning or seeking backward after a completed row leaves the DB stuck at the old near-end/completed position. Continue-watching then stays hidden or resumes from stale data. Preserve stale-import protection without blocking current-session lower positions, e.g. compare update freshness rather than monotonic position.
 
 ### P3 — Data Model
 *(none pending)*
 
 ### P4 — Security Hardening
-*(none pending)*
+
+- [ ] **Proxy client IP extraction trusts the wrong `X-Forwarded-For` hop**
+  `src/api/uploads.rs:601-613` uses the rightmost `X-Forwarded-For` entry and falls back to `127.0.0.1` when `BEHIND_PROXY=true`. It also never checks the configured `TRUSTED_PROXY_CIDRS`, even though `src/config.rs:36-37` loads that setting and the docs say forwarded headers are trusted from configured proxies. In the usual `client, proxy1, proxy2` header format, the rightmost address is the nearest proxy, so per-IP upload rate limiting and pending-upload ownership collapse to the proxy instead of the client. Parse the leftmost trusted client address only when the peer is a trusted proxy, and fall back to the actual peer address when the header is absent or invalid.
 
 ### P5 — Operational
 *(none pending)*
