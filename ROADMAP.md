@@ -22,6 +22,9 @@ Priorities: bug > guard > perf > feature.
 - [ ] **Server playback progress cannot move backwards or clear completion**
   `src/db/queries_playback.rs:18-24` only updates an existing row when the new `position_seconds` is greater than the stored value. `static/watch.js:276-284` sends progress on `ended`, `pause`, and `seeked`, so replaying an episode from the beginning or seeking backward after a completed row leaves the DB stuck at the old near-end/completed position. Continue-watching then stays hidden or resumes from stale data. Preserve stale-import protection without blocking current-session lower positions, e.g. compare update freshness rather than monotonic position.
 
+- [ ] **Watch-folder duplicate check can move a new source into `done` without enqueueing it**
+  `src/api/watch_folder.rs:443-457` renames the watched source to the done-directory target before checking `job_exists_active_by_filename`. If an active job already exists, the function returns `Ok(())` after the move and never enqueues the new file, so a freshly dropped replacement or duplicate can disappear from the watch root with no processing job. Check the active-job dedup condition before the rename, or roll the file back when the post-rename duplicate check decides to skip.
+
 ### P3 — Data Model
 *(none pending)*
 
