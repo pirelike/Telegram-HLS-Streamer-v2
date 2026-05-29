@@ -9,32 +9,10 @@ Priorities: bug > guard > perf > feature.
 
 ## Active Work
 
-### P0 — Critical Bugs
-
-- [ ] **`replace_database_file` can still leave no active DB after a failed install**
-  `src/db/transfer.rs:391-397` renames the live DB to backup before all fallible install steps complete, then removes sidecars and renames the staged DB into place. If sidecar cleanup or the final rename fails, the active `streamer.db` path is gone even though the API reports replacement failure. Make the swap rollback-safe: either stage in the same directory with an atomic replace that preserves/rolls back the active DB, or restore the backup on every post-backup failure path.
-
-### P1 — Performance (High Impact)
-*(none pending)*
-
 ### P2 — Reliability
 
-- [ ] **Server playback progress cannot move backwards or clear completion**
-  `src/db/queries_playback.rs:18-24` only updates an existing row when the new `position_seconds` is greater than the stored value. `static/watch.js:276-284` sends progress on `ended`, `pause`, and `seeked`, so replaying an episode from the beginning or seeking backward after a completed row leaves the DB stuck at the old near-end/completed position. Continue-watching then stays hidden or resumes from stale data. Preserve stale-import protection without blocking current-session lower positions, e.g. compare update freshness rather than monotonic position.
-
-- [ ] **Watch-folder duplicate check can move a new source into `done` without enqueueing it**
-  `src/api/watch_folder.rs:443-457` renames the watched source to the done-directory target before checking `job_exists_active_by_filename`. If an active job already exists, the function returns `Ok(())` after the move and never enqueues the new file, so a freshly dropped replacement or duplicate can disappear from the watch root with no processing job. Check the active-job dedup condition before the rename, or roll the file back when the post-rename duplicate check decides to skip.
-
-### P3 — Data Model
-*(none pending)*
-
-### P4 — Security Hardening
-
-- [ ] **Proxy client IP extraction trusts the wrong `X-Forwarded-For` hop**
-  `src/api/uploads.rs:601-613` uses the rightmost `X-Forwarded-For` entry and falls back to `127.0.0.1` when `BEHIND_PROXY=true`. It also never checks the configured `TRUSTED_PROXY_CIDRS`, even though `src/config.rs:36-37` loads that setting and the docs say forwarded headers are trusted from configured proxies. In the usual `client, proxy1, proxy2` header format, the rightmost address is the nearest proxy, so per-IP upload rate limiting and pending-upload ownership collapse to the proxy instead of the client. Parse the leftmost trusted client address only when the peer is a trusted proxy, and fall back to the actual peer address when the header is absent or invalid.
-
-### P5 — Operational
-*(none pending)*
+- [ ] **Out-of-order browser upload can mark a chunk received without writing its bytes**
+  Current `cargo test` fails in `api::tests::upload::out_of_order_chunks_resume_and_finalize`: after uploading chunks in order `2, 0, 1`, `/api/upload/status/:id` reports `received_indices = [0, 1, 2]`, but reading the staged upload file returns `abcd\0\0\0\0ij` instead of `abcdefghij`. The affected path is `src/api/uploads.rs:270-340`, where the handler records the chunk as received after the write path; audit the current chunk body/write/offset flow before trusting resumable uploads with sparse or out-of-order chunks.
 
 ### P6 — New Features
 
@@ -53,7 +31,7 @@ Priorities: bug > guard > perf > feature.
 ### P7 — Code Quality
 
 ### Current Verification Baseline
-- `cargo test` passes: 172 passed, 1 ignored.
+- `cargo test` passes: 176 passed, 1 ignored.
 - `cargo fmt --check` passes (clean).
 - `cargo clippy --all-targets --all-features` passes with 0 warnings.
 
@@ -89,12 +67,15 @@ Priorities: bug > guard > perf > feature.
 - [x] `store_config` writes `selected_encoder` before `config` — reordered to write config first, then encoder
 - [x] `handle_reset_settings` does not reload config from DB — added `Config::load` call after restoring defaults
 - [x] `enqueue_existing_job` overwrites terminal job state — added `is_terminal()` guard before overwriting state back to `Queued`
+- [x] **Intro/outro fingerprint hardcodes `0:a:0`, silently fails on video-only sources** — added `has_audio` check in `processing_markers.rs`; chromaprint pass skipped when analysis has no audio channels; falls back to chapter/black/silence detection only
+- [x] **`replace_database_file` can leave no active DB after a failed install** — wrapped post-backup install steps in a closure; on any error, `fs::rename(backup → active)` is attempted before returning the original error
 
 ### P1 — Performance (High Impact)
 - [x] Browser upload is strictly serial even though chunk retries are resumable
 - [x] Upload resume assumes contiguous chunks
 - [x] No lightweight playback/cache benchmark exists
 - [x] Cache warm-up is too coarse for home-server bandwidth
+- [x] **`ffprobe`/`ffmpeg` in marker and probe paths run without timeout or cancellation** — `analyze_media` wrapped with 60s `tokio::time::timeout`; `probe_duration` with 30s timeout; `generate_fingerprint_window`, `detect_silence_points`, `detect_black_points` each wrapped with appropriate wall-clock timeouts
 
 ### P2 — Reliability
 - [x] **`encode_video_tier` always reports zero oversized-segment repairs** — `repair_oversized_video_segments` now returns `Result<usize>` with actual repair count; hardcoded `m4s_repair_count = 0` eliminated
@@ -148,7 +129,8 @@ Priorities: bug > guard > perf > feature.
 - [x] `parse_bitrate_bps` rejects multi-character suffixes — ported multi-char suffix parsing from `bitrate_bits`
 - [x] Virtual ABR 16:9 fallback for zero source dimensions — fall back to copy without scaling
 - [x] `insert_job_marker` / `insert_processing_marker` don't populate `created_at_unix` — added `strftime('%s','now')`
-- [x] `save_playback_progress` overwrites without recency check — added `WHERE excluded.position_seconds > playback_progress.position_seconds`
+- [x] `save_playback_progress` backward-seek blocked — removed `WHERE position_seconds >` guard; in-session writes always overwrite, allowing backward seek and replay
+- [x] `save_playback_progress` and `merge_from_export` recency semantics differ — `merge_from_export` already uses `updated_at`; `save_playback_progress` now always overwrites (in-session), keeping them aligned
 - [x] `copyPlayerUrl` crashes — `nextElementSibling` returns null — select button by ID instead of sibling DOM order
 - [x] Browse page search non-functional — references hidden input — dynamically create visible `#pageSearchInput` in filter bar
 - [x] Extra `</div>` in video card HTML breaks layout — removed stray closing div
@@ -160,6 +142,14 @@ Priorities: bug > guard > perf > feature.
 - [x] `_seriesDetailSelected`/`_seriesDetailEpisodes` never reset — reset on series detail key change
 - [x] Event listeners accumulate on `metadataTableWrap` — add delegated listener once via dataset flag
 - [x] Resume position applied twice causing visible jump — single seek via `player.load()` start time, removed redundant second seek
+- [x] **Watch-folder overwrite path loses the pre-existing done file when enqueue fails** — renamed existing done file to `.done.bak` sidecar before overwrite; restored on enqueue failure; deleted on success
+- [x] **Watch-folder duplicate check ran after rename, silently losing the source file** — moved `job_exists_active_by_filename` check before `fs::rename`; both queries now scoped with `media_type = "Film"`
+- [x] **`handle_cancel_job` skipped processing-dir and source-file cleanup** — extracts `source_path`, `processing_path`, `delete_source_on_finish` while holding jobs lock; calls `cleanup_job_paths` after DB write
+- [x] **Per-IP upload rate limiter recorded denied request before rejecting** — length check moved before `push_back`; 429 path no longer records a timestamp slot
+- [x] **`ts_dir` leaked on every error path in `encode_video_tier`** — wrapped entire fallible body in an immediately-awaited `async { }` block; `remove_dir_all(&ts_dir)` called unconditionally after the block exits
+- [x] **`upload_locks` HashMap grew unboundedly across bot-token rotations** — added `prune_upload_locks(active_tokens)` to `TelegramRuntime`; called from bot-add and bot-delete handlers after config write
+- [x] **Telegram 401/404/410 misclassified as `Retryable`** — extended `Permanent` branch in `classify_api_body` to `matches!(code, 400 | 401 | 403 | 404 | 410)`
+- [x] **`get_file_bytes_attempt` passed empty JSON to classifier on non-2xx file GET** — synthetic body `{"error_code": status, "description": "file GET HTTP {status}"}` enables 404→Permanent path and stale-file_id text matcher
 
 ### P3 — Data Model
 - [x] DB export/import loses split segment parts
@@ -178,6 +168,9 @@ Priorities: bug > guard > perf > feature.
 - [x] `db_auto_merge_bot_index` used as vector index without bounds check
 - [x] `validate_table_name` allowlist missing 7 tables
 - [x] `validate_column_name` allowlist missing many columns from newer tables
+- [x] **`get_job_source_bitrate_by_filename` missing `media_type` scope** — added `media_type: &str` parameter and `AND media_type = ?2` to WHERE clause; watch-folder caller passes `"Film"`
+- [x] **`job_exists_active_by_filename` missing `media_type` filter** — same shape as above; watch-folder dedup now correctly scoped
+- [x] **`delete_job` not transactional across cascade** — wrapped DELETE in `unchecked_transaction()` matching surrounding style
 
 ### P4 — Security Hardening
 - [x] Settings-to-`.env` write path allows newline injection
@@ -186,18 +179,15 @@ Priorities: bug > guard > perf > feature.
 - [x] Upload status endpoint does not validate ownership
 - [x] Telegram errors may leak bot tokens
 - [x] Public proxy settings are not enforced consistently
-- [x] **Basic-auth credential comparison is not constant-time**
-  `src/api/auth.rs:32` — replaced `user == ... && pass == ...` with custom `constant_time_eq` that XOR-accumulates byte differences across the entire length, hardening the existing gate.
-- [x] **TMDB API key exposed in request URLs (logged by reqwest/proxies)**
-  `src/api/metadata.rs:348-353` — `reqwest` is built with `default-features = false` (no `log` feature), so URL logging is disabled; documented in code comment that no logging of `url` variable should be added.
-- [x] **`upload_document` records upload-error metric for pre-check size failures**
-  `src/telegram/upload.rs:33-42` — removed `record_upload_error` call from size pre-check path; metrics now only recorded inside `upload_prepared_document` for actual Telegram API failures.
+- [x] **Basic-auth credential comparison is not constant-time** — replaced `user == ... && pass == ...` with custom `constant_time_eq` that XOR-accumulates byte differences across the entire length
+- [x] **TMDB API key exposed in request URLs (logged by reqwest/proxies)** — `reqwest` built with `default-features = false` (no `log` feature); URL logging disabled; documented in code comment
+- [x] **`upload_document` records upload-error metric for pre-check size failures** — removed `record_upload_error` call from size pre-check path; metrics only recorded for actual Telegram API failures
+- [x] **`redact_bot_token` aborted on short false-match, leaving later real tokens unredacted** — replaced `break` with `pos = end; continue;` so scanning continues past the false match
+- [x] **Proxy client IP extraction trusted wrong XFF hop** — rewrote `client_ip` to check peer against `trusted_proxy_cidrs` first; returns leftmost non-trusted XFF entry when peer is a trusted proxy; hand-rolled IPv4/IPv6 CIDR membership, no new dependency
 
 ### P5 — Operational
-- [x] **Marker `max_offset` capped at `a_len/4` silently misses real episode drift**
-  `src/media/markers.rs:312` — Removed `.min(a_len / 4)` cap; `max_offset` is now `MAX_OFFSET_POINTS` alone. The loop already guards against out-of-bounds access, so the cap only silently dropped valid drifted matches.
-- [x] **`max_plaintext_size` parameter name is misleading**
-  `src/crypto.rs:81-88` — Renamed parameter from `max_upload_size` to `telegram_max_file_size` to prevent accidental misuse with `Config.max_upload_size` (100 GB browser limit vs 20 MB Telegram limit).
+- [x] **Marker `max_offset` capped at `a_len/4` silently misses real episode drift** — removed `.min(a_len / 4)` cap; `max_offset` is now `MAX_OFFSET_POINTS` alone
+- [x] **`max_plaintext_size` parameter name is misleading** — renamed parameter from `max_upload_size` to `telegram_max_file_size`
 - [x] Watch-folder claim can overwrite existing done files
 - [x] Startup probes for `ffmpeg`/`ffprobe` can hang indefinitely
 - [x] Cloudflared child can survive THLS shutdown
@@ -214,6 +204,8 @@ Priorities: bug > guard > perf > feature.
 - [x] Global polling interval in `shared.js` never cleared — cleared on `pagehide`/`beforeunload`
 - [x] Hero rotation `setInterval` in `browse-home.js` never cleared — `stopTimer()` on `pagehide`/`beforeunload`; `startTimer()` clears before creating
 - [x] `pollStatus` interval in `upload.js` leaks on navigation — `activeStatusPolls` Set + cleanup on `pagehide`/`beforeunload`
+- [x] **`HLS_SEGMENT_DURATION` not runtime-settable** — added registry entry (Int, min 2, max 10, default 4); added `setting_value` and `apply_setting` arms; updated field comment
+- [x] **`set_setting`/`set_settings` accepted arbitrary values without validation** — added `normalize_str_for_key(key, value)` call before INSERT; write fails with typed error if validation fails
 
 ### P7 — Code Quality (Completed)
 - [x] Audit and remove fragile `.unwrap()` / `.expect()` calls in runtime + worker paths — propagated via `?` in handlers; `.expect("reason")` for provably-infallible sites; startup/migration unwraps left loud-at-boot by design

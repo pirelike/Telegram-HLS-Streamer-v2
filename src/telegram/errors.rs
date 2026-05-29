@@ -42,7 +42,8 @@ pub(super) fn redact_bot_token(msg: &str) -> String {
         };
         let end = token_start + end_offset;
         if end - token_start <= 10 {
-            break;
+            pos = end;
+            continue;
         }
         result.replace_range(token_start..end, "***REDACTED***");
         pos = token_start + "***REDACTED***".len();
@@ -71,7 +72,7 @@ pub(super) fn classify_api_body(status: u16, body: &Value) -> TelegramError {
             .unwrap_or(1);
         return TelegramError::RetryAfter(Duration::from_secs(retry_after.max(1)));
     }
-    if code == 400 || code == 403 {
+    if matches!(code, 400 | 401 | 403 | 404 | 410) {
         return TelegramError::Permanent(anyhow!(normalize_telegram_api_error(status, body)));
     }
     TelegramError::Retryable(anyhow!(normalize_telegram_api_error(status, body)))

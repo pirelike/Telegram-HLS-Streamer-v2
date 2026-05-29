@@ -324,9 +324,8 @@ async fn cancel_during_processing_cleans_up_and_leaves_no_db_row() {
     // No DB row for this job
     let conn = state.db_conn().await.unwrap();
     assert!(db::get_job(&conn, "cancel-proc").unwrap().is_none());
-    // Cleanup is deferred to process_job; verify processing dir still exists
-    // (process_job will clean it up when it observes the cancel flag).
-    assert!(processing_path.exists());
+    // handle_cancel_job now calls cleanup_job_paths immediately.
+    assert!(!processing_path.exists());
 }
 
 #[tokio::test]

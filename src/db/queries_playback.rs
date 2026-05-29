@@ -20,8 +20,7 @@ pub fn save_playback_progress(conn: &Connection, progress: &NewPlaybackProgress)
             duration_seconds=excluded.duration_seconds,
             progress_pct=excluded.progress_pct,
             completed=excluded.completed,
-            updated_at=CURRENT_TIMESTAMP
-         WHERE excluded.position_seconds > playback_progress.position_seconds",
+            updated_at=CURRENT_TIMESTAMP",
         params![
             progress.client_id,
             progress.job_id,

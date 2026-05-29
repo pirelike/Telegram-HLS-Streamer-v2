@@ -120,7 +120,9 @@ pub(super) async fn prepare_marker_detection(
         }
     };
 
-    let new_fingerprints = if cfg.intro_chromaprint_enabled && !series_name.is_empty() {
+    let has_audio = analysis.audio_streams.iter().any(|s| s.channels > 0);
+    let new_fingerprints = if cfg.intro_chromaprint_enabled && !series_name.is_empty() && has_audio
+    {
         if !media::chromaprint_available() {
             tracing::warn!(job_id = %request.job_id, "chromaprint fingerprint generation unavailable");
             Vec::new()
@@ -136,7 +138,13 @@ pub(super) async fn prepare_marker_detection(
             }
         }
     } else {
-        if !cfg.intro_chromaprint_enabled {
+        if !has_audio {
+            tracing::info!(
+                job_id = %request.job_id,
+                filename = %request.filename,
+                "chromaprint marker generation skipped: no audio streams"
+            );
+        } else if !cfg.intro_chromaprint_enabled {
             tracing::info!(
                 job_id = %request.job_id,
                 filename = %request.filename,

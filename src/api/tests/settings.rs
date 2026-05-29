@@ -15,16 +15,6 @@ async fn settings_get_post_and_reset_update_runtime_config() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_response(response).await;
     assert!(body["categories"]["reliability"]["settings"].is_array());
-    let all_settings: Vec<&serde_json::Value> = body["categories"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|category| category["settings"].as_array().unwrap())
-        .collect();
-    assert!(!all_settings
-        .iter()
-        .any(|setting| setting["key"] == "HLS_SEGMENT_DURATION"));
-
     let response = app
         .oneshot(
             Request::post("/api/settings")

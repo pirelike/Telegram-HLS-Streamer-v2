@@ -62,6 +62,11 @@ impl TelegramRuntime {
             .clone()
     }
 
+    pub async fn prune_upload_locks(&self, active_tokens: &[String]) {
+        let mut locks = self.upload_locks.lock().await;
+        locks.retain(|token, _| active_tokens.contains(token));
+    }
+
     pub async fn metrics_snapshot(&self) -> TelegramMetrics {
         self.metrics.lock().await.clone()
     }

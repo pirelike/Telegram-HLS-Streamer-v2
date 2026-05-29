@@ -147,7 +147,11 @@ async fn get_file_bytes_attempt(
     let url = resolve_file_url(client, base_url, bot, file_id).await?;
     let resp = client.get(&url).send().await.map_err(classify_reqwest)?;
     if !resp.status().is_success() {
-        return Err(classify_api_body(resp.status().as_u16(), &json!({})));
+        let status_u16 = resp.status().as_u16();
+        return Err(classify_api_body(
+            status_u16,
+            &json!({ "error_code": status_u16, "description": format!("file GET HTTP {status_u16}") }),
+        ));
     }
     resp.bytes()
         .await

@@ -393,15 +393,30 @@ pub fn replace_database_file(
     } else {
         fs::File::create(&backup_path).context("creating empty backup marker")?;
     }
-    remove_sqlite_sidecars(active_path)?;
-    fs::rename(source_path, active_path).context("installing replacement database")?;
-    let conn = init_db(active_path).context("opening replacement database")?;
-    let schema_revision = current_schema_revision(&conn)?;
-    conn.close().map_err(|(_, e)| anyhow!(e))?;
-    Ok(ReplaceDatabaseResult {
-        backup_path,
-        schema_revision,
-    })
+    // Attempt install; on any failure restore the backup so the active DB path is never empty.
+    let install_result: Result<i64> = (|| {
+        remove_sqlite_sidecars(active_path)?;
+        fs::rename(source_path, active_path).context("installing replacement database")?;
+        let conn = init_db(active_path).context("opening replacement database")?;
+        let revision = current_schema_revision(&conn)?;
+        conn.close().map_err(|(_, e)| anyhow!(e))?;
+        Ok(revision)
+    })();
+    match install_result {
+        Ok(schema_revision) => Ok(ReplaceDatabaseResult {
+            backup_path,
+            schema_revision,
+        }),
+        Err(e) => {
+            if let Err(restore_err) = fs::rename(&backup_path, active_path) {
+                tracing::error!(
+                    error = %restore_err,
+                    "failed to restore active database after install failure; server has no active database"
+                );
+            }
+            Err(e)
+        }
+    }
 }
 
 fn remove_sqlite_sidecars(path: &Path) -> Result<()> {

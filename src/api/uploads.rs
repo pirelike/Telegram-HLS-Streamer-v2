@@ -66,7 +66,7 @@ pub(super) async fn handle_upload_init(
     let peer = maybe_addr
         .map(|ConnectInfo(a)| a.ip())
         .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
-    let ip = client_ip(&headers, cfg.behind_proxy, peer);
+    let ip = client_ip(&headers, cfg.behind_proxy, peer, &cfg.trusted_proxy_cidrs);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
@@ -220,7 +220,7 @@ pub(super) async fn handle_upload_chunk(
     let peer = maybe_addr
         .map(|ConnectInfo(a)| a.ip())
         .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
-    let ip = client_ip(&headers, cfg.behind_proxy, peer);
+    let ip = client_ip(&headers, cfg.behind_proxy, peer, &cfg.trusted_proxy_cidrs);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
@@ -373,7 +373,7 @@ pub(super) async fn handle_upload_finalize(
     let peer = maybe_addr
         .map(|ConnectInfo(a)| a.ip())
         .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
-    let ip = client_ip(&headers, cfg.behind_proxy, peer);
+    let ip = client_ip(&headers, cfg.behind_proxy, peer, &cfg.trusted_proxy_cidrs);
     if let Some(response) = check_upload_rate_limit(&state, ip).await {
         return response;
     }
@@ -486,7 +486,7 @@ pub(super) async fn handle_upload_status(
     let peer = maybe_addr
         .map(|ConnectInfo(a)| a.ip())
         .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
-    let ip = client_ip(&headers, cfg.behind_proxy, peer);
+    let ip = client_ip(&headers, cfg.behind_proxy, peer, &cfg.trusted_proxy_cidrs);
 
     let pending = state.pending_uploads.lock().await;
     let Some(upload) = pending.get(&upload_id) else {
@@ -593,27 +593,68 @@ fn required_header(headers: &HeaderMap, name: &str) -> Result<String, String> {
         .map_err(|_| format!("invalid {name} header"))
 }
 
+fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
+    let Some((addr_str, prefix_str)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix_len) = prefix_str.parse::<u32>() else {
+        return false;
+    };
+    let Ok(cidr_addr) = addr_str.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match (ip, cidr_addr) {
+        (std::net::IpAddr::V4(ip4), std::net::IpAddr::V4(cidr4)) => {
+            if prefix_len > 32 {
+                return false;
+            }
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
+            (u32::from(ip4) & mask) == (u32::from(cidr4) & mask)
+        }
+        (std::net::IpAddr::V6(ip6), std::net::IpAddr::V6(cidr6)) => {
+            if prefix_len > 128 {
+                return false;
+            }
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                !0u128 << (128 - prefix_len)
+            };
+            (u128::from(ip6) & mask) == (u128::from(cidr6) & mask)
+        }
+        _ => false,
+    }
+}
+
+fn ip_is_trusted_proxy(ip: std::net::IpAddr, trusted_cidrs: &[String]) -> bool {
+    trusted_cidrs.iter().any(|cidr| ip_in_cidr(ip, cidr))
+}
+
 fn client_ip(
     headers: &HeaderMap,
     behind_proxy: bool,
     peer_addr: std::net::IpAddr,
+    trusted_proxy_cidrs: &[String],
 ) -> std::net::IpAddr {
-    if behind_proxy {
-        headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                let entries: Vec<&str> = v
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                entries.last().and_then(|s| s.parse().ok())
-            })
-            .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback ip"))
-    } else {
-        peer_addr
+    if !behind_proxy || !ip_is_trusted_proxy(peer_addr, trusted_proxy_cidrs) {
+        return peer_addr;
     }
+    // peer is a trusted proxy; find leftmost non-trusted address in X-Forwarded-For
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+                .find(|ip| !ip_is_trusted_proxy(*ip, trusted_proxy_cidrs))
+        })
+        .unwrap_or(peer_addr)
 }
 
 async fn check_upload_rate_limit(state: &AppState, ip: std::net::IpAddr) -> Option<Response> {
@@ -636,14 +677,14 @@ async fn check_upload_rate_limit(state: &AppState, ip: std::net::IpAddr) -> Opti
         !dq.is_empty()
     });
     let requests = limits.entry(ip).or_default();
-    requests.push_back(now);
-    if requests.len() > max {
+    if requests.len() >= max {
         return Some(api_error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
             "upload rate limit exceeded",
         ));
     }
+    requests.push_back(now);
     None
 }
 
@@ -734,31 +775,61 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn default_cidrs() -> Vec<String> {
+        vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+    }
+
     #[test]
-    fn client_ip_takes_rightmost_entry() {
+    fn client_ip_takes_leftmost_non_proxy_entry() {
+        let cidrs = default_cidrs();
+        // 1.2.3.4 is the real client; 10.0.0.1 is the intermediate proxy
         let headers = make_headers("1.2.3.4, 10.0.0.1");
-        let ip = client_ip(&headers, true, loopback());
-        assert_eq!(ip, peer("10.0.0.1"));
+        let ip = client_ip(&headers, true, loopback(), &cidrs);
+        assert_eq!(ip, peer("1.2.3.4"));
     }
 
     #[test]
     fn client_ip_single_entry() {
+        let cidrs = default_cidrs();
         let headers = make_headers("10.0.0.1");
-        let ip = client_ip(&headers, true, loopback());
+        let ip = client_ip(&headers, true, loopback(), &cidrs);
         assert_eq!(ip, peer("10.0.0.1"));
     }
 
     #[test]
     fn client_ip_no_proxy_returns_peer_addr() {
+        let cidrs = default_cidrs();
         let headers = HeaderMap::new();
-        let ip = client_ip(&headers, false, peer("192.168.1.5"));
+        let ip = client_ip(&headers, false, peer("192.168.1.5"), &cidrs);
         assert_eq!(ip, peer("192.168.1.5"));
     }
 
     #[test]
-    fn client_ip_missing_header_returns_loopback() {
+    fn client_ip_peer_not_in_trusted_cidrs_ignores_xff() {
+        let cidrs = default_cidrs();
+        // peer is 10.0.0.2, not in trusted CIDRs, so XFF is ignored
+        let headers = make_headers("1.2.3.4");
+        let ip = client_ip(&headers, true, peer("10.0.0.2"), &cidrs);
+        assert_eq!(ip, peer("10.0.0.2"));
+    }
+
+    #[test]
+    fn client_ip_missing_xff_falls_back_to_peer() {
+        let cidrs = default_cidrs();
         let headers = HeaderMap::new();
-        let ip = client_ip(&headers, true, loopback());
+        let ip = client_ip(&headers, true, loopback(), &cidrs);
         assert_eq!(ip, loopback());
+    }
+
+    #[test]
+    fn ip_in_cidr_v4_works() {
+        assert!(ip_in_cidr("192.168.1.5".parse().unwrap(), "192.168.1.0/24"));
+        assert!(!ip_in_cidr(
+            "192.168.2.5".parse().unwrap(),
+            "192.168.1.0/24"
+        ));
+        assert!(ip_in_cidr("10.0.0.1".parse().unwrap(), "10.0.0.0/8"));
+        assert!(ip_in_cidr("127.0.0.1".parse().unwrap(), "127.0.0.1/32"));
+        assert!(!ip_in_cidr("127.0.0.2".parse().unwrap(), "127.0.0.1/32"));
     }
 }

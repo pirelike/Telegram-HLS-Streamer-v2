@@ -129,17 +129,26 @@ pub(crate) fn fmp4_input_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+const PROBE_TIMEOUT_SECS: u64 = 30;
+
 pub(super) async fn probe_duration(path: &Path) -> Result<f64> {
-    let output = Command::new("ffprobe")
-        .arg("-v")
-        .arg("error")
-        .arg("-show_entries")
-        .arg("format=duration")
-        .arg("-of")
-        .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(fmp4_input_arg(path))
-        .output()
-        .await?;
+    let path_arg = fmp4_input_arg(path);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+        Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-show_entries")
+            .arg("format=duration")
+            .arg("-of")
+            .arg("default=noprint_wrappers=1:nokey=1")
+            .arg(&path_arg)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("ffprobe probe_duration timed out after {PROBE_TIMEOUT_SECS}s")
+    })??;
     if !output.status.success() {
         bail!("ffprobe duration failed");
     }

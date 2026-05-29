@@ -59,13 +59,10 @@ pub struct Config {
     pub video_bitrate: String,
     pub audio_bitrate: String,
 
-    // INTERNAL FALLBACK ONLY — NOT loaded from settings (no registry entry).
-    // Used by playlist-rendering paths (api/playlists.rs, api/playback/virtual_.rs)
-    // when there is no job context to compute a real value from. Encode-time
-    // call sites derive a per-job value via
-    // media::process::target_segment_seconds_for_tier. Do not plumb this field
-    // into the encode pipeline. See the comment block on that helper for full
-    // background.
+    // Fallback used by playlist-rendering paths (api/playlists.rs, api/playback/virtual_.rs)
+    // when there is no job context. Encode-time call sites derive a per-job value via
+    // media::process::target_segment_seconds_for_tier — do not plumb this field into
+    // the encode pipeline.
     pub hls_segment_duration: u32,
     pub audio_segment_duration: u32,
 
@@ -248,6 +245,7 @@ impl Config {
             "MAX_PARALLEL_ENCODES" => self.max_parallel_encodes.to_string(),
             "VIDEO_BITRATE" => self.video_bitrate.clone(),
             "AUDIO_BITRATE" => self.audio_bitrate.clone(),
+            "HLS_SEGMENT_DURATION" => self.hls_segment_duration.to_string(),
             "AUDIO_SEGMENT_DURATION" => self.audio_segment_duration.to_string(),
             "JOB_TIMEOUT_SECONDS" => self.job_timeout_seconds.to_string(),
             "QUEUE_TIMEOUT_SECONDS" => self.queue_timeout_seconds.to_string(),
@@ -427,6 +425,7 @@ fn apply_setting(cfg: &mut Config, key: &str, value: &str, source: &str) {
             "MAX_PARALLEL_ENCODES" => cfg.max_parallel_encodes = parse_int(value)?,
             "VIDEO_BITRATE" => cfg.video_bitrate = value.to_string(),
             "AUDIO_BITRATE" => cfg.audio_bitrate = value.to_string(),
+            "HLS_SEGMENT_DURATION" => cfg.hls_segment_duration = parse_int(value)?,
             "AUDIO_SEGMENT_DURATION" => cfg.audio_segment_duration = parse_int(value)?,
             "JOB_TIMEOUT_SECONDS" => cfg.job_timeout_seconds = parse_int(value)?,
             "QUEUE_TIMEOUT_SECONDS" => cfg.queue_timeout_seconds = parse_int(value)?,

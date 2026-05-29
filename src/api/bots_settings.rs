@@ -390,7 +390,9 @@ pub(super) async fn handle_add_bot(
             }
         }
     };
+    let active_tokens: Vec<String> = new_cfg.bots.iter().map(|b| b.token.clone()).collect();
     *state.config.write().await = Arc::new(new_cfg);
+    state.telegram.prune_upload_locks(&active_tokens).await;
     Json(json!({ "id": id, "message": "bot added" })).into_response()
 }
 
@@ -438,7 +440,9 @@ pub(super) async fn handle_delete_bot(
             }
         }
     };
+    let active_tokens: Vec<String> = new_cfg.bots.iter().map(|b| b.token.clone()).collect();
     *state.config.write().await = Arc::new(new_cfg);
+    state.telegram.prune_upload_locks(&active_tokens).await;
     Json(json!({ "message": "bot deleted" })).into_response()
 }
 fn settings_response(cfg: &Config) -> Value {

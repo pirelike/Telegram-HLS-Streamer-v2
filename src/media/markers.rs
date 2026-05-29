@@ -181,33 +181,42 @@ pub async fn generate_fingerprints(
     Ok(fingerprints)
 }
 
+const FINGERPRINT_TIMEOUT_SECS: u64 = 120;
+const SILENCE_BLACK_TIMEOUT_SECS: u64 = 30;
+
 async fn generate_fingerprint_window(
     source_path: &Path,
     start_seconds: f64,
     duration_seconds: f64,
 ) -> anyhow::Result<String> {
-    let audio = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-ss")
-        .arg(format!("{start_seconds:.3}"))
-        .arg("-t")
-        .arg(format!("{duration_seconds:.3}"))
-        .arg("-i")
-        .arg(source_path)
-        .arg("-map")
-        .arg("0:a:0")
-        .arg("-ac")
-        .arg("1")
-        .arg("-ar")
-        .arg("11025")
-        .arg("-f")
-        .arg("wav")
-        .arg("pipe:1")
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("extracting audio for chromaprint: {e}"))?;
+    let audio = tokio::time::timeout(
+        std::time::Duration::from_secs(FINGERPRINT_TIMEOUT_SECS),
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-ss")
+            .arg(format!("{start_seconds:.3}"))
+            .arg("-t")
+            .arg(format!("{duration_seconds:.3}"))
+            .arg("-i")
+            .arg(source_path)
+            .arg("-map")
+            .arg("0:a:0")
+            .arg("-ac")
+            .arg("1")
+            .arg("-ar")
+            .arg("11025")
+            .arg("-f")
+            .arg("wav")
+            .arg("pipe:1")
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("ffmpeg audio extraction timed out after {FINGERPRINT_TIMEOUT_SECS}s")
+    })?
+    .map_err(|e| anyhow::anyhow!("extracting audio for chromaprint: {e}"))?;
 
     if !audio.status.success() {
         anyhow::bail!(
@@ -272,9 +281,11 @@ fn normalize_fingerprint_output(stdout: &str) -> String {
 
 // Chromaprint emits one 32-bit int per ~0.1238 seconds.
 const POINTS_PER_SECOND: f64 = 1.0 / 0.1238;
-const HAMMING_THRESHOLD: u32 = 6;
+const HAMMING_THRESHOLD: u32 = 8;
 const MIN_MATCH_POINTS: usize = 100;
+const MAX_MISMATCH_GAP_POINTS: usize = 3;
 const MAX_OFFSET_POINTS: i64 = 400;
+const SNAP_SEARCH_SECONDS: f64 = 12.0;
 
 pub fn compare_fingerprints(
     generated: &GeneratedFingerprint,
@@ -312,6 +323,7 @@ fn find_best_match(
 
     let mut best_start = 0usize;
     let mut best_len = 0usize;
+    let mut best_match_points = 0usize;
 
     for offset in -max_offset..=max_offset {
         let a_start = (-offset).max(0) as usize;
@@ -326,31 +338,48 @@ fn find_best_match(
 
         let mut run_start = a_start;
         let mut run_len = 0usize;
+        let mut run_match_points = 0usize;
+        let mut gap_len = 0usize;
         let mut local_best_start = a_start;
         let mut local_best_len = 0usize;
+        let mut local_best_match_points = 0usize;
 
         for i in 0..len {
             if (a[a_start + i] ^ b[b_start + i]).count_ones() <= HAMMING_THRESHOLD {
                 if run_len == 0 {
                     run_start = a_start + i;
+                    run_match_points = 0;
                 }
                 run_len += 1;
-                if run_len > local_best_len {
+                run_match_points += 1;
+                gap_len = 0;
+                if run_match_points > local_best_match_points
+                    || (run_match_points == local_best_match_points && run_len > local_best_len)
+                {
                     local_best_len = run_len;
                     local_best_start = run_start;
+                    local_best_match_points = run_match_points;
                 }
+            } else if run_len > 0 && gap_len < MAX_MISMATCH_GAP_POINTS {
+                run_len += 1;
+                gap_len += 1;
             } else {
                 run_len = 0;
+                run_match_points = 0;
+                gap_len = 0;
             }
         }
 
-        if local_best_len > best_len {
+        if local_best_match_points > best_match_points
+            || (local_best_match_points == best_match_points && local_best_len > best_len)
+        {
             best_len = local_best_len;
             best_start = local_best_start;
+            best_match_points = local_best_match_points;
         }
     }
 
-    if best_len < MIN_MATCH_POINTS {
+    if best_match_points < MIN_MATCH_POINTS {
         return None;
     }
 
@@ -368,7 +397,7 @@ fn find_best_match(
         start_seconds: start_secs,
         end_seconds: end_secs,
         source: "chromaprint".to_string(),
-        confidence: ((best_len as f64 / a.len() as f64) * 2.0).clamp(0.5, 1.0),
+        confidence: ((best_match_points as f64 / a.len() as f64) * 2.0).clamp(0.5, 1.0),
     })
 }
 
@@ -426,8 +455,8 @@ async fn snap_marker_to_boundaries(source_path: &Path, marker: NewMediaMarker) -
     }
     let start = marker.start_seconds;
     let end = marker.end_seconds;
-    let search_start = (start - 8.0).max(0.0);
-    let search_end = end + 8.0;
+    let search_start = (start - SNAP_SEARCH_SECONDS).max(0.0);
+    let search_end = end + SNAP_SEARCH_SECONDS;
     let mut candidates = Vec::new();
 
     candidates.extend(
@@ -445,8 +474,8 @@ async fn snap_marker_to_boundaries(source_path: &Path, marker: NewMediaMarker) -
         return marker;
     }
 
-    let snapped_start = nearest_point(start, &candidates, 8.0).unwrap_or(start);
-    let snapped_end = nearest_point(end, &candidates, 8.0).unwrap_or(end);
+    let snapped_start = nearest_point(start, &candidates, SNAP_SEARCH_SECONDS).unwrap_or(start);
+    let snapped_end = nearest_point(end, &candidates, SNAP_SEARCH_SECONDS).unwrap_or(end);
     if snapped_end <= snapped_start
         || !is_valid_marker_duration(&marker.marker_type, snapped_end - snapped_start)
     {
@@ -477,23 +506,27 @@ async fn detect_silence_points(
     start_seconds: f64,
     duration_seconds: f64,
 ) -> anyhow::Result<Vec<f64>> {
-    let output = tokio::process::Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-ss")
-        .arg(format!("{start_seconds:.3}"))
-        .arg("-t")
-        .arg(format!("{duration_seconds:.3}"))
-        .arg("-i")
-        .arg(source_path)
-        .arg("-map")
-        .arg("0:a:0")
-        .arg("-af")
-        .arg("silencedetect=noise=-35dB:d=0.25")
-        .arg("-f")
-        .arg("null")
-        .arg("-")
-        .output()
-        .await?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(SILENCE_BLACK_TIMEOUT_SECS),
+        tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-ss")
+            .arg(format!("{start_seconds:.3}"))
+            .arg("-t")
+            .arg(format!("{duration_seconds:.3}"))
+            .arg("-i")
+            .arg(source_path)
+            .arg("-map")
+            .arg("0:a:0")
+            .arg("-af")
+            .arg("silencedetect=noise=-32dB:d=0.25")
+            .arg("-f")
+            .arg("null")
+            .arg("-")
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ffmpeg silence detection timed out"))??;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -509,22 +542,26 @@ async fn detect_black_points(
     start_seconds: f64,
     duration_seconds: f64,
 ) -> anyhow::Result<Vec<f64>> {
-    let output = tokio::process::Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-ss")
-        .arg(format!("{start_seconds:.3}"))
-        .arg("-t")
-        .arg(format!("{duration_seconds:.3}"))
-        .arg("-i")
-        .arg(source_path)
-        .arg("-vf")
-        .arg("blackdetect=d=0.25:pic_th=0.98")
-        .arg("-an")
-        .arg("-f")
-        .arg("null")
-        .arg("-")
-        .output()
-        .await?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(SILENCE_BLACK_TIMEOUT_SECS),
+        tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-ss")
+            .arg(format!("{start_seconds:.3}"))
+            .arg("-t")
+            .arg(format!("{duration_seconds:.3}"))
+            .arg("-i")
+            .arg(source_path)
+            .arg("-vf")
+            .arg("blackdetect=d=0.25:pic_th=0.96")
+            .arg("-an")
+            .arg("-f")
+            .arg("null")
+            .arg("-")
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ffmpeg black detection timed out"))??;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -599,6 +636,43 @@ mod tests {
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].marker_type, "outro");
         assert!(markers[0].start_seconds >= 900.0);
+        assert!(markers[0].end_seconds > markers[0].start_seconds);
+    }
+
+    #[test]
+    fn marker_fingerprint_window_accepts_noisier_points() {
+        let generated_points = vec![0_u32; 180];
+        let existing_points = vec![0xff_u32; 180];
+        let generated = GeneratedFingerprint {
+            window_type: "intro".into(),
+            window_start_seconds: 0.0,
+            window_duration_seconds: 60.0,
+            fingerprint: fp(&generated_points),
+        };
+
+        let markers = compare_fingerprints(&generated, &[existing("intro", &existing_points)]);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].marker_type, "intro");
+        assert!(markers[0].end_seconds > markers[0].start_seconds);
+    }
+
+    #[test]
+    fn marker_fingerprint_window_bridges_short_mismatch_gap() {
+        let generated_points = vec![10_u32; 130];
+        let mut existing_points = generated_points.clone();
+        existing_points[50..53].fill(u32::MAX);
+        let generated = GeneratedFingerprint {
+            window_type: "intro".into(),
+            window_start_seconds: 0.0,
+            window_duration_seconds: 60.0,
+            fingerprint: fp(&generated_points),
+        };
+
+        let markers = compare_fingerprints(&generated, &[existing("intro", &existing_points)]);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].marker_type, "intro");
         assert!(markers[0].end_seconds > markers[0].start_seconds);
     }
 
