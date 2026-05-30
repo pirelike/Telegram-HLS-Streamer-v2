@@ -29,6 +29,8 @@ pub fn get_all_settings(conn: &Connection) -> Result<HashMap<String, String>> {
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     super::validate_setting_key(key)?;
     let value_type = setting_value_type(key)?;
+    let value = crate::settings_registry::normalize_str_for_key(key, value)
+        .map_err(|e| anyhow::anyhow!("invalid value for {key}: {e}"))?;
     conn.execute(
         "INSERT INTO settings(key, value, value_type, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, value_type=excluded.value_type, updated_at=CURRENT_TIMESTAMP",
@@ -42,6 +44,8 @@ pub fn set_settings(conn: &mut Connection, settings: &HashMap<String, String>) -
     for (key, value) in settings {
         super::validate_setting_key(key)?;
         let value_type = setting_value_type(key)?;
+        let value = crate::settings_registry::normalize_str_for_key(key, value)
+            .map_err(|e| anyhow::anyhow!("invalid value for {key}: {e}"))?;
         tx.execute(
             "INSERT INTO settings(key, value, value_type, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value, value_type=excluded.value_type, updated_at=CURRENT_TIMESTAMP",

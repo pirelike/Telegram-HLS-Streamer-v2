@@ -270,10 +270,11 @@ pub fn update_job_metadata_fields(
 pub fn get_job_source_bitrate_by_filename(
     conn: &Connection,
     filename: &str,
+    media_type: &str,
 ) -> Result<Option<i64>> {
     conn.query_row(
-        "SELECT source_bitrate FROM jobs WHERE filename = ?1 AND status = 'complete' ORDER BY created_at DESC LIMIT 1",
-        params![filename],
+        "SELECT source_bitrate FROM jobs WHERE filename = ?1 AND media_type = ?2 AND status = 'complete' ORDER BY created_at DESC LIMIT 1",
+        params![filename, media_type],
         |row| row.get(0),
     )
     .optional()
@@ -380,7 +381,10 @@ pub fn get_segments_for_job(conn: &Connection, job_id: &str) -> Result<Vec<Segme
 }
 
 pub fn delete_job(conn: &Connection, job_id: &str) -> Result<bool> {
-    Ok(conn.execute("DELETE FROM jobs WHERE job_id = ?1", params![job_id])? > 0)
+    let tx = conn.unchecked_transaction()?;
+    let deleted = tx.execute("DELETE FROM jobs WHERE job_id = ?1", params![job_id])? > 0;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 pub fn delete_old_jobs(conn: &Connection, older_than_days: i64) -> Result<usize> {
@@ -413,10 +417,14 @@ pub fn insert_job_marker(
     Ok(())
 }
 
-pub fn job_exists_active_by_filename(conn: &Connection, filename: &str) -> Result<bool> {
+pub fn job_exists_active_by_filename(
+    conn: &Connection,
+    filename: &str,
+    media_type: &str,
+) -> Result<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM jobs WHERE filename = ?1 AND status IN ('queued','downloading','analyzing','processing','uploading')",
-        params![filename],
+        "SELECT COUNT(*) FROM jobs WHERE filename = ?1 AND media_type = ?2 AND status IN ('queued','downloading','analyzing','processing','uploading')",
+        params![filename, media_type],
         |r| r.get(0),
     )?;
     Ok(count > 0)

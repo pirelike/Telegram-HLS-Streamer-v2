@@ -8,8 +8,9 @@ use rusqlite::{params, Connection};
 
 use super::models::{
     bool_to_i64, normalize_job_metadata, DatabaseBackupResult, DbExport, ExternalMetadataRow,
-    JobMetadataLinkRow, MediaFingerprintRow, MediaMarkerRow, MergeResult, NewJob,
-    PlaybackProgressRow, ReplaceDatabaseResult, SeriesMetadataLinkRow,
+    FavoriteRow, JobMetadataLinkRow, MediaFingerprintRow, MediaMarkerRow, MergeResult, NewJob,
+    PlaybackProgressRow, PreferenceRow, RatingRow, ReplaceDatabaseResult, SeriesMetadataLinkRow,
+    WatchlistRow,
 };
 use super::row_mapping::{
     external_metadata_from_row, job_from_row, job_metadata_link_from_row,
@@ -18,7 +19,10 @@ use super::row_mapping::{
     EXTERNAL_METADATA_SELECT_SQL, JOB_SELECT_SQL, SEGMENT_PART_SELECT_SQL, SEGMENT_SELECT_SQL,
     TRACK_SELECT_SQL,
 };
-use super::{current_schema_revision, init_db, validate_sqlite_header};
+use super::{
+    current_schema_revision, export_favorites, export_preferences, export_ratings, export_users,
+    export_watchlist, init_db, validate_sqlite_header,
+};
 
 pub fn export_to_dict(conn: &Connection) -> Result<DbExport> {
     let mut jobs_stmt =
@@ -61,6 +65,11 @@ pub fn export_to_dict(conn: &Connection) -> Result<DbExport> {
         playback_progress: export_playback_progress(conn)?,
         media_markers: export_media_markers(conn)?,
         media_fingerprints: export_media_fingerprints(conn)?,
+        users: export_users(conn)?,
+        user_favorites: export_favorites(conn)?,
+        user_watchlist: export_watchlist(conn)?,
+        user_ratings: export_ratings(conn)?,
+        user_preferences: export_preferences(conn)?,
     })
 }
 
@@ -88,7 +97,7 @@ fn export_series_metadata_links(conn: &Connection) -> Result<Vec<SeriesMetadataL
 
 fn export_playback_progress(conn: &Connection) -> Result<Vec<PlaybackProgressRow>> {
     let mut stmt = conn.prepare(
-        "SELECT client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at FROM playback_progress ORDER BY client_id ASC, job_id ASC",
+        "SELECT client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at FROM playback_progress ORDER BY COALESCE(user_id, client_id) ASC, job_id ASC",
     )?;
     let rows = stmt.query_map([], playback_progress_from_row)?;
     rows.map(|r| r.map_err(Into::into)).collect()
@@ -228,19 +237,49 @@ pub fn merge_from_export(
             ],
         )?;
     }
-    for progress in &export.playback_progress {
+    for user in &export.users {
         tx.execute(
-            "INSERT INTO playback_progress(client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(client_id, job_id) DO UPDATE SET
-                 position_seconds = excluded.position_seconds,
-                 duration_seconds = excluded.duration_seconds,
-                 progress_pct     = excluded.progress_pct,
-                 completed        = excluded.completed,
-                 updated_at       = excluded.updated_at
-             WHERE excluded.updated_at > playback_progress.updated_at",
-            params![progress.client_id, progress.job_id, progress.position_seconds, progress.duration_seconds, progress.progress_pct, { bool_to_i64(progress.completed) }, progress.updated_at],
+            "INSERT OR IGNORE INTO users(user_id, username, password_hash, is_admin, created_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                user.user_id,
+                user.username,
+                user.password_hash,
+                bool_to_i64(user.is_admin),
+                user.created_at,
+                user.last_seen_at
+            ],
         )?;
+    }
+    for progress in &export.playback_progress {
+        if progress.user_id.is_some() {
+            tx.execute(
+                "INSERT INTO playback_progress(client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(user_id, job_id) WHERE user_id IS NOT NULL DO UPDATE SET
+                     client_id         = excluded.client_id,
+                     position_seconds = excluded.position_seconds,
+                     duration_seconds = excluded.duration_seconds,
+                     progress_pct     = excluded.progress_pct,
+                     completed        = excluded.completed,
+                     updated_at       = excluded.updated_at
+                 WHERE excluded.updated_at > playback_progress.updated_at",
+                params![progress.client_id, progress.user_id, progress.job_id, progress.position_seconds, progress.duration_seconds, progress.progress_pct, { bool_to_i64(progress.completed) }, progress.updated_at],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO playback_progress(client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(client_id, job_id) DO UPDATE SET
+                     position_seconds = excluded.position_seconds,
+                     duration_seconds = excluded.duration_seconds,
+                     progress_pct     = excluded.progress_pct,
+                     completed        = excluded.completed,
+                     updated_at       = excluded.updated_at
+                 WHERE excluded.updated_at > playback_progress.updated_at",
+                params![progress.client_id, progress.job_id, progress.position_seconds, progress.duration_seconds, progress.progress_pct, { bool_to_i64(progress.completed) }, progress.updated_at],
+            )?;
+        }
     }
     for meta in &export.external_metadata {
         let target_id: i64 = tx.query_row(
@@ -304,6 +343,10 @@ pub fn merge_from_export(
             params![fp.job_id, fp.media_type, fp.series_name, fp.season_number, fp.window_type, fp.window_start_seconds, fp.window_duration_seconds, fp.duration_seconds, fp.fingerprint, fp.fingerprint_source, fp.created_at],
         )?;
     }
+    merge_user_favorites(&tx, &export.user_favorites)?;
+    merge_user_watchlist(&tx, &export.user_watchlist)?;
+    merge_user_ratings(&tx, &export.user_ratings)?;
+    merge_user_preferences(&tx, &export.user_preferences)?;
     tx.commit()?;
     Ok(MergeResult {
         merged_jobs,
@@ -375,6 +418,60 @@ fn split_segment_key(segment_key: &str) -> (&str, &str) {
         .unwrap_or(("legacy", segment_key))
 }
 
+fn merge_user_favorites(tx: &rusqlite::Transaction<'_>, rows: &[FavoriteRow]) -> Result<()> {
+    for row in rows {
+        tx.execute(
+            "INSERT OR IGNORE INTO user_favorites(user_id, job_id, added_at)
+             VALUES (?1, ?2, ?3)",
+            params![row.user_id, row.job_id, row.added_at],
+        )?;
+    }
+    Ok(())
+}
+
+fn merge_user_watchlist(tx: &rusqlite::Transaction<'_>, rows: &[WatchlistRow]) -> Result<()> {
+    for row in rows {
+        tx.execute(
+            "INSERT OR IGNORE INTO user_watchlist(user_id, job_id, added_at)
+             VALUES (?1, ?2, ?3)",
+            params![row.user_id, row.job_id, row.added_at],
+        )?;
+    }
+    Ok(())
+}
+
+fn merge_user_ratings(tx: &rusqlite::Transaction<'_>, rows: &[RatingRow]) -> Result<()> {
+    for row in rows {
+        tx.execute(
+            "INSERT INTO user_ratings(user_id, job_id, liked, rated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, job_id) DO UPDATE SET
+                liked = excluded.liked,
+                rated_at = excluded.rated_at
+             WHERE excluded.rated_at > user_ratings.rated_at",
+            params![
+                row.user_id,
+                row.job_id,
+                bool_to_i64(row.liked),
+                row.rated_at
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn merge_user_preferences(tx: &rusqlite::Transaction<'_>, rows: &[PreferenceRow]) -> Result<()> {
+    for row in rows {
+        tx.execute(
+            "INSERT INTO user_preferences(user_id, key, value)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+            params![row.user_id, row.key, row.value],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn replace_database_file(
     active_path: &Path,
     source_path: &Path,
@@ -393,15 +490,30 @@ pub fn replace_database_file(
     } else {
         fs::File::create(&backup_path).context("creating empty backup marker")?;
     }
-    remove_sqlite_sidecars(active_path)?;
-    fs::rename(source_path, active_path).context("installing replacement database")?;
-    let conn = init_db(active_path).context("opening replacement database")?;
-    let schema_revision = current_schema_revision(&conn)?;
-    conn.close().map_err(|(_, e)| anyhow!(e))?;
-    Ok(ReplaceDatabaseResult {
-        backup_path,
-        schema_revision,
-    })
+    // Attempt install; on any failure restore the backup so the active DB path is never empty.
+    let install_result: Result<i64> = (|| {
+        remove_sqlite_sidecars(active_path)?;
+        fs::rename(source_path, active_path).context("installing replacement database")?;
+        let conn = init_db(active_path).context("opening replacement database")?;
+        let revision = current_schema_revision(&conn)?;
+        conn.close().map_err(|(_, e)| anyhow!(e))?;
+        Ok(revision)
+    })();
+    match install_result {
+        Ok(schema_revision) => Ok(ReplaceDatabaseResult {
+            backup_path,
+            schema_revision,
+        }),
+        Err(e) => {
+            if let Err(restore_err) = fs::rename(&backup_path, active_path) {
+                tracing::error!(
+                    error = %restore_err,
+                    "failed to restore active database after install failure; server has no active database"
+                );
+            }
+            Err(e)
+        }
+    }
 }
 
 fn remove_sqlite_sidecars(path: &Path) -> Result<()> {

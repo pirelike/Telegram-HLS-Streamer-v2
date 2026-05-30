@@ -6,14 +6,16 @@ HTTP layer for THLS. This folder owns Axum routes, request/response shaping, bro
 
 | Module | Type | Responsibility | ~Lines |
 |---|---|---|---|
-| `mod.rs` | file | Router definition, `AppState`, health/metrics endpoints, shared API helpers. | 463 |
-| `auth.rs` | file | Lightweight auth/session helpers and constant-time credential comparison. | 89 |
-| `bots_settings.rs` | file | Settings CRUD and bot-management endpoints. | 504 |
+| `mod.rs` | file | Router definition, `AppState`, health/metrics endpoints, shared API helpers. | 496 |
+| `auth.rs` | file | Session-cookie/Basic-auth middleware, current-user extraction, and credential helpers. | 175 |
+| `bots_settings.rs` | file | Settings CRUD and bot-management endpoints. | 508 |
 | `db_transfer.rs` | file | DB export/import/backup/load HTTP handlers and request helpers. | 414 |
 | `db_transfer_replace.rs` | file | Import staging, merge, live replacement, and pool drain helpers. | 142 |
 | `db_transfer_sync.rs` | file | Automatic DB sync/bootstrap snapshot orchestration and Telegram upload. | 395 |
-| `frontend.rs` | file | Server-rendered page handlers, routing/resolution helpers, shell/chrome, slug helpers. | 372 |
-| `frontend_bodies.rs` | file | Per-page HTML body builders used by `frontend.rs`. | 421 |
+| `discovery.rs` | file | User-aware Next Up plus recently-added feed endpoints. | 100 |
+| `favorites.rs` | file | Per-user favorites toggle/list endpoints. | 76 |
+| `frontend.rs` | file | Server-rendered page handlers, routing/resolution helpers, shell/chrome, slug helpers. | 385 |
+| `frontend_bodies.rs` | file | Per-page HTML body builders used by `frontend.rs`. | 483 |
 | `ingest.rs` | file | URL ingest validation/download and enqueue flow. | 592 |
 | `jobs/` | dir | Job lifecycle and jobs REST API. Read `jobs/guide.md`. | ~2838 |
 | `markers.rs` | file | Media marker endpoint: intro/outro for Shaka skip UI. | 40 |
@@ -21,11 +23,15 @@ HTTP layer for THLS. This folder owns Axum routes, request/response shaping, bro
 | `playback/` | dir | Segment serving, cache, real/virtual segment fetches. Read `playback/guide.md`. | ~2731 |
 | `playlists.rs` | file | HLS master/media/subtitle/virtual playlist generation and thumbnail route. | 588 |
 | `playlists/` | dir | Playlist unit tests. | ~226 |
-| `progress.rs` | file | Browser-client playback progress persistence API. | 245 |
+| `preferences.rs` | file | Per-user playback preference get/patch endpoints. | 105 |
+| `progress.rs` | file | Browser/user-scoped playback progress persistence API. | 267 |
+| `ratings.rs` | file | Per-user thumbs up/down rating endpoints. | 95 |
 | `tests.rs` | file | Cross-API integration test module root. | 7 |
 | `tests/` | dir | Split integration test harness and feature clusters. | ~1759 |
-| `uploads.rs` | file | Chunked resumable upload protocol and pending-upload cleanup. | 764 |
-| `watch_folder.rs` | file | Watch-folder settings, scanning, and auto-enqueue flow. | 654 |
+| `uploads.rs` | file | Chunked resumable upload protocol and pending-upload cleanup. | 835 |
+| `users.rs` | file | Login/logout/me plus admin user CRUD endpoints. | 261 |
+| `watchlist.rs` | file | Per-user watchlist toggle/list endpoints. | 76 |
+| `watch_folder.rs` | file | Watch-folder settings, scanning, and auto-enqueue flow. | 680 |
 
 ## Key public items from `mod.rs`
 
@@ -75,6 +81,8 @@ The API layer may orchestrate other modules. Lower-level modules (`db`, `media`,
 | Add/change HLS playlist output | `playlists.rs`, then route in `mod.rs` if a new endpoint is needed. |
 | Change job metadata fields | `jobs/types.rs`, `jobs/handlers.rs`, and the DB model/query layer. |
 | Change HTML layout or page markup | `frontend.rs` and static assets if needed. |
+| Change login/session/user account APIs | `auth.rs`, `users.rs`, and `src/db/queries_users.rs`. |
+| Add/change per-user library actions | `favorites.rs`, `watchlist.rs`, `ratings.rs`, `preferences.rs`, and the matching DB query modules. |
 | Add external metadata provider | `metadata.rs` and `src/db/`. |
 | Change playback progress persistence | `progress.rs` and `src/db/`. |
 | Add media markers (intro/outro) | `markers.rs`, `src/media/markers.rs`, `src/db/`. |

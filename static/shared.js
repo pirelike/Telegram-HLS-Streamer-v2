@@ -203,3 +203,112 @@ function updateSidebar() {
     window.addEventListener('pagehide', () => clearInterval(globalPollTimer), { once: true });
     window.addEventListener('beforeunload', () => clearInterval(globalPollTimer), { once: true });
 })();
+
+// ─── Session auth and small user-data helpers ───────────────────────────────
+(function () {
+    const menu = document.getElementById('userMenu');
+    const btn = document.getElementById('userMenuBtn');
+    const popover = document.getElementById('userMenuPopover');
+    const nameEl = document.getElementById('userMenuName');
+    const logoutBtn = document.getElementById('logoutBtn');
+    const loginForm = document.getElementById('loginForm');
+    let currentUser = null;
+
+    window.THLSAuth = {
+        user: () => currentUser,
+        isSignedIn: () => !!currentUser,
+    };
+
+    async function loadMe() {
+        try {
+            const resp = await fetch('/api/auth/me');
+            if (!resp.ok) return null;
+            const data = await resp.json();
+            currentUser = data.authenticated ? data.user : null;
+            updateUserMenu();
+            return currentUser;
+        } catch {
+            return null;
+        }
+    }
+
+    function updateUserMenu() {
+        if (!menu || !nameEl || !logoutBtn) return;
+        if (currentUser) {
+            nameEl.textContent = currentUser.username || 'User';
+            logoutBtn.hidden = false;
+        } else {
+            nameEl.textContent = 'Signed out';
+            logoutBtn.hidden = true;
+        }
+    }
+
+    if (btn && popover) {
+        btn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            popover.classList.toggle('hidden');
+        });
+        document.addEventListener('click', (event) => {
+            if (!popover.contains(event.target) && event.target !== btn) {
+                popover.classList.add('hidden');
+            }
+        });
+    }
+
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', async () => {
+            await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+            window.location.href = '/login';
+        });
+    }
+
+    if (loginForm) {
+        loginForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const status = document.getElementById('loginStatus');
+            const submit = document.getElementById('loginSubmit');
+            if (status) status.textContent = '';
+            if (submit) submit.disabled = true;
+            try {
+                const resp = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: document.getElementById('loginUsername').value,
+                        password: document.getElementById('loginPassword').value,
+                    }),
+                });
+                if (!resp.ok) throw new Error('Invalid username or password');
+                window.location.href = '/';
+            } catch (error) {
+                if (status) status.textContent = error.message || 'Sign in failed';
+            } finally {
+                if (submit) submit.disabled = false;
+            }
+        });
+    }
+
+    window.THLSUserData = {
+        async toggleFavorite(jobId) {
+            const resp = await fetch('/api/favorites/' + encodeURIComponent(jobId), { method: 'POST' });
+            if (!resp.ok) throw new Error('Favorite update failed');
+            return resp.json();
+        },
+        async toggleWatchlist(jobId) {
+            const resp = await fetch('/api/watchlist/' + encodeURIComponent(jobId), { method: 'POST' });
+            if (!resp.ok) throw new Error('Watchlist update failed');
+            return resp.json();
+        },
+        async setRating(jobId, liked) {
+            const resp = await fetch('/api/ratings/' + encodeURIComponent(jobId), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: liked == null ? '' : JSON.stringify({ liked }),
+            });
+            if (!resp.ok) throw new Error('Rating update failed');
+            return resp.json();
+        },
+    };
+
+    loadMe();
+})();

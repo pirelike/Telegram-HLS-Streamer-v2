@@ -662,6 +662,7 @@ fn playback_progress_marks_completed_near_end() {
         &conn,
         &NewPlaybackProgress {
             client_id: "client1".into(),
+            user_id: None,
             job_id: "progress-job".into(),
             position_seconds: 960.0,
             duration_seconds: 1000.0,
@@ -669,12 +670,143 @@ fn playback_progress_marks_completed_near_end() {
     )
     .unwrap();
 
-    let progress = get_playback_progress(&conn, "client1", "progress-job")
+    let progress = get_playback_progress(&conn, "client1", None, "progress-job")
         .unwrap()
         .unwrap();
     assert!(progress.completed);
     assert_eq!(progress.progress_pct, 96);
-    assert!(list_playback_progress(&conn, "client1").unwrap().is_empty());
+    assert!(list_playback_progress(&conn, "client1", None)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn user_scoped_progress_overrides_client_id_across_devices() {
+    let path = temp_db_path("user_progress.db");
+    let mut conn = init_db(&path).unwrap();
+    save_job(
+        &mut conn,
+        &NewJob::complete("progress-job", "episode.mkv"),
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let password_hash = hash_password("secret").unwrap();
+    let user = create_user(&conn, "alice", &password_hash, false).unwrap();
+
+    save_playback_progress(
+        &conn,
+        &NewPlaybackProgress {
+            client_id: "device-a".into(),
+            user_id: Some(user.user_id.clone()),
+            job_id: "progress-job".into(),
+            position_seconds: 100.0,
+            duration_seconds: 1000.0,
+        },
+    )
+    .unwrap();
+    save_playback_progress(
+        &conn,
+        &NewPlaybackProgress {
+            client_id: "device-b".into(),
+            user_id: Some(user.user_id.clone()),
+            job_id: "progress-job".into(),
+            position_seconds: 220.0,
+            duration_seconds: 1000.0,
+        },
+    )
+    .unwrap();
+
+    let progress = get_playback_progress(&conn, "device-b", Some(&user.user_id), "progress-job")
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.position_seconds, 220.0);
+    assert_eq!(progress.progress_pct, 22);
+    assert_eq!(progress.user_id.as_deref(), Some(user.user_id.as_str()));
+    assert!(
+        get_playback_progress(&conn, "device-a", None, "progress-job")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn user_sessions_expire_and_are_ignored() {
+    let path = temp_db_path("user_sessions.db");
+    let conn = init_db(&path).unwrap();
+    let password_hash = hash_password("secret").unwrap();
+    let user = create_user(&conn, "alice", &password_hash, true).unwrap();
+    create_session(
+        &conn,
+        &user.user_id,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .unwrap();
+
+    assert!(get_session_user(
+        &conn,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    .unwrap()
+    .is_some());
+    conn.execute(
+        "UPDATE user_sessions SET expires_at = datetime('now', '-1 second')",
+        [],
+    )
+    .unwrap();
+
+    assert!(get_session_user(
+        &conn,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(delete_expired_sessions(&conn).unwrap(), 0);
+}
+
+#[test]
+fn user_data_toggle_and_rating_queries_work() {
+    let path = temp_db_path("user_data.db");
+    let mut conn = init_db(&path).unwrap();
+    save_job(
+        &mut conn,
+        &NewJob::complete("job1", "movie.mkv"),
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let password_hash = hash_password("secret").unwrap();
+    let user = create_user(&conn, "alice", &password_hash, false).unwrap();
+
+    assert!(toggle_favorite(&conn, &user.user_id, "job1").unwrap());
+    assert!(favorite_exists(&conn, &user.user_id, "job1").unwrap());
+    assert_eq!(list_favorites(&conn, &user.user_id).unwrap().len(), 1);
+    assert!(!toggle_favorite(&conn, &user.user_id, "job1").unwrap());
+    assert!(!favorite_exists(&conn, &user.user_id, "job1").unwrap());
+
+    assert!(toggle_watchlist(&conn, &user.user_id, "job1").unwrap());
+    assert!(watchlist_exists(&conn, &user.user_id, "job1").unwrap());
+    assert_eq!(list_watchlist(&conn, &user.user_id).unwrap().len(), 1);
+
+    set_rating(&conn, &user.user_id, "job1", true).unwrap();
+    assert!(
+        get_rating(&conn, &user.user_id, "job1")
+            .unwrap()
+            .unwrap()
+            .liked
+    );
+    assert_eq!(rating_summary(&conn, "job1").unwrap(), (1, 1));
+    set_rating(&conn, &user.user_id, "job1", false).unwrap();
+    assert!(
+        !get_rating(&conn, &user.user_id, "job1")
+            .unwrap()
+            .unwrap()
+            .liked
+    );
+    assert!(delete_rating(&conn, &user.user_id, "job1").unwrap());
+    assert!(get_rating(&conn, &user.user_id, "job1").unwrap().is_none());
 }
 
 #[test]

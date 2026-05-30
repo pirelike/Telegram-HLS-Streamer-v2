@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use serde_json::{json, Value};
 
-use super::frontend_bodies::{browse_body, settings_body, upload_body, watch_body};
+use super::frontend_bodies::{browse_body, login_body, settings_body, upload_body, watch_body};
 use super::{api_error, db_unavailable, valid_job_id, AppState};
 use crate::db;
 
@@ -109,6 +109,10 @@ pub(super) async fn handle_upload_page() -> Html<String> {
         "",
         r#"<script src="/static/upload.js?v=5"></script>"#,
     )
+}
+
+pub(super) async fn handle_login_page() -> Html<String> {
+    base_shell("Sign in - Telegram HLS Streamer", "", login_body(), "", "")
 }
 
 pub(super) async fn handle_settings_page() -> Html<String> {
@@ -303,6 +307,15 @@ fn base_shell(
             <i class="material-icons-round">add</i>
             <span class="upload-btn-text">Upload</span>
         </a>
+        <div class="user-menu" id="userMenu">
+            <button class="navbar-icon-btn" id="userMenuBtn" title="User">
+                <i class="material-icons-round">account_circle</i>
+            </button>
+            <div class="user-menu-popover hidden" id="userMenuPopover">
+                <div class="user-menu-name" id="userMenuName">Signed out</div>
+                <button class="user-menu-action" id="logoutBtn" type="button">Sign out</button>
+            </div>
+        </div>
         <button class="navbar-icon-btn" id="themeToggleBtn" title="Toggle theme">
             <i class="material-icons-round">contrast</i>
         </button>

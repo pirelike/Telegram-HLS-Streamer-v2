@@ -362,6 +362,26 @@ async fn claim_and_enqueue(
     })
     .await??;
 
+    let filename = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("watch-file")
+        .to_string();
+
+    // Check for active job BEFORE rename so the source stays in the watch root on dedup
+    {
+        let conn = state.db_conn().await?;
+        let filename_check = filename.clone();
+        let exists = tokio::task::spawn_blocking(move || {
+            crate::db::job_exists_active_by_filename(&conn, &filename_check, "Film")
+        })
+        .await??;
+        if exists {
+            tracing::info!(filename = %filename, "watch folder file already has an active job; skipping");
+            return Ok(());
+        }
+    }
+
     // Check if target already exists — protect against overwriting higher-quality files
     let target_exists = tokio::task::spawn_blocking({
         let target = target.clone();
@@ -369,8 +389,8 @@ async fn claim_and_enqueue(
     })
     .await?;
 
-    if target_exists {
-        // Run ffprobe on the new source to get its video bitrate
+    // Stage the existing done file (rather than deleting it) so we can restore on enqueue failure
+    let staged_backup: Option<PathBuf> = if target_exists {
         let source_path = source.clone();
         let new_analysis = crate::media::analyze_media(&source_path).await;
         let new_bitrate = match &new_analysis {
@@ -388,15 +408,10 @@ async fn claim_and_enqueue(
             }
         };
 
-        // Look up the existing job's source bitrate from DB
         let conn = state.db_conn().await?;
-        let filename_for_db = target
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("watch-file")
-            .to_string();
+        let filename_for_db = filename.clone();
         let existing_bitrate =
-            crate::db::get_job_source_bitrate_by_filename(&conn, &filename_for_db)?;
+            crate::db::get_job_source_bitrate_by_filename(&conn, &filename_for_db, "Film")?;
 
         match existing_bitrate {
             None => {
@@ -413,14 +428,17 @@ async fn claim_and_enqueue(
             }
             Some(existing) if new_bitrate > existing => {
                 tracing::info!(
-                    filename = %filename_for_db,
+                    filename = %filename,
                     new_bitrate,
                     existing_bitrate = existing,
-                    "watch file: new source has higher bitrate; overwriting existing done file"
+                    "watch file: new source has higher bitrate; staging existing done file for replacement"
                 );
-                // Remove old done file so rename can proceed
-                let target = target.clone();
-                tokio::task::spawn_blocking(move || std::fs::remove_file(&target)).await??;
+                let backup = target.with_extension("done.bak");
+                let target_clone = target.clone();
+                let backup_clone = backup.clone();
+                tokio::task::spawn_blocking(move || std::fs::rename(&target_clone, &backup_clone))
+                    .await??;
+                Some(backup)
             }
             Some(existing) => {
                 anyhow::bail!(
@@ -431,29 +449,23 @@ async fn claim_and_enqueue(
                 );
             }
         }
-    }
+    } else {
+        None
+    };
 
-    let filename = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("watch-file")
-        .to_string();
     let rename_target = target.clone();
     let source_clone = source.clone();
-    tokio::task::spawn_blocking(move || std::fs::rename(&source_clone, &rename_target)).await??;
-
-    // Skip if an active job already exists for this file (prevents re-enqueue after restart)
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || std::fs::rename(&source_clone, &rename_target)).await?
     {
-        let conn = state.db_conn().await?;
-        let filename_check = filename.clone();
-        let exists = tokio::task::spawn_blocking(move || {
-            crate::db::job_exists_active_by_filename(&conn, &filename_check)
-        })
-        .await??;
-        if exists {
-            tracing::info!(filename = %filename, "watch folder file already has an active job; skipping");
-            return Ok(());
+        if let Some(ref backup) = staged_backup {
+            let backup_clone = backup.clone();
+            let target_clone = target.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || std::fs::rename(&backup_clone, &target_clone))
+                    .await;
         }
+        return Err(e.into());
     }
 
     let enqueue_result = enqueue_job(
@@ -470,14 +482,28 @@ async fn claim_and_enqueue(
     )
     .await;
 
-    if let Err(e) = enqueue_result {
-        let source_clone = source.clone();
-        let target_clone = target.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::rename(&target_clone, &source_clone))
-            .await;
-        return Err(e);
+    match enqueue_result {
+        Ok(_) => {
+            if let Some(backup) = staged_backup {
+                let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(&backup)).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let source_clone = source.clone();
+            let target_clone = target.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || std::fs::rename(&target_clone, &source_clone))
+                    .await;
+            if let Some(backup) = staged_backup {
+                let target_clone = target.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || std::fs::rename(&backup, &target_clone))
+                        .await;
+            }
+            Err(e)
+        }
     }
-    Ok(())
 }
 
 fn validate_watch_paths(settings: &WatchSettings) -> Result<(PathBuf, PathBuf), String> {

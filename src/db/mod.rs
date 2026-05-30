@@ -6,7 +6,10 @@ mod queries;
 mod queries_library;
 mod queries_metadata;
 mod queries_playback;
+mod queries_ratings;
 mod queries_settings;
+mod queries_user_lists;
+mod queries_users;
 mod row_mapping;
 mod transfer;
 
@@ -15,7 +18,10 @@ pub use queries::*;
 pub use queries_library::*;
 pub use queries_metadata::*;
 pub use queries_playback::*;
+pub use queries_ratings::*;
 pub use queries_settings::*;
+pub use queries_user_lists::*;
+pub use queries_users::*;
 pub use transfer::*;
 
 use std::io::Read;
@@ -26,7 +32,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
-pub const LATEST_SCHEMA_REVISION: i64 = 27;
+pub const LATEST_SCHEMA_REVISION: i64 = 34;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 pub type DbConn = r2d2::PooledConnection<SqliteConnectionManager>;

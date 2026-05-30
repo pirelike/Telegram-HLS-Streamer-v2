@@ -1,6 +1,6 @@
 mod download;
 mod handlers;
-mod json;
+pub(super) mod json;
 pub(crate) mod processing;
 mod processing_lifecycle;
 mod processing_markers;

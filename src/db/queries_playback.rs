@@ -12,36 +12,73 @@ pub fn save_playback_progress(conn: &Connection, progress: &NewPlaybackProgress)
     };
     let pct = pct.clamp(0, 100);
     let completed = pct >= 95;
-    conn.execute(
-        "INSERT INTO playback_progress(client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
-         ON CONFLICT(client_id, job_id) DO UPDATE SET
-            position_seconds=excluded.position_seconds,
-            duration_seconds=excluded.duration_seconds,
-            progress_pct=excluded.progress_pct,
-            completed=excluded.completed,
-            updated_at=CURRENT_TIMESTAMP
-         WHERE excluded.position_seconds > playback_progress.position_seconds",
-        params![
-            progress.client_id,
-            progress.job_id,
-            progress.position_seconds,
-            progress.duration_seconds,
-            pct,
-            { bool_to_i64(completed) },
-        ],
-    )?;
+    if let Some(user_id) = progress.user_id.as_deref() {
+        let scoped_client_id = format!("u_{user_id}");
+        conn.execute(
+            "INSERT INTO playback_progress(client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)
+             ON CONFLICT(user_id, job_id) WHERE user_id IS NOT NULL DO UPDATE SET
+                client_id=excluded.client_id,
+                position_seconds=excluded.position_seconds,
+                duration_seconds=excluded.duration_seconds,
+                progress_pct=excluded.progress_pct,
+                completed=excluded.completed,
+                updated_at=CURRENT_TIMESTAMP",
+            params![
+                scoped_client_id,
+                user_id,
+                progress.job_id,
+                progress.position_seconds,
+                progress.duration_seconds,
+                pct,
+                { bool_to_i64(completed) },
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO playback_progress(client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+             ON CONFLICT(client_id, job_id) DO UPDATE SET
+                position_seconds=excluded.position_seconds,
+                duration_seconds=excluded.duration_seconds,
+                progress_pct=excluded.progress_pct,
+                completed=excluded.completed,
+                updated_at=CURRENT_TIMESTAMP",
+            params![
+                progress.client_id,
+                progress.job_id,
+                progress.position_seconds,
+                progress.duration_seconds,
+                pct,
+                { bool_to_i64(completed) },
+            ],
+        )?;
+    }
     Ok(())
 }
 
 pub fn get_playback_progress(
     conn: &Connection,
     client_id: &str,
+    user_id: Option<&str>,
     job_id: &str,
 ) -> Result<Option<PlaybackProgressRow>> {
+    if let Some(user_id) = user_id {
+        let user_progress = conn
+            .query_row(
+                "SELECT client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
+                 FROM playback_progress WHERE user_id = ?1 AND job_id = ?2",
+                params![user_id, job_id],
+                playback_progress_from_row,
+            )
+            .optional()?;
+        if user_progress.is_some() {
+            return Ok(user_progress);
+        }
+    }
     conn.query_row(
-        "SELECT client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
-         FROM playback_progress WHERE client_id = ?1 AND job_id = ?2",
+        "SELECT client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
+         FROM playback_progress WHERE client_id = ?1 AND user_id IS NULL AND job_id = ?2",
         params![client_id, job_id],
         playback_progress_from_row,
     )
@@ -52,21 +89,87 @@ pub fn get_playback_progress(
 pub fn list_playback_progress(
     conn: &Connection,
     client_id: &str,
+    user_id: Option<&str>,
 ) -> Result<Vec<PlaybackProgressRow>> {
+    if let Some(user_id) = user_id {
+        let mut stmt = conn.prepare(
+            "SELECT client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
+             FROM playback_progress WHERE user_id = ?1 AND completed = 0
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![user_id], playback_progress_from_row)?;
+        return rows.map(|r| r.map_err(Into::into)).collect();
+    }
     let mut stmt = conn.prepare(
-        "SELECT client_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
-         FROM playback_progress WHERE client_id = ?1 AND completed = 0
+        "SELECT client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
+         FROM playback_progress WHERE client_id = ?1 AND user_id IS NULL AND completed = 0
          ORDER BY updated_at DESC",
     )?;
     let rows = stmt.query_map(params![client_id], playback_progress_from_row)?;
     rows.map(|r| r.map_err(Into::into)).collect()
 }
 
-pub fn delete_playback_progress(conn: &Connection, client_id: &str, job_id: &str) -> Result<bool> {
+pub fn list_watch_history(conn: &Connection, user_id: &str) -> Result<Vec<PlaybackProgressRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT client_id, user_id, job_id, position_seconds, duration_seconds, progress_pct, completed, updated_at
+         FROM playback_progress WHERE user_id = ?1 AND completed = 1
+         ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map(params![user_id], playback_progress_from_row)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
+pub fn delete_playback_progress(
+    conn: &Connection,
+    client_id: &str,
+    user_id: Option<&str>,
+    job_id: &str,
+) -> Result<bool> {
+    if let Some(user_id) = user_id {
+        return Ok(conn.execute(
+            "DELETE FROM playback_progress WHERE user_id = ?1 AND job_id = ?2",
+            params![user_id, job_id],
+        )? > 0);
+    }
     Ok(conn.execute(
-        "DELETE FROM playback_progress WHERE client_id = ?1 AND job_id = ?2",
+        "DELETE FROM playback_progress WHERE client_id = ?1 AND user_id IS NULL AND job_id = ?2",
         params![client_id, job_id],
     )? > 0)
+}
+
+pub fn next_unwatched_episode(
+    conn: &Connection,
+    user_id: &str,
+    media_type: &str,
+    series_name: &str,
+) -> Result<Option<JobRow>> {
+    let sql = format!(
+        "{} WHERE media_type = ?1
+              AND series_name = ?2
+              AND is_series = 1
+              AND status = 'complete'
+              AND NOT EXISTS (
+                  SELECT 1 FROM playback_progress p
+                  WHERE p.user_id = ?3
+                    AND p.job_id = jobs.job_id
+                    AND p.completed = 1
+              )
+            ORDER BY
+              CASE WHEN season_number IS NULL THEN 1 ELSE 0 END ASC,
+              COALESCE(season_number, 0) ASC,
+              COALESCE(episode_number, 0) ASC,
+              COALESCE(part_number, 0) ASC,
+              created_at ASC
+            LIMIT 1",
+        JOB_SELECT_SQL
+    );
+    conn.query_row(
+        &sql,
+        params![media_type, series_name, user_id],
+        job_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 // --- Media markers ---

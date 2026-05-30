@@ -124,6 +124,27 @@ pub(super) fn upload_body() -> &'static str {
 </main>"##
 }
 
+pub(super) fn login_body() -> &'static str {
+    r#"<main class="main login-page" id="mainContent">
+    <div class="login-panel">
+        <div class="login-mark">TG</div>
+        <h1>Sign in</h1>
+        <form id="loginForm" class="login-form">
+            <label>
+                <span>Username</span>
+                <input class="t-input" id="loginUsername" name="username" autocomplete="username" required autofocus>
+            </label>
+            <label>
+                <span>Password</span>
+                <input class="t-input" id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+            </label>
+            <button class="t-btn t-btn--primary" type="submit" id="loginSubmit">Sign in</button>
+            <div class="settings-status" id="loginStatus"></div>
+        </form>
+    </div>
+</main>"#
+}
+
 pub(super) fn settings_body() -> &'static str {
     r#"<main class="main settings-page" id="mainContent">
 <div class="t-settings-layout">
@@ -141,6 +162,8 @@ pub(super) fn settings_body() -> &'static str {
     <a class="t-side__item" data-section="settings-metadata"><i class="material-icons-round">info</i> Metadata</a>
     <a class="t-side__item" data-section="settings-system"><i class="material-icons-round">tune</i> System</a>
     <a class="t-side__item" data-section="settings-cloudflared"><i class="material-icons-round">cloud</i> Cloudflared</a>
+    <div class="t-side__group">User</div>
+    <a class="t-side__item" data-section="settings-preferences"><i class="material-icons-round">person</i> Preferences</a>
   </aside>
 
   <main class="t-settings-main t-scroll" id="settingsMain">
@@ -280,6 +303,45 @@ pub(super) fn settings_body() -> &'static str {
     <section class="settings-section" id="settings-metadata" hidden></section>
     <section class="settings-section" id="settings-system" hidden></section>
     <section class="settings-section" id="settings-cloudflared" hidden></section>
+    <section class="settings-section" id="settings-preferences" hidden>
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <h2>Preferences</h2>
+          <div class="settings-group-sub">Playback defaults for the signed-in user.</div>
+        </div>
+        <div class="t-pane settings-pane">
+          <div class="settings-subhead">
+            <span>Player defaults</span>
+            <div class="subhead-actions">
+              <span class="settings-status subhead-status" id="preferencesStatus"></span>
+              <button class="subhead-save-btn" onclick="saveUserPreferences()">Save</button>
+            </div>
+          </div>
+          <div class="t-settings-row">
+            <div><div class="t-settings-row-label">Audio language</div><div class="t-settings-row-hint">ISO code such as jpn, eng, hun.</div></div>
+            <div><input class="t-input" id="prefAudioLanguage" placeholder="jpn"></div>
+          </div>
+          <div class="t-settings-row">
+            <div><div class="t-settings-row-label">Subtitle language</div><div class="t-settings-row-hint">Use off to disable subtitles by default.</div></div>
+            <div><input class="t-input" id="prefSubtitleLanguage" placeholder="eng"></div>
+          </div>
+          <div class="t-settings-row">
+            <div><div class="t-settings-row-label">Default quality</div><div class="t-settings-row-hint">auto or a tier label like 1080p.</div></div>
+            <div><input class="t-input" id="prefDefaultQuality" placeholder="auto"></div>
+          </div>
+          <div class="t-settings-row">
+            <div><div class="t-settings-row-label">Autoplay next</div><div class="t-settings-row-hint">Start the next episode automatically.</div></div>
+            <div><button class="t-switch" id="prefAutoplayNextSwitch" role="switch" aria-checked="false"></button></div>
+            <input type="checkbox" id="prefAutoplayNext" hidden>
+          </div>
+          <div class="t-settings-row">
+            <div><div class="t-settings-row-label">Skip intro</div><div class="t-settings-row-hint">Automatically skip intro markers when available.</div></div>
+            <div><button class="t-switch" id="prefSkipIntroSwitch" role="switch" aria-checked="false"></button></div>
+            <input type="checkbox" id="prefSkipIntro" hidden>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 </div>
 </main>

@@ -67,6 +67,7 @@ pub const SETTINGS: &[SettingSpec] = &[
     setting!("MAX_PARALLEL_ENCODES", "MAX_PARALLEL_ENCODES", "hardware", SettingType::Int, "2", "Max parallel video encodes per job.", Some(1), None),
     setting!("VIDEO_BITRATE", "VIDEO_BITRATE", "hardware", SettingType::Str, "4M", "Default video bitrate.", None, None),
     setting!("AUDIO_BITRATE", "AUDIO_BITRATE", "hardware", SettingType::Str, "128k", "Default audio bitrate.", None, None),
+    setting!("HLS_SEGMENT_DURATION", "HLS_SEGMENT_DURATION", "file_handling", SettingType::Int, "4", "Fallback HLS video segment duration in seconds for playlist rendering (not used during encoding).", Some(2), Some(10)),
     setting!("AUDIO_SEGMENT_DURATION", "AUDIO_SEGMENT_DURATION", "file_handling", SettingType::Int, "30", "Audio segment duration in seconds.", Some(1), None),
     setting!("ABR_ENABLED", "ABR_ENABLED", "adaptive_bitrate", SettingType::Bool, "true", "Produce eager ABR tiers.", None, None),
     setting!("ENABLE_COPY_MODE", "ENABLE_COPY_MODE", "adaptive_bitrate", SettingType::Bool, "true", "Enable tier-0 passthrough.", None, None),

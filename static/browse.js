@@ -250,11 +250,31 @@ function renderCard(j, type) {
             <div class="card-title">${title}</div>
             <div class="card-subtitle"><span class="dot"></span>${subtitleHtml}</div>
             <div class="player-actions" style="margin-top:0.75rem;display:flex;gap:0.5rem;">
+                <button class="action-btn icon-only" title="Favorite" onclick="event.preventDefault();event.stopPropagation();toggleFavorite('${safeId}', this)"><i class="material-icons-round">favorite</i></button>
+                <button class="action-btn icon-only" title="My List" onclick="event.preventDefault();event.stopPropagation();toggleWatchlist('${safeId}', this)"><i class="material-icons-round">bookmark_add</i></button>
                 <button class="action-btn" onclick="event.preventDefault();openEditModal('${safeId}')">Edit</button>
                 <button class="action-btn danger" onclick="event.preventDefault();deleteJob('${safeId}')">Delete</button>
             </div>
         </div>
     </a>`;
+}
+
+async function toggleFavorite(jobId, btn) {
+    try {
+        const data = await window.THLSUserData.toggleFavorite(jobId);
+        if (btn) btn.classList.toggle('active', !!data.favorite);
+    } catch (e) {
+        alert(e.message || 'Favorite update failed');
+    }
+}
+
+async function toggleWatchlist(jobId, btn) {
+    try {
+        const data = await window.THLSUserData.toggleWatchlist(jobId);
+        if (btn) btn.classList.toggle('active', !!data.watchlisted);
+    } catch (e) {
+        alert(e.message || 'Watchlist update failed');
+    }
 }
 
 // ─── Series detail (seasons view) ────────────────────────────────────────────

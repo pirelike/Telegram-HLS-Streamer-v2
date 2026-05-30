@@ -8,6 +8,20 @@ let currentMarkers = [];
 let skipBtn = null;
 let skipBtnAutoFade = null;
 let playerEventAbort = null;
+let playbackPrefs = {};
+let autoSkippedMarkers = new Set();
+
+async function loadPlaybackPreferences() {
+    try {
+        const resp = await fetch('/api/preferences');
+        if (!resp.ok) return {};
+        const data = await resp.json();
+        playbackPrefs = data.preferences || {};
+        return playbackPrefs;
+    } catch {
+        return {};
+    }
+}
 
 // ─── Watch progress persistence (used by home "Continue Watching") ────────────
 const THLS_PROGRESS_KEY = 'thls_progress_v1';
@@ -107,6 +121,15 @@ function updateSkipButton() {
         if (skipBtn) skipBtn.classList.remove('visible');
         return;
     }
+    const markerKey = `${marker.marker_type}:${marker.start_seconds}:${marker.end_seconds}`;
+    if (playbackPrefs.skip_intro === '1' && !autoSkippedMarkers.has(markerKey)) {
+        const video = document.getElementById('videoEl');
+        if (video) {
+            autoSkippedMarkers.add(markerKey);
+            video.currentTime = marker.end_seconds;
+            return;
+        }
+    }
     ensureSkipButton();
     const label = marker.marker_type === 'outro' || marker.marker_type === 'credits'
         ? 'Skip credits'
@@ -145,6 +168,8 @@ function getBufferConfig(overrideBufferConfig = null) {
 async function initPlayer(job, overrideBufferConfig = null) {
     currentJob = job;
     attemptedQuotaRecovery = Boolean(overrideBufferConfig);
+    autoSkippedMarkers = new Set();
+    const prefs = await loadPlaybackPreferences();
     const videoEl = document.getElementById('videoEl');
     const m3u8Url = `${window.location.origin}/hls/${job.job_id}/master.m3u8`;
     const bufferConfig = getBufferConfig(overrideBufferConfig);
@@ -200,8 +225,8 @@ async function initPlayer(job, overrideBufferConfig = null) {
             abr: {
                 defaultBandwidthEstimate: bufferConfig.defaultBandwidthEstimate,
             },
-            preferredAudioLanguage: 'und',
-            preferredTextLanguage: '',
+            preferredAudioLanguage: prefs.audio_language || 'und',
+            preferredTextLanguage: prefs.subtitle_language === 'off' ? '' : (prefs.subtitle_language || ''),
         });
 
         player.addEventListener('error', async e => {
@@ -276,6 +301,11 @@ async function initPlayer(job, overrideBufferConfig = null) {
         videoEl.addEventListener('ended', () => {
             saveProgress(job.job_id, videoEl.duration, videoEl.duration);
             serverSaveProgress(job.job_id, videoEl.duration, videoEl.duration);
+            if (playbackPrefs.autoplay_next === '1') {
+                const idx = currentSiblings.findIndex(s => s.job_id === job.job_id);
+                const next = idx >= 0 ? currentSiblings[idx + 1] : null;
+                if (next) window.location.href = '/watch/' + encodeURIComponent(next.job_id);
+            }
         }, playerEventOptions);
         videoEl.addEventListener('pause', () => {
             serverSaveProgress(job.job_id, videoEl.currentTime, videoEl.duration || job.duration || 0);
@@ -369,6 +399,18 @@ function renderInfoPanel(job) {
             <button class="t-btn t-btn--primary" onclick="document.getElementById('videoEl').play()">
                 ${resumeIcon} ${resumeLabel}
             </button>
+            <button class="t-btn t-btn--ghost" onclick="toggleWatchFavorite('${safeId}', this)" title="Favorite">
+                <i class="material-icons-round" style="font-size:16px">favorite</i> Favorite
+            </button>
+            <button class="t-btn t-btn--ghost" onclick="toggleWatchlistItem('${safeId}', this)" title="My List">
+                <i class="material-icons-round" style="font-size:16px">bookmark_add</i> My List
+            </button>
+            <button class="t-btn t-btn--ghost" onclick="rateWatchItem('${safeId}', true, this)" title="Like">
+                <i class="material-icons-round" style="font-size:16px">thumb_up</i>
+            </button>
+            <button class="t-btn t-btn--ghost" onclick="rateWatchItem('${safeId}', false, this)" title="Dislike">
+                <i class="material-icons-round" style="font-size:16px">thumb_down</i>
+            </button>
             <button class="t-btn t-btn--ghost" onclick="copyPlayerUrl()" title="Copy M3U8">
                 <i class="material-icons-round" style="font-size:16px">link</i> Copy M3U8
             </button>
@@ -401,6 +443,33 @@ function renderInfoPanel(job) {
                  onclick="openEditModal('${safeId}')">Edit metadata</button>`;
 
     renderMoreLikeThis(job);
+}
+
+async function toggleWatchFavorite(jobId, btn) {
+    try {
+        const data = await window.THLSUserData.toggleFavorite(jobId);
+        if (btn) btn.classList.toggle('active', !!data.favorite);
+    } catch (e) {
+        alert(e.message || 'Favorite update failed');
+    }
+}
+
+async function toggleWatchlistItem(jobId, btn) {
+    try {
+        const data = await window.THLSUserData.toggleWatchlist(jobId);
+        if (btn) btn.classList.toggle('active', !!data.watchlisted);
+    } catch (e) {
+        alert(e.message || 'Watchlist update failed');
+    }
+}
+
+async function rateWatchItem(jobId, liked, btn) {
+    try {
+        await window.THLSUserData.setRating(jobId, liked);
+        if (btn) btn.classList.add('active');
+    } catch (e) {
+        alert(e.message || 'Rating update failed');
+    }
 }
 
 function renderMoreLikeThis(job) {

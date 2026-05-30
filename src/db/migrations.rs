@@ -145,6 +145,41 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         name: "add_jobs_source_bitrate",
         run: run_migration_27,
     },
+    Migration {
+        revision: 28,
+        name: "add_users_table",
+        run: run_migration_28,
+    },
+    Migration {
+        revision: 29,
+        name: "add_user_sessions_table",
+        run: run_migration_29,
+    },
+    Migration {
+        revision: 30,
+        name: "add_user_scoped_playback_progress",
+        run: run_migration_30,
+    },
+    Migration {
+        revision: 31,
+        name: "add_user_favorites",
+        run: run_migration_31,
+    },
+    Migration {
+        revision: 32,
+        name: "add_user_watchlist",
+        run: run_migration_32,
+    },
+    Migration {
+        revision: 33,
+        name: "add_user_ratings",
+        run: run_migration_33,
+    },
+    Migration {
+        revision: 34,
+        name: "add_user_preferences",
+        run: run_migration_34,
+    },
 ];
 
 // Public wrappers for test access
@@ -228,6 +263,27 @@ pub(crate) fn run_migration_26(conn: &Connection) -> Result<()> {
 }
 pub(crate) fn run_migration_27(conn: &Connection) -> Result<()> {
     migration_27_add_jobs_source_bitrate(conn)
+}
+pub(crate) fn run_migration_28(conn: &Connection) -> Result<()> {
+    migration_28_add_users_table(conn)
+}
+pub(crate) fn run_migration_29(conn: &Connection) -> Result<()> {
+    migration_29_add_user_sessions_table(conn)
+}
+pub(crate) fn run_migration_30(conn: &Connection) -> Result<()> {
+    migration_30_add_user_scoped_playback_progress(conn)
+}
+pub(crate) fn run_migration_31(conn: &Connection) -> Result<()> {
+    migration_31_add_user_favorites(conn)
+}
+pub(crate) fn run_migration_32(conn: &Connection) -> Result<()> {
+    migration_32_add_user_watchlist(conn)
+}
+pub(crate) fn run_migration_33(conn: &Connection) -> Result<()> {
+    migration_33_add_user_ratings(conn)
+}
+pub(crate) fn run_migration_34(conn: &Connection) -> Result<()> {
+    migration_34_add_user_preferences(conn)
 }
 
 fn table_sql_contains(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
@@ -379,7 +435,13 @@ fn validate_table_name(table: &str) -> Result<&str> {
         | "series_metadata_links"
         | "playback_progress"
         | "media_markers"
-        | "media_fingerprints" => Ok(table),
+        | "media_fingerprints"
+        | "users"
+        | "user_sessions"
+        | "user_favorites"
+        | "user_watchlist"
+        | "user_ratings"
+        | "user_preferences" => Ok(table),
         _ => bail!("unknown sqlite table: {table}"),
     }
 }
@@ -471,7 +533,16 @@ fn validate_column_name(column: &str) -> Result<&str> {
         | "window_start_seconds"
         | "window_duration_seconds"
         | "fingerprint"
-        | "fingerprint_source" => Ok(column),
+        | "fingerprint_source"
+        | "user_id"
+        | "username"
+        | "password_hash"
+        | "is_admin"
+        | "last_seen_at"
+        | "expires_at"
+        | "added_at"
+        | "liked"
+        | "rated_at" => Ok(column),
         _ => bail!("unknown sqlite column: {column}"),
     }
 }
@@ -1319,6 +1390,109 @@ fn migration_26_add_telegram_encryption_nonces(conn: &Connection) -> Result<()> 
 
 fn migration_27_add_jobs_source_bitrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "jobs", "source_bitrate", "INTEGER NOT NULL DEFAULT 0")
+}
+
+fn migration_28_add_users_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0,1)),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TIMESTAMP
+        );",
+    )?;
+    Ok(())
+}
+
+fn migration_29_add_user_sessions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_sessions (
+            token TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_user
+            ON user_sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_expires
+            ON user_sessions(expires_at);",
+    )?;
+    Ok(())
+}
+
+fn migration_30_add_user_scoped_playback_progress(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "playback_progress",
+        "user_id",
+        "TEXT REFERENCES users(user_id) ON DELETE CASCADE",
+    )?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_playback_progress_user_job
+            ON playback_progress(user_id, job_id)
+            WHERE user_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_playback_progress_user_updated
+            ON playback_progress(user_id, updated_at DESC)
+            WHERE user_id IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+fn migration_31_add_user_favorites(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_favorites (
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, job_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_favorites_added
+            ON user_favorites(user_id, added_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn migration_32_add_user_watchlist(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_watchlist (
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, job_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_watchlist_added
+            ON user_watchlist(user_id, added_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn migration_33_add_user_ratings(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_ratings (
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            liked INTEGER NOT NULL CHECK (liked IN (0,1)),
+            rated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, job_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_ratings_job
+            ON user_ratings(job_id);",
+    )?;
+    Ok(())
+}
+
+fn migration_34_add_user_preferences(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_preferences (
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (user_id, key)
+        );",
+    )?;
+    Ok(())
 }
 
 fn backfill_segment_key_parts(conn: &Connection, table: &str) -> Result<()> {

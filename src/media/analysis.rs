@@ -6,19 +6,26 @@ use tokio::process::Command;
 
 use super::models::{AudioStream, MediaAnalysis, SubtitleStream, VideoStream};
 
+const ANALYZE_TIMEOUT_SECS: u64 = 60;
+
 pub async fn analyze_media(path: &Path) -> Result<MediaAnalysis> {
-    let output = Command::new("ffprobe")
-        .arg("-v")
-        .arg("error")
-        .arg("-show_format")
-        .arg("-show_streams")
-        .arg("-show_chapters")
-        .arg("-print_format")
-        .arg("json")
-        .arg(path)
-        .output()
-        .await
-        .context("running ffprobe")?;
+    let path_owned = path.to_path_buf();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(ANALYZE_TIMEOUT_SECS),
+        Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-show_format")
+            .arg("-show_streams")
+            .arg("-show_chapters")
+            .arg("-print_format")
+            .arg("json")
+            .arg(&path_owned)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ffprobe analysis timed out after {ANALYZE_TIMEOUT_SECS}s"))?
+    .context("running ffprobe")?;
     if !output.status.success() {
         bail!(
             "ffprobe failed: {}",
