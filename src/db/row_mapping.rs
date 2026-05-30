@@ -131,12 +131,13 @@ pub(super) fn playback_progress_from_row(
 ) -> rusqlite::Result<PlaybackProgressRow> {
     Ok(PlaybackProgressRow {
         client_id: row.get(0)?,
-        job_id: row.get(1)?,
-        position_seconds: row.get(2)?,
-        duration_seconds: row.get(3)?,
-        progress_pct: row.get(4)?,
-        completed: row.get::<_, i64>(5)? == 1,
-        updated_at: row.get(6)?,
+        user_id: row.get(1)?,
+        job_id: row.get(2)?,
+        position_seconds: row.get(3)?,
+        duration_seconds: row.get(4)?,
+        progress_pct: row.get(5)?,
+        completed: row.get::<_, i64>(6)? == 1,
+        updated_at: row.get(7)?,
     })
 }
 

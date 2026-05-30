@@ -3,10 +3,11 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use super::auth::AuthUser;
 use super::{api_error, db_unavailable, valid_job_id, AppState};
 use crate::db;
 
@@ -17,9 +18,11 @@ pub struct ProgressQuery {
 
 pub async fn handle_list_progress(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthUser>>,
     Query(query): Query<ProgressQuery>,
 ) -> Response {
-    let client_id = match validate_client_id_param(query.client_id) {
+    let user_id = auth.as_ref().map(|Extension(user)| user.user_id.clone());
+    let client_id = match validate_client_id_param(query.client_id, user_id.is_some()) {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -29,7 +32,11 @@ pub async fn handle_list_progress(
         Err(e) => return db_unavailable(e),
     };
     let cid = client_id.clone();
-    let result = tokio::task::spawn_blocking(move || db::list_playback_progress(&conn, &cid)).await;
+    let uid = user_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db::list_playback_progress(&conn, &cid, uid.as_deref())
+    })
+    .await;
     match result {
         Ok(Ok(progress)) => {
             Json(json!({ "progress": progress, "client_id": client_id })).into_response()
@@ -49,13 +56,15 @@ pub async fn handle_list_progress(
 
 pub async fn handle_get_progress(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthUser>>,
     Path(job_id): Path<String>,
     Query(query): Query<ProgressQuery>,
 ) -> Response {
     if !valid_job_id(&job_id) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_job_id", "invalid job id");
     }
-    let client_id = match validate_client_id_param(query.client_id) {
+    let user_id = auth.as_ref().map(|Extension(user)| user.user_id.clone());
+    let client_id = match validate_client_id_param(query.client_id, user_id.is_some()) {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -65,9 +74,12 @@ pub async fn handle_get_progress(
         Err(e) => return db_unavailable(e),
     };
     let cid = client_id.clone();
+    let uid = user_id.clone();
     let jid = job_id.clone();
-    let result =
-        tokio::task::spawn_blocking(move || db::get_playback_progress(&conn, &cid, &jid)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        db::get_playback_progress(&conn, &cid, uid.as_deref(), &jid)
+    })
+    .await;
     match result {
         Ok(Ok(Some(progress))) => {
             Json(json!({ "progress": progress, "client_id": client_id })).into_response()
@@ -88,6 +100,7 @@ pub async fn handle_get_progress(
 
 pub async fn handle_save_progress(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthUser>>,
     Path(job_id): Path<String>,
     Json(body): Json<Map<String, Value>>,
 ) -> Response {
@@ -95,8 +108,10 @@ pub async fn handle_save_progress(
         return api_error(StatusCode::BAD_REQUEST, "invalid_job_id", "invalid job id");
     }
 
+    let user_id = auth.as_ref().map(|Extension(user)| user.user_id.clone());
     let client_id = match extract_string(&body, "client_id") {
         Some(id) if !id.is_empty() => id,
+        _ if user_id.is_some() => String::new(),
         _ => {
             return api_error(
                 StatusCode::BAD_REQUEST,
@@ -105,7 +120,7 @@ pub async fn handle_save_progress(
             )
         }
     };
-    if !valid_client_id(&client_id) {
+    if !client_id.is_empty() && !valid_client_id(&client_id) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_client_id",
@@ -137,6 +152,7 @@ pub async fn handle_save_progress(
 
     let progress = db::NewPlaybackProgress {
         client_id,
+        user_id,
         job_id: job_id.clone(),
         position_seconds,
         duration_seconds,
@@ -165,13 +181,15 @@ pub async fn handle_save_progress(
 
 pub async fn handle_delete_progress(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthUser>>,
     Path(job_id): Path<String>,
     Query(query): Query<ProgressQuery>,
 ) -> Response {
     if !valid_job_id(&job_id) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_job_id", "invalid job id");
     }
-    let client_id = match validate_client_id_param(query.client_id) {
+    let user_id = auth.as_ref().map(|Extension(user)| user.user_id.clone());
+    let client_id = match validate_client_id_param(query.client_id, user_id.is_some()) {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -181,9 +199,12 @@ pub async fn handle_delete_progress(
         Err(e) => return db_unavailable(e),
     };
     let cid = client_id.clone();
+    let uid = user_id.clone();
     let jid = job_id.clone();
-    let result =
-        tokio::task::spawn_blocking(move || db::delete_playback_progress(&conn, &cid, &jid)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        db::delete_playback_progress(&conn, &cid, uid.as_deref(), &jid)
+    })
+    .await;
     match result {
         Ok(Ok(deleted)) => Json(json!({ "deleted": deleted })).into_response(),
         Ok(Err(e)) => api_error(
@@ -200,9 +221,10 @@ pub async fn handle_delete_progress(
 }
 
 #[allow(clippy::result_large_err)] // Response is pre-built axum type; boxing would require callers to unbox
-fn validate_client_id_param(value: Option<String>) -> Result<String, Response> {
+fn validate_client_id_param(value: Option<String>, optional: bool) -> Result<String, Response> {
     let id = match value.filter(|s| !s.is_empty()) {
         Some(id) => id,
+        None if optional => String::new(),
         None => {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
@@ -211,7 +233,7 @@ fn validate_client_id_param(value: Option<String>) -> Result<String, Response> {
             ))
         }
     };
-    if !valid_client_id(&id) {
+    if !id.is_empty() && !valid_client_id(&id) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_client_id",

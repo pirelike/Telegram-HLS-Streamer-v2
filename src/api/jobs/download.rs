@@ -48,11 +48,12 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
         } else {
             None
         };
-        Ok::<_, anyhow::Error>((job, tracks, segment_count, ext_meta))
+        let rating_summary = db::rating_summary(&conn, &job_id_clone).unwrap_or((0, 0));
+        Ok::<_, anyhow::Error>((job, tracks, segment_count, ext_meta, rating_summary))
     })
     .await;
 
-    let (job_opt, tracks, segment_count, ext_meta) = match db_result {
+    let (job_opt, tracks, segment_count, ext_meta, rating_summary) = match db_result {
         Ok(Ok(val)) => val,
         Ok(Err(e)) => {
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())
@@ -132,6 +133,11 @@ pub(super) async fn full_job_response(state: &AppState, job_id: &str) -> Respons
         "external_ids": external_ids,
         "feature_flags": {
             "tac_comments_enabled": cfg.tac_comments_enabled,
+        },
+        "ratings": {
+            "likes": rating_summary.0,
+            "total": rating_summary.1,
+            "like_pct": if rating_summary.1 > 0 { Some((rating_summary.0 * 100) / rating_summary.1) } else { None },
         },
     }))
     .into_response()

@@ -91,6 +91,7 @@ function sectionDescription(sectionId) {
     if (sectionId === 'settings-system')      return 'Reliability, rate limiting, and hardware acceleration.';
     if (sectionId === 'settings-cloudflared') return 'Cloudflared tunnel configuration.';
     if (sectionId === 'settings-metadata')   return 'External metadata providers (TMDB for movies/TV, AniList for anime — AniList needs no key), intro/outro detection, and community comments.';
+    if (sectionId === 'settings-preferences') return 'Playback defaults for your user account.';
     return 'Configure server behaviour. Changes save per section.';
 }
 
@@ -979,9 +980,90 @@ function escHtml(str) {
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ─── User preferences ────────────────────────────────────────────────────────
+
+function setupPreferenceSwitch(id, checkboxId) {
+    const sw = document.getElementById(id);
+    const cb = document.getElementById(checkboxId);
+    if (!sw || !cb) return;
+    sw.onclick = () => {
+        cb.checked = !cb.checked;
+        sw.setAttribute('aria-checked', cb.checked ? 'true' : 'false');
+    };
+}
+
+function applyPreferenceSwitch(id, checkboxId, enabled) {
+    const sw = document.getElementById(id);
+    const cb = document.getElementById(checkboxId);
+    if (!sw || !cb) return;
+    cb.checked = !!enabled;
+    sw.setAttribute('aria-checked', cb.checked ? 'true' : 'false');
+}
+
+function loadUserPreferences() {
+    const status = document.getElementById('preferencesStatus');
+    fetch('/api/preferences')
+        .then(async r => {
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(data.error || 'Could not load preferences');
+            return data.preferences || {};
+        })
+        .then(prefs => {
+            const audio = document.getElementById('prefAudioLanguage');
+            const sub = document.getElementById('prefSubtitleLanguage');
+            const quality = document.getElementById('prefDefaultQuality');
+            if (audio) audio.value = prefs.audio_language || '';
+            if (sub) sub.value = prefs.subtitle_language || '';
+            if (quality) quality.value = prefs.default_quality || 'auto';
+            applyPreferenceSwitch('prefAutoplayNextSwitch', 'prefAutoplayNext', prefs.autoplay_next === '1');
+            applyPreferenceSwitch('prefSkipIntroSwitch', 'prefSkipIntro', prefs.skip_intro === '1');
+        })
+        .catch(err => {
+            if (status) {
+                status.textContent = err.message || 'Could not load preferences';
+                status.className = 'settings-status error';
+            }
+        });
+}
+
+function saveUserPreferences() {
+    const status = document.getElementById('preferencesStatus');
+    const payload = {
+        audio_language: document.getElementById('prefAudioLanguage')?.value || '',
+        subtitle_language: document.getElementById('prefSubtitleLanguage')?.value || '',
+        default_quality: document.getElementById('prefDefaultQuality')?.value || 'auto',
+        autoplay_next: document.getElementById('prefAutoplayNext')?.checked ? '1' : '0',
+        skip_intro: document.getElementById('prefSkipIntro')?.checked ? '1' : '0',
+    };
+    if (status) {
+        status.textContent = 'Saving...';
+        status.className = 'settings-status';
+    }
+    fetch('/api/preferences', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }).then(async r => {
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || 'Could not save preferences');
+        if (status) {
+            status.textContent = 'Saved';
+            status.className = 'settings-status ok';
+        }
+    }).catch(err => {
+        if (status) {
+            status.textContent = err.message || 'Could not save preferences';
+            status.className = 'settings-status error';
+        }
+    });
+}
+
 // ─── Init ──────────────────────────────────────────────────────────────────────
 
 loadSettings();
 loadBots();
 loadWatchSettings();
 setupWatchSwitch();
+setupPreferenceSwitch('prefAutoplayNextSwitch', 'prefAutoplayNext');
+setupPreferenceSwitch('prefSkipIntroSwitch', 'prefSkipIntro');
+loadUserPreferences();

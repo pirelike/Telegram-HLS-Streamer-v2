@@ -144,7 +144,7 @@
                '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">' +
                '<path d="M7 5.5v13l11-6.5z"/></svg> Play' +
              '</a>' +
-             '<button class="t-btn t-btn--ghost" type="button">' +
+             '<button class="t-btn t-btn--ghost" type="button" onclick="window.THLSUserData&&THLSUserData.toggleWatchlist(\'' + escAttr(j.job_id) + '\').then(d=>this.classList.toggle(\'active\',!!d.watchlisted)).catch(e=>alert(e.message))">' +
                '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
                '<path d="M12 5v14"/><path d="M5 12h14"/></svg> Watchlist' +
              '</button>' +
@@ -155,6 +155,8 @@
   async function renderRows(recent, films, series, animeFilms, animeTv) {
     // Fetch server-side playback progress.
     let serverProgress = {};
+    let favorites = [];
+    let watchlist = [];
     try {
       let clientId = localStorage.getItem('thls_client_id_v1');
       if (clientId) {
@@ -166,6 +168,14 @@
           }
         }
       }
+    } catch {}
+    try {
+      const [favResp, listResp] = await Promise.all([
+        fetch('/api/favorites'),
+        fetch('/api/watchlist')
+      ]);
+      if (favResp.ok) favorites = (await favResp.json()).jobs || [];
+      if (listResp.ok) watchlist = (await listResp.json()).jobs || [];
     } catch {}
 
     // Merge persisted localStorage progress with server progress.
@@ -201,6 +211,8 @@
     const rows  = [];
 
     if (cw.length)     rows.push(rowHtml('Continue Watching', cw,     'video'));
+    if (watchlist.length) rows.push(rowHtml('My List', watchlist, 'video'));
+    if (favorites.length) rows.push(rowHtml('Favorites', favorites, 'video'));
     if (recent.length) rows.push(rowHtml('Recently Added',    annotated, 'video'));
     if (films.length)  rows.push(rowHtml('Films',  films,  'video',  '/films'));
     if (series.length) rows.push(rowHtml('Series', series, 'series', '/series'));
@@ -257,6 +269,10 @@
              '<div class="card-meta">' +
                '<div class="card-title">' + title + '</div>' +
                '<div class="card-subtitle">' + subHtml + '</div>' +
+               '<div class="player-actions" style="margin-top:0.75rem;display:flex;gap:0.5rem;">' +
+                 '<button class="action-btn icon-only" title="Favorite" onclick="event.preventDefault();event.stopPropagation();window.THLSUserData&&THLSUserData.toggleFavorite(\'' + safeId + '\').then(d=>this.classList.toggle(\'active\',!!d.favorite)).catch(e=>alert(e.message))"><i class="material-icons-round">favorite</i></button>' +
+                 '<button class="action-btn icon-only" title="My List" onclick="event.preventDefault();event.stopPropagation();window.THLSUserData&&THLSUserData.toggleWatchlist(\'' + safeId + '\').then(d=>this.classList.toggle(\'active\',!!d.watchlisted)).catch(e=>alert(e.message))"><i class="material-icons-round">bookmark_add</i></button>' +
+               '</div>' +
              '</div>' +
            '</a>';
   }

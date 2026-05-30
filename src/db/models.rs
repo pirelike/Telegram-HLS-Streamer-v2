@@ -295,6 +295,16 @@ pub struct DbExport {
     pub media_markers: Vec<MediaMarkerRow>,
     #[serde(default)]
     pub media_fingerprints: Vec<MediaFingerprintRow>,
+    #[serde(default)]
+    pub users: Vec<UserRow>,
+    #[serde(default)]
+    pub user_favorites: Vec<FavoriteRow>,
+    #[serde(default)]
+    pub user_watchlist: Vec<WatchlistRow>,
+    #[serde(default)]
+    pub user_ratings: Vec<RatingRow>,
+    #[serde(default)]
+    pub user_preferences: Vec<PreferenceRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -384,6 +394,8 @@ pub struct SeriesMetadataLinkRow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlaybackProgressRow {
     pub client_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub job_id: String,
     pub position_seconds: f64,
     pub duration_seconds: f64,
@@ -395,9 +407,65 @@ pub struct PlaybackProgressRow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NewPlaybackProgress {
     pub client_id: String,
+    pub user_id: Option<String>,
     pub job_id: String,
     pub position_seconds: f64,
     pub duration_seconds: f64,
+}
+
+// --- Users and per-user data ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserRow {
+    pub user_id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub is_admin: bool,
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionRow {
+    pub token: String,
+    pub user_id: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FavoriteRow {
+    pub user_id: String,
+    pub job_id: String,
+    pub added_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatchlistRow {
+    pub user_id: String,
+    pub job_id: String,
+    pub added_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RatingRow {
+    pub user_id: String,
+    pub job_id: String,
+    pub liked: bool,
+    pub rated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreferenceRow {
+    pub user_id: String,
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserJobRow {
+    pub job: JobRow,
+    pub marked_at: String,
 }
 
 // --- Media markers ---

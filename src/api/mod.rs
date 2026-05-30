@@ -3,6 +3,8 @@ mod bots_settings;
 pub(crate) mod db_transfer;
 mod db_transfer_replace;
 mod db_transfer_sync;
+mod discovery;
+mod favorites;
 mod frontend;
 mod frontend_bodies;
 mod ingest;
@@ -11,9 +13,13 @@ mod markers;
 mod metadata;
 mod playback;
 mod playlists;
+mod preferences;
 mod progress;
+mod ratings;
 mod uploads;
+mod users;
 mod watch_folder;
+mod watchlist;
 
 pub(crate) use jobs::start_background_tasks;
 pub(crate) use uploads::cleanup_orphaned_uploads;
@@ -137,9 +143,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/anime-tv", get(frontend::handle_anime_tv_root))
         .route("/anime-tv/*path", get(frontend::handle_anime_tv_path))
         .route("/upload", get(frontend::handle_upload_page))
+        .route("/login", get(frontend::handle_login_page))
         .route("/settings", get(frontend::handle_settings_page))
         .route("/watch/:job_id", get(frontend::handle_watch_page))
         .nest_service("/static", ServeDir::new("static"))
+        .route("/api/auth/login", post(users::handle_login))
+        .route("/api/auth/logout", post(users::handle_logout))
+        .route("/api/auth/me", get(users::handle_me))
+        .route(
+            "/api/users",
+            get(users::handle_list_users).post(users::handle_create_user),
+        )
+        .route("/api/users/:user_id", delete(users::handle_delete_user))
         .route("/api/jobs", get(handle_list_jobs))
         .route("/api/jobs/active", get(jobs::handle_active_jobs))
         .route(
@@ -209,6 +224,24 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .post(progress::handle_save_progress)
                 .delete(progress::handle_delete_progress),
         )
+        .route("/api/favorites", get(favorites::handle_list_favorites))
+        .route(
+            "/api/favorites/:job_id",
+            post(favorites::handle_toggle_favorite),
+        )
+        .route("/api/watchlist", get(watchlist::handle_list_watchlist))
+        .route(
+            "/api/watchlist/:job_id",
+            post(watchlist::handle_toggle_watchlist),
+        )
+        .route("/api/ratings", get(ratings::handle_list_ratings))
+        .route("/api/ratings/:job_id", post(ratings::handle_set_rating))
+        .route(
+            "/api/preferences",
+            get(preferences::handle_get_preferences).patch(preferences::handle_patch_preferences),
+        )
+        .route("/api/next-up", get(discovery::handle_next_up))
+        .route("/api/recently-added", get(discovery::handle_recently_added))
         .route("/api/metadata/search", get(metadata::handle_search))
         .route(
             "/api/metadata/:metadata_id/refresh",

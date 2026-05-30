@@ -55,7 +55,7 @@ pub(super) fn queue_depth(jobs: &HashMap<String, JobState>, job_id: &str) -> Opt
     )
 }
 
-pub(super) fn normalize_category(value: Option<&str>) -> Result<Option<String>, String> {
+pub(crate) fn normalize_category(value: Option<&str>) -> Result<Option<String>, String> {
     match value.map(str::trim).filter(|s| !s.is_empty()) {
         None | Some("all") => Ok(None),
         Some("Film") | Some("Series") | Some("Anime Film") | Some("Anime TV") => {
